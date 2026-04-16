@@ -1,0 +1,1733 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>AutoStock — KIS 자동매매</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%233b82f6'/><text x='50%25' y='54%25' font-size='36' font-weight='bold' font-family='Arial' fill='white' text-anchor='middle' dominant-baseline='middle'>A</text></svg>"/>
+  <meta name="theme-color" content="#060b18"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- !! purge=1: 모든 캐시 삭제 후 리다이렉트 (Firebase 로드 완전 차단) !! -->
+  <script>
+    if (location.search.includes('purge=1')) {
+      // document.write로 페이지 전체 덮어쓰기 → 이후 스크립트 로드 차단
+      document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>초기화 중...</title></head><body style="background:#060b18;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif"><div style="text-align:center"><div style="font-size:24px;margin-bottom:12px">🔄</div><div>캐시 초기화 중...</div></div></body></html>');
+      document.close();
+
+      // localStorage, sessionStorage 삭제
+      try { localStorage.clear(); } catch(_) {}
+      try { sessionStorage.clear(); } catch(_) {}
+
+      // IndexedDB 전부 삭제 (Firebase 세션 포함)
+      var dbs = [
+        'firebaseLocalStorageDb',
+        'firebase-heartbeat-database', 
+        'firebase-installations-database',
+        'firebase-messaging-database',
+        'firebase-installations-store'
+      ];
+      var done = 0;
+      function next() {
+        done++;
+        if (done >= dbs.length) location.replace(location.pathname);
+      }
+      dbs.forEach(function(name) {
+        try {
+          var req = indexedDB.deleteDatabase(name);
+          req.onsuccess = req.onerror = req.onblocked = next;
+        } catch(_) { next(); }
+      });
+      setTimeout(function() { location.replace(location.pathname); }, 2000);
+    }
+  </script>
+
+  <!-- Firebase SDK (purge=1일 때는 위에서 document.write로 차단됨) -->
+  <script type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+    import { getAuth, GoogleAuthProvider, signInWithPopup,
+             signOut, onAuthStateChanged }
+      from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDHSPhqVfrGxf59Hqps_EQa-5DI1ej1U_M",
+      authDomain: "autostock-kis.firebaseapp.com",
+      projectId: "autostock-kis",
+      storageBucket: "autostock-kis.firebasestorage.app",
+      messagingSenderId: "360910097151",
+      appId: "1:360910097151:web:db7a185ace1d5673bddaca"
+    };
+
+    const app  = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const provider = new GoogleAuthProvider();
+
+    // 팝업 방식 로그인
+    window._signInWithGoogle = async () => {
+      const result = await signInWithPopup(auth, provider);
+      return result;
+    };
+    window._doSignOut = () => {
+      signOut(auth)
+        .catch(() => {})
+        .finally(() => { location.href = location.pathname + '?purge=1'; });
+    };
+    window._refreshToken = async () => {
+      if (window._currentUser)
+        window._idToken = await window._currentUser.getIdToken(true);
+    };
+
+    // ── 인증 상태 감지 ─────────────────────────────────────
+    onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        window._currentUser = user;
+        // 토큰 가져오기 (실패해도 계속 진행)
+        try { window._idToken = await user.getIdToken(); } catch(_) {}
+        // 55분마다 자동 갱신
+        clearInterval(window._tokenTimer);
+        window._tokenTimer = setInterval(async () => {
+          try { window._idToken = await user.getIdToken(true); } catch(_) {}
+        }, 55 * 60 * 1000);
+        // 앱으로 진입
+        window._onFirebaseUser(user);
+      } else {
+        window._currentUser = null;
+        window._idToken     = null;
+        clearInterval(window._tokenTimer);
+        window._onFirebaseNull();
+      }
+    });
+  </script>
+  <style>
+    *{font-family:'Inter',sans-serif;box-sizing:border-box;}
+    body{background:#060b18;}
+    .glass{background:rgba(255,255,255,.04);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.08);}
+    .glass-hover:hover{background:rgba(255,255,255,.07);transition:.2s;}
+    .glow-blue{box-shadow:0 0 24px rgba(59,130,246,.25);}
+    .gradient-text{background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+    .tab-active{background:linear-gradient(135deg,#1d4ed8,#4f46e5);color:#fff;box-shadow:0 4px 20px rgba(79,70,229,.4);}
+    .tab-inactive{background:transparent;color:#64748b;}
+    .mktab-active{border-bottom:2px solid #3b82f6;color:#60a5fa;font-weight:600;}
+    .mktab-inactive{border-bottom:2px solid transparent;color:#475569;}
+    .spin{animation:spin 1s linear infinite;}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .fade-up{animation:fadeUp .3s ease;}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+    .pulse-green{animation:pulseG 2s infinite;}
+    .shake{animation:shake .4s ease;}
+    @keyframes shake{0%,100%{transform:translateX(0)}20%{transform:translateX(-8px)}40%{transform:translateX(8px)}60%{transform:translateX(-6px)}80%{transform:translateX(6px)}}
+    @keyframes pulseG{0%,100%{opacity:1}50%{opacity:.5}}
+    .ticker-up{color:#22c55e;} .ticker-down{color:#ef4444;} .ticker-flat{color:#94a3b8;}
+    .cnt-active{background:linear-gradient(135deg,#1d4ed8,#4f46e5);color:#fff;border-color:transparent;}
+    .cnt-inactive{background:rgba(255,255,255,.05);color:#64748b;border-color:rgba(255,255,255,.1);}
+    ::-webkit-scrollbar{width:4px;}
+    ::-webkit-scrollbar-track{background:transparent;}
+    ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:4px;}
+    input,select,textarea{background:rgba(255,255,255,.06)!important;border:1px solid rgba(255,255,255,.1)!important;
+      color:#f1f5f9!important;border-radius:10px!important;padding:10px 14px!important;font-size:14px!important;
+      outline:none!important;width:100%;}
+    input:focus,select:focus,textarea:focus{border-color:#3b82f6!important;box-shadow:0 0 0 3px rgba(59,130,246,.2)!important;}
+    input::placeholder,textarea::placeholder{color:#475569!important;}
+    select option{background:#0f172a;}
+    .page{display:none!important;}
+    .page.active{display:block!important;}
+    #pageLogin.active,#pageSetup.active,#pagePinLock.active,#pageLoading.active{display:flex!important;}
+    .step-dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.15);transition:.3s;}
+    .step-dot.active{background:#3b82f6;box-shadow:0 0 8px rgba(59,130,246,.6);}
+    .step-dot.done{background:#22c55e;}
+    .wizard-step{display:none;} .wizard-step.active{display:block;}
+    .skeleton{
+      position:relative;
+      overflow:hidden;
+      border-radius:10px;
+      background:rgba(100,116,139,.25);
+      color:transparent!important;
+    }
+    .skeleton::after{
+      content:'';
+      position:absolute;
+      inset:0;
+      transform:translateX(-100%);
+      background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);
+      animation:skeletonShimmer 1.2s infinite;
+    }
+    @keyframes skeletonShimmer{
+      100%{transform:translateX(100%);}
+    }
+  </style>
+</head>
+<body class="text-white min-h-screen">
+
+<!-- ── 배경 그라디언트 ──────────────────────────────────── -->
+<div class="fixed inset-0 pointer-events-none overflow-hidden">
+  <div class="absolute -top-40 -left-40 w-96 h-96 bg-blue-600 opacity-10 rounded-full blur-3xl"></div>
+  <div class="absolute top-1/2 -right-40 w-80 h-80 bg-purple-600 opacity-8 rounded-full blur-3xl"></div>
+  <div class="absolute -bottom-20 left-1/3 w-72 h-72 bg-indigo-600 opacity-8 rounded-full blur-3xl"></div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     로딩 화면 (인증 완료 후 상태 확인 중)
+════════════════════════════════════════════════════════ -->
+<div id="pageLoading" class="page fixed inset-0 flex items-center justify-center px-4" style="background:#060b18;z-index:150">
+  <div class="text-center">
+    <div class="w-14 h-14 rounded-2xl flex items-center justify-center font-black text-xl mx-auto mb-4"
+         style="background:linear-gradient(135deg,#3b82f6,#8b5cf6)">A</div>
+    <div class="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full spin mx-auto mb-3"></div>
+    <p id="loadingMsg" class="text-sm text-slate-400">계정 정보 확인 중...</p>
+  </div>
+</div>
+
+<!-- PIN 잠금 화면 (임시 비활성화) -->
+<div id="pagePinLock" class="page" style="display:none!important">
+  <div class="w-full max-w-xs glass rounded-3xl p-8 text-center fade-up">
+
+    <!-- 로그인 계정 정보 -->
+    <div id="pinLockAvatar" class="w-16 h-16 rounded-full mx-auto mb-3 flex items-center justify-center text-2xl font-bold bg-blue-600 overflow-hidden"></div>
+    <p id="pinLockName" class="text-sm font-semibold text-white mb-0.5"></p>
+    <p id="pinLockEmail" class="text-xs text-slate-400 mb-4"></p>
+
+    <h2 id="pinLockTitle" class="text-base font-bold text-white mb-1">PIN 입력</h2>
+    <p class="text-xs text-slate-500 mb-5">앱 잠금을 해제하세요</p>
+
+    <!-- PIN 입력 표시 (점) -->
+    <div class="flex justify-center gap-4 mb-5" id="pinDots">
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="dot0"></div>
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="dot1"></div>
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="dot2"></div>
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="dot3"></div>
+    </div>
+
+    <!-- 오류 메시지 -->
+    <p id="pinError" class="text-red-400 text-xs mb-3 h-4"></p>
+
+    <!-- 숫자 키패드 -->
+    <div class="grid grid-cols-3 gap-3 mb-4">
+      <button onclick="pinInput('1')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">1</button>
+      <button onclick="pinInput('2')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">2</button>
+      <button onclick="pinInput('3')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">3</button>
+      <button onclick="pinInput('4')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">4</button>
+      <button onclick="pinInput('5')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">5</button>
+      <button onclick="pinInput('6')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">6</button>
+      <button onclick="pinInput('7')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">7</button>
+      <button onclick="pinInput('8')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">8</button>
+      <button onclick="pinInput('9')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">9</button>
+      <button onclick="pinClear()" class="py-4 rounded-2xl text-sm font-semibold text-slate-400 glass glass-hover transition-all">지우기</button>
+      <button onclick="pinInput('0')" class="pin-key py-4 rounded-2xl text-xl font-bold text-white glass glass-hover transition-all">0</button>
+      <button onclick="pinDeleteOne()" class="py-4 rounded-2xl text-xl text-slate-400 glass glass-hover transition-all">⌫</button>
+    </div>
+
+    <div class="flex flex-col gap-2 mt-2 pt-3 border-t border-white/5">
+      <button onclick="doSignOut()" class="w-full py-2.5 rounded-xl text-xs font-semibold text-slate-400 glass glass-hover transition-all">
+        🔄 다른 계정으로 로그인
+      </button>
+      <button onclick="resetPin()" class="w-full py-2.5 rounded-xl text-xs font-semibold transition-all"
+        style="background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:#fca5a5">
+        🔑 PIN 초기화 (잊어버렸을 때)
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- PIN 설정 모달 -->
+<div id="modalPinSetup" class="hidden fixed inset-0 flex items-center justify-center px-4" style="background:#060b18;z-index:300">
+  <div class="w-full max-w-xs glass rounded-3xl p-8 text-center fade-up">
+
+    <!-- 상단: PIN 없이 사용 버튼 (눈에 잘 띄게) -->
+    <button onclick="skipPinSetup()" class="w-full py-2.5 rounded-xl text-sm font-semibold mb-5 transition-all"
+      style="background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);color:#93c5fd">
+      PIN 없이 바로 사용하기 →
+    </button>
+
+    <h3 id="pinSetupTitle" class="text-base font-bold text-white mb-1">PIN 설정 (선택사항)</h3>
+    <p id="pinSetupDesc" class="text-xs text-slate-500 mb-5">4자리 숫자로 앱을 잠글 수 있습니다<br>원하지 않으면 위 버튼을 누르세요</p>
+
+    <!-- 입력된 숫자 표시 (dots) -->
+    <div class="flex justify-center gap-4 mb-3" id="pinSetupDots">
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="setupDot0"></div>
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="setupDot1"></div>
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="setupDot2"></div>
+      <div class="w-3.5 h-3.5 rounded-full border-2 border-slate-600" id="setupDot3"></div>
+    </div>
+    <p id="pinSetupError" class="text-red-400 text-xs mb-3 h-4"></p>
+
+    <!-- 숫자 키패드 -->
+    <div class="grid grid-cols-3 gap-3">
+      <button onclick="pinSetupInput('1')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">1</button>
+      <button onclick="pinSetupInput('2')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">2</button>
+      <button onclick="pinSetupInput('3')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">3</button>
+      <button onclick="pinSetupInput('4')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">4</button>
+      <button onclick="pinSetupInput('5')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">5</button>
+      <button onclick="pinSetupInput('6')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">6</button>
+      <button onclick="pinSetupInput('7')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">7</button>
+      <button onclick="pinSetupInput('8')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">8</button>
+      <button onclick="pinSetupInput('9')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">9</button>
+      <button onclick="pinSetupClear()" class="py-4 rounded-2xl text-sm text-slate-400 glass glass-hover">지우기</button>
+      <button onclick="pinSetupInput('0')" class="py-4 rounded-2xl text-xl font-bold text-white glass glass-hover">0</button>
+      <button onclick="pinSetupDeleteOne()" class="py-4 rounded-2xl text-xl text-slate-400 glass glass-hover">⌫</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     로그인 페이지
+════════════════════════════════════════════════════════ -->
+<div id="pageLogin" class="page active fixed inset-0 flex items-center justify-center px-4" style="z-index:100">
+  <div class="w-full max-w-sm glass rounded-3xl p-8 text-center fade-up">
+    <div class="w-16 h-16 rounded-2xl flex items-center justify-center font-black text-2xl mx-auto mb-4"
+         style="background:linear-gradient(135deg,#3b82f6,#8b5cf6)">A</div>
+    <h1 class="text-2xl font-bold text-white mb-1">AutoStock</h1>
+    <p class="text-slate-400 text-sm mb-8">KIS 한국·미국 자동매매 시스템</p>
+    <button onclick="handleGoogleLogin()" id="btnGoogleLogin"
+      class="w-full py-3.5 rounded-2xl font-semibold text-sm flex items-center justify-center gap-3 transition-all glass-hover"
+      style="background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15)">
+      <svg class="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+      <span id="btnGoogleLoginText">Google 로그인</span>
+    </button>
+    <!-- 에러 메시지 박스 -->
+    <div id="loginErrorBox" style="display:none;margin-top:16px;padding:12px;background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);border-radius:12px;">
+      <p id="loginErrorMsg" class="text-red-400 text-xs text-left break-all"></p>
+    </div>
+    <p class="text-xs text-slate-600 mt-6">로그인 후 KIS API 키를 설정하면 자동매매가 시작됩니다</p>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     설정 마법사 페이지 (3단계 온보딩)
+════════════════════════════════════════════════════════ -->
+<div id="pageSetup" class="page fixed inset-0 overflow-y-auto px-4 py-8" style="z-index:100">
+  <div class="max-w-lg mx-auto">
+    <div class="glass rounded-3xl p-8 fade-up">
+
+      <!-- 헤더 -->
+      <div class="flex items-center gap-3 mb-6">
+        <div class="w-10 h-10 rounded-xl flex items-center justify-center font-black text-lg"
+             style="background:linear-gradient(135deg,#3b82f6,#8b5cf6)">A</div>
+        <div>
+          <h2 class="text-lg font-bold text-white">AutoStock 시작하기</h2>
+          <p class="text-xs text-slate-400" id="wizardSubtitle">계정 설정을 완료하면 자동매매가 시작됩니다</p>
+        </div>
+      </div>
+
+      <!-- 단계 표시기 -->
+      <div class="flex items-center gap-2 mb-7">
+        <div class="flex items-center gap-1.5">
+          <div class="step-dot active" id="sdot1"></div>
+          <div class="flex-1 h-px bg-white/10 w-8" id="sline1" style="width:32px"></div>
+          <div class="step-dot" id="sdot2"></div>
+          <div class="flex-1 h-px bg-white/10 w-8" id="sline2" style="width:32px"></div>
+          <div class="step-dot" id="sdot3"></div>
+        </div>
+        <span class="text-xs text-slate-500 ml-2" id="wizardStepLabel">1 / 3 — 프로필</span>
+      </div>
+
+      <!-- ─── STEP 1: 프로필 확인 ─────────────────────────── -->
+      <div id="wStep1" class="wizard-step active space-y-5">
+        <div class="text-center py-2">
+          <div id="wizardAvatar" class="w-20 h-20 rounded-full mx-auto mb-3 flex items-center justify-center text-3xl font-bold bg-blue-600 overflow-hidden border-2 border-blue-500/40"></div>
+          <p id="wizardName" class="text-base font-bold text-white mb-0.5"></p>
+          <p id="wizardEmail" class="text-xs text-slate-400"></p>
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5">표시 이름 <span class="text-slate-600">(선택 — 변경 가능)</span></label>
+          <input id="setupDisplayName" type="text" placeholder="사용할 닉네임 또는 실명"/>
+        </div>
+        <div class="rounded-2xl p-4 text-xs text-slate-400 leading-relaxed" style="background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.15)">
+          <p class="font-semibold text-blue-300 mb-1">📋 가입 절차 안내</p>
+          <p>① 프로필 확인 → ② KIS API 키 등록 → ③ 감시 종목 설정</p>
+          <p class="mt-1 text-slate-500">API 키 등록 전까지 매매 기능은 잠금 상태입니다.</p>
+        </div>
+        <button onclick="wizardNext()" class="w-full py-3.5 rounded-2xl font-bold text-sm transition-all" style="background:linear-gradient(135deg,#1d4ed8,#4f46e5)">
+          다음 — API 키 등록 →
+        </button>
+        <button onclick="doSignOut()" class="w-full py-2 text-xs text-slate-600 hover:text-slate-400 transition-colors">다른 계정으로 로그인</button>
+      </div>
+
+      <!-- ─── STEP 2: KIS API 키 ─────────────────────────── -->
+      <div id="wStep2" class="wizard-step space-y-4">
+        <div class="rounded-2xl p-3.5 text-xs leading-relaxed" style="background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.2)">
+          <p class="font-semibold text-yellow-300 mb-1">🔑 KIS Open API 키 필요</p>
+          <p class="text-slate-400">한국투자증권 홈페이지 → Open API → 앱 등록 후 키를 발급받으세요. 모의투자 키와 실전투자 키는 별도입니다.</p>
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5">App Key <span class="text-red-400">*</span></label>
+          <input id="setupAppKey" type="text" placeholder="KIS App Key"/>
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5">App Secret <span class="text-red-400">*</span></label>
+          <input id="setupAppSecret" type="password" placeholder="KIS App Secret"/>
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5">계좌번호 <span class="text-red-400">*</span> <span class="text-slate-600">(예: 50123456-01)</span></label>
+          <input id="setupAccountNo" type="text" placeholder="XXXXXXXX-XX"/>
+        </div>
+        <div style="display:none">
+          <label class="text-xs text-slate-500 block mb-1.5">투자 모드</label>
+          <select id="setupMock">
+            <option value="true">모의투자 — 테스트 권장 (실제 돈 아님)</option>
+            <option value="false">실전투자 ⚠️ — 실제 자산 거래</option>
+          </select>
+        </div>
+        <div id="setupError" class="text-red-400 text-xs hidden py-2 px-3 rounded-xl" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2)"></div>
+        <div class="flex gap-2 pt-1">
+          <button onclick="wizardPrev()" class="flex-1 py-3 rounded-2xl text-sm font-semibold text-slate-400 glass glass-hover">← 이전</button>
+          <button onclick="wizardNext()" id="btnSetupSave" class="flex-1 py-3 rounded-2xl font-bold text-sm transition-all" style="background:linear-gradient(135deg,#1d4ed8,#4f46e5)">다음 →</button>
+        </div>
+      </div>
+
+      <!-- ─── STEP 3: 감시 종목 ──────────────────────────── -->
+      <div id="wStep3" class="wizard-step space-y-4">
+        <div class="rounded-2xl p-3.5 text-xs leading-relaxed" style="background:rgba(139,92,246,.07);border:1px solid rgba(139,92,246,.2)">
+          <p class="font-semibold text-purple-300 mb-1">📊 감시 종목 설정 (선택사항)</p>
+          <p class="text-slate-400">AI와 알고리즘이 분석할 종목입니다. 나중에 언제든 변경 가능합니다.</p>
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5">🇰🇷 한국 주식 <span class="text-slate-600">(종목코드, 쉼표 구분)</span></label>
+          <input id="setupKrWatchlist" type="text" value="005930,000660,042700,035420,035720,005380,247540,086520,068270,352820"/>
+          <p class="text-xs text-slate-600 mt-1">삼성전자, SK하이닉스, 한미반도체, NAVER, 카카오... 등 기본값</p>
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 block mb-1.5">🇺🇸 미국 주식 <span class="text-slate-600">(티커, 쉼표 구분)</span></label>
+          <input id="setupUsWatchlist" type="text" value="NVDA,AAPL,MSFT,TSLA,META,AMD,PLTR,SOFI,COIN,SOXL"/>
+          <p class="text-xs text-slate-600 mt-1">엔비디아, 애플, 마이크로소프트... 등 기본값</p>
+        </div>
+        <div id="setupError3" class="text-red-400 text-xs hidden py-2 px-3 rounded-xl" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2)"></div>
+        <div class="flex gap-2 pt-1">
+          <button onclick="wizardPrev()" class="flex-1 py-3 rounded-2xl text-sm font-semibold text-slate-400 glass glass-hover">← 이전</button>
+          <button onclick="submitSetup()" id="btnSetupFinal" class="flex-1 py-3 rounded-2xl font-bold text-sm transition-all" style="background:linear-gradient(135deg,#15803d,#16a34a)">
+            ✅ 설정 완료 — 시작!
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     메인 대시보드
+════════════════════════════════════════════════════════ -->
+<div id="pageApp" class="page">
+
+  <!-- 헤더 -->
+  <header class="sticky top-0 z-50 px-5 py-3.5 border-b border-white/5" style="background:rgba(6,11,24,.85);backdrop-filter:blur(20px)">
+    <div class="max-w-6xl mx-auto flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl flex items-center justify-center font-black text-base" style="background:linear-gradient(135deg,#3b82f6,#8b5cf6)">A</div>
+        <div>
+          <span class="font-bold text-white text-base">AutoStock</span>
+          <span id="modeBadge" class="ml-2 px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-500/20 text-blue-400">모의투자</span>
+        </div>
+      </div>
+      <div class="flex items-center gap-4">
+        <div class="flex items-center gap-2">
+          <div id="botDot" class="w-2 h-2 rounded-full bg-slate-600"></div>
+          <span id="botStatusText" class="text-xs text-slate-400 hidden sm:block"></span>
+        </div>
+        <span class="text-xs text-slate-600 hidden sm:block" id="updatedAt"></span>
+        <button onclick="loadAll()" class="w-8 h-8 rounded-lg glass glass-hover flex items-center justify-center">
+          <svg id="refreshIcon" class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+          </svg>
+        </button>
+        <!-- 유저 메뉴 -->
+        <div class="relative" id="userMenuWrap">
+          <button onclick="toggleUserMenu()" class="w-8 h-8 rounded-full overflow-hidden border border-white/20">
+            <img id="userAvatar" src="" class="w-full h-full object-cover" onerror="this.style.display='none'"/>
+            <span id="userInitial" class="w-full h-full flex items-center justify-center text-xs font-bold text-white" style="background:linear-gradient(135deg,#334155,#6366f1)"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="12" cy="8" r="3.5" fill="rgba(255,255,255,.9)"/><path d="M5.5 19c0-3.2 2.9-5.5 6.5-5.5s6.5 2.3 6.5 5.5" stroke="rgba(255,255,255,.9)" stroke-width="2" stroke-linecap="round"/></svg></span>
+          </button>
+          <div id="userMenu" class="hidden absolute right-0 mt-1 w-48 glass rounded-xl p-1 shadow-2xl border border-white/10 z-50">
+            <div id="userMenuName" class="px-3 py-2 text-xs text-slate-400 border-b border-white/5"></div>
+            <button onclick="openSettings()" class="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-white/5 rounded-lg transition">⚙️ API 설정</button>
+            <button id="btnPinMenu" onclick="handlePinMenu()" class="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-white/5 rounded-lg transition">🔒 PIN 설정</button>
+            <button id="btnPinRemove" onclick="removePin()" class="hidden w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-white/5 rounded-lg transition">🔓 PIN 해제</button>
+            <button onclick="doSignOut()" class="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-500/10 rounded-lg transition">로그아웃</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-5 space-y-4 relative z-10">
+
+    <!-- KIS API 에러 배너 -->
+    <div id="kisApiError" style="display:none;padding:16px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);border-radius:14px;font-size:13px;color:#f87171;line-height:1.6">
+      <div class="flex items-start gap-2">
+        <span style="font-size:18px;flex-shrink:0">⚠️</span>
+        <div style="width:100%">
+          <strong style="display:block;margin-bottom:4px;font-size:14px">KIS API 연결 실패</strong>
+          <span id="kisApiErrorMsg" style="word-break:break-all;color:#fca5a5;font-size:12px;font-family:monospace"></span>
+
+          <div id="kis403Help" style="display:none;margin-top:12px;padding:12px;background:rgba(0,0,0,.3);border-radius:10px;font-size:12px;color:#94a3b8">
+            <p style="color:#fbbf24;font-weight:600;margin-bottom:8px">🔒 403 오류 = 서버 IP가 KIS에 등록되지 않음</p>
+            <p style="margin-bottom:6px">Firebase 서버 IP를 KIS 개발자센터에 등록해야 합니다:</p>
+            <ol style="margin-left:16px;margin-bottom:10px;line-height:1.8">
+              <li><a href="https://apiportal.kbs.koreainvestment.com" target="_blank" style="color:#60a5fa">KIS 개발자센터</a> 로그인</li>
+              <li>내 앱 → 앱 선택 → <strong style="color:#fff">API 관리</strong> 탭</li>
+              <li>허용 IP 목록에 아래 IP 추가</li>
+            </ol>
+            <div style="background:rgba(255,255,255,.06);border-radius:8px;padding:10px;display:flex;align-items:center;justify-content:space-between;gap:8px">
+              <span id="serverIpDisplay" style="color:#a78bfa;font-family:monospace;font-size:13px">조회 중...</span>
+              <button onclick="copyServerIp()" style="background:rgba(99,102,241,.3);border:1px solid rgba(99,102,241,.5);color:#a78bfa;padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer">복사</button>
+            </div>
+            <p style="margin-top:8px;font-size:11px;color:#64748b">※ IP는 가끔 바뀔 수 있습니다. 바뀌면 다시 등록 필요.</p>
+          </div>
+
+          <div id="kisGenericHelp" style="display:none;margin-top:8px;font-size:12px;color:#94a3b8">
+            설정 메뉴에서 App Key / App Secret / 계좌번호를 다시 확인해주세요.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 상단 지표 카드 -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div class="glass rounded-2xl p-4">
+        <p class="text-xs text-slate-500 mb-1.5">총자산</p>
+        <p id="totalEquity" class="text-xl font-bold text-white">-</p>
+      </div>
+      <div class="glass rounded-2xl p-4">
+        <p class="text-xs text-slate-500 mb-1.5">주문가능</p>
+        <p id="availableCash" class="text-xl font-bold text-white">-</p>
+      </div>
+      <div class="glass rounded-2xl p-4">
+        <p class="text-xs text-slate-500 mb-1.5">오늘 실현손익</p>
+        <p id="realizedPnl" class="text-xl font-bold text-white">-</p>
+      </div>
+      <div class="glass rounded-2xl p-4">
+        <p class="text-xs text-slate-500 mb-1.5">보유 포지션</p>
+        <p id="positionSummary" class="text-xl font-bold text-white">-</p>
+      </div>
+    </div>
+
+    <!-- 마켓 탭 (한국 / 미국) -->
+    <div class="flex gap-0 border-b border-white/5">
+      <button id="mktKR" onclick="switchMarket('KR')" class="px-5 py-2.5 text-sm transition-all mktab-active">🇰🇷 한국 주식</button>
+      <button id="mktUS" onclick="switchMarket('US')" class="px-5 py-2.5 text-sm transition-all mktab-inactive">🇺🇸 미국 주식</button>
+    </div>
+
+    <!-- 감시 종목 티커 -->
+    <div class="glass rounded-2xl p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-white flex items-center gap-2">
+          <span class="w-1.5 h-4 rounded-full bg-blue-500 inline-block"></span>
+          <span id="watchlistTitle">감시 종목</span>
+        </h2>
+        <span class="text-xs text-slate-500" id="watchlistCount"></span>
+      </div>
+      <div id="watchlistGrid" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2">
+        <div class="text-slate-500 text-xs py-2">로딩 중...</div>
+      </div>
+    </div>
+
+    <!-- 수동 / 자동 탭 -->
+    <div class="glass rounded-2xl overflow-hidden">
+      <div class="flex p-1.5 gap-1.5 border-b border-white/5">
+        <button id="tabManual" onclick="switchTab('manual')" class="flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all tab-active">✋ 수동 매매</button>
+        <button id="tabAuto" onclick="switchTab('auto')" class="flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all tab-inactive">🤖 AI 자동 매매</button>
+      </div>
+
+      <!-- 수동 탭 -->
+      <div id="panelManual" class="p-5 fade-up">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div class="space-y-3">
+            <h3 class="text-sm font-semibold text-slate-300">직접 주문 <span id="manualMarketBadge" class="text-xs text-blue-400 font-normal ml-1">🇰🇷 한국</span></h3>
+            <div>
+              <div class="flex items-center justify-between mb-1.5">
+                <label class="text-xs text-slate-500">종목코드 / 티커</label>
+                <button onclick="loadMiniChartFromInput()" class="text-[11px] text-blue-300 hover:text-blue-200 transition">차트 보기</button>
+              </div>
+              <input id="orderCode" type="text" placeholder="예) 005930  또는  AAPL" oninput="this.value=this.value.toUpperCase()"/>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="text-xs text-slate-500 block mb-1.5">수량 <span class="text-slate-600">(빈칸=자동)</span></label>
+                <input id="orderQty" type="number" min="1" placeholder="자동계산"/>
+              </div>
+              <div>
+                <label class="text-xs text-slate-500 block mb-1.5">가격 <span class="text-slate-600">(0=시장가)</span></label>
+                <input id="orderPrice" type="number" min="0" placeholder="0"/>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-3 pt-1">
+              <button onclick="placeOrder('buy')" class="py-3 rounded-xl font-bold text-sm transition-all glow-blue" style="background:linear-gradient(135deg,#1d4ed8,#2563eb)">매수</button>
+              <button onclick="placeOrder('sell')" class="py-3 rounded-xl font-bold text-sm transition-all" style="background:linear-gradient(135deg,#b91c1c,#dc2626)">매도</button>
+            </div>
+            <div id="orderResult" class="text-xs text-center text-slate-400 min-h-5 py-1"></div>
+            <div id="miniChartWrap" class="hidden rounded-xl p-3" style="background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08)">
+              <div class="flex items-center justify-between mb-2">
+                <div class="text-xs font-semibold text-slate-300">
+                  <span id="miniChartTitle">-</span>
+                  <span id="miniChartPrice" class="ml-1 text-slate-400"></span>
+                </div>
+                <span id="miniChartChange" class="text-xs"></span>
+              </div>
+              <svg id="miniChartSvg" viewBox="0 0 280 90" class="w-full h-[90px]"></svg>
+            </div>
+          </div>
+          <div>
+            <h3 class="text-sm font-semibold text-slate-300 mb-3">보유 포지션</h3>
+            <div id="posTableManual" class="space-y-2 max-h-72 overflow-y-auto pr-1">
+              <p class="text-slate-600 text-xs text-center py-8">보유 포지션 없음</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 자동 탭 -->
+      <div id="panelAuto" class="hidden p-5 fade-up">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+
+          <!-- 설정 & 제어 -->
+          <div class="space-y-3">
+            <h3 class="text-sm font-semibold text-slate-300">자동 매매 설정</h3>
+            <div class="rounded-2xl p-4 space-y-3" style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07)">
+              <div class="flex items-center justify-between">
+                <span class="text-sm font-semibold text-white">봇 상태</span>
+                <div id="botStatusBig" class="text-xs font-bold px-2.5 py-1 rounded-full bg-slate-700 text-slate-300">확인 중</div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <button id="btnStart" onclick="botControl('start')" class="py-2.5 rounded-xl font-bold text-sm transition-all" style="background:linear-gradient(135deg,#15803d,#16a34a)">시작</button>
+                <button id="btnStop" onclick="botControl('stop')" class="py-2.5 rounded-xl font-bold text-sm transition-all" style="background:linear-gradient(135deg,#b91c1c,#dc2626)">중지</button>
+              </div>
+              <button onclick="botControl('resume')" class="w-full py-2 rounded-xl text-xs font-semibold text-slate-400 transition-all glass glass-hover">매매 재개</button>
+            </div>
+            <div class="rounded-2xl p-4" style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07)">
+              <p class="text-sm font-semibold text-white mb-3">AI 추천 종목 수</p>
+              <div class="flex gap-2">
+                <button onclick="setStockCount(3)" id="cnt3" class="flex-1 py-2.5 rounded-xl text-sm font-bold border transition-all cnt-active">3</button>
+                <button onclick="setStockCount(4)" id="cnt4" class="flex-1 py-2.5 rounded-xl text-sm font-bold border transition-all cnt-inactive">4</button>
+                <button onclick="setStockCount(5)" id="cnt5" class="flex-1 py-2.5 rounded-xl text-sm font-bold border transition-all cnt-inactive">5</button>
+              </div>
+              <p id="stockCountSaved" class="text-xs text-center mt-2 text-slate-500"></p>
+            </div>
+            <div class="rounded-2xl p-4" style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07)">
+              <p class="text-sm font-semibold text-white mb-3">즉시 실행</p>
+              <div class="space-y-2">
+                <button onclick="runAI('morning')" class="w-full py-2.5 rounded-xl text-xs font-semibold transition-all glass glass-hover text-purple-300 border border-purple-500/20">✨ 오전 09:30 세션</button>
+                <button onclick="runAI('afternoon')" class="w-full py-2.5 rounded-xl text-xs font-semibold transition-all glass glass-hover text-indigo-300 border border-indigo-500/20">✨ 오후 13:00 세션</button>
+                <button onclick="runAI('late')" class="w-full py-2.5 rounded-xl text-xs font-semibold transition-all glass glass-hover text-slate-300 border border-slate-500/20">✨ 마감 15:30 세션</button>
+              </div>
+              <div id="aiRunStatus" class="text-xs text-center mt-2 text-slate-400 min-h-4"></div>
+            </div>
+          </div>
+
+          <!-- 자동 포지션 -->
+          <div>
+            <h3 class="text-sm font-semibold text-slate-300 mb-3">보유 포지션 <span id="posCountAuto" class="text-slate-600 font-normal text-xs"></span></h3>
+            <div id="posTableAuto" class="space-y-2 max-h-[440px] overflow-y-auto pr-1">
+              <p class="text-slate-600 text-xs text-center py-8">보유 포지션 없음</p>
+            </div>
+          </div>
+
+          <!-- AI 추천 -->
+          <div>
+            <h3 class="text-sm font-semibold text-slate-300 mb-3">AI 추천 결과</h3>
+            <div id="aiRecsPanel" class="space-y-2 max-h-[440px] overflow-y-auto pr-1">
+              <p class="text-slate-600 text-xs text-center py-8">추천 이력 없음</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 전략 설정 -->
+    <div class="glass rounded-2xl overflow-hidden">
+      <button onclick="toggleSection('settingsBody')" class="w-full px-5 py-4 flex items-center justify-between text-left">
+        <span class="text-sm font-semibold text-white flex items-center gap-2">
+          <span class="w-1.5 h-4 rounded-full bg-purple-500 inline-block"></span>
+          전략 설정
+        </span>
+        <svg id="settingsChevron" class="w-4 h-4 text-slate-500 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div id="settingsBody" class="hidden border-t border-white/5 p-5">
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-4">
+          <div><label class="text-xs text-slate-500 block mb-1.5">K 팩터</label><input id="cfgK" type="number" step="0.1"/></div>
+          <div><label class="text-xs text-slate-500 block mb-1.5">이동평균 기간</label><input id="cfgMA" type="number"/></div>
+          <div><label class="text-xs text-slate-500 block mb-1.5">손절 비율 (%)</label><input id="cfgStopLoss" type="number" step="0.1"/></div>
+          <div>
+            <label class="text-xs text-slate-500 block mb-1.5">최대 비중 (%)</label>
+            <input id="cfgMaxPos" type="number" step="1" min="1" max="100" oninput="updateInvestmentGuide()"/>
+            <p id="cfgMaxPosHint" class="text-[11px] text-slate-500 mt-1.5"></p>
+          </div>
+          <div><label class="text-xs text-slate-500 block mb-1.5">일일 목표 수익 (%)</label><input id="cfgDailyTarget" type="number" step="0.1"/></div>
+          <div class="md:col-span-2"><label class="text-xs text-slate-500 block mb-1.5">한국 감시종목 (쉼표 구분)</label><input id="cfgKrWatchlist" placeholder="005930,000660"/></div>
+          <div><label class="text-xs text-slate-500 block mb-1.5">미국 감시종목 (쉼표 구분)</label><input id="cfgUsWatchlist" placeholder="AAPL,NVDA"/></div>
+          <div style="display:none"><label class="text-xs text-slate-500 block mb-1.5">투자 모드</label>
+            <select id="cfgMock"><option value="true">모의투자</option><option value="false">실전투자 ⚠️</option></select>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <button onclick="saveConfig()" class="px-5 py-2.5 rounded-xl text-sm font-semibold transition-all" style="background:linear-gradient(135deg,#1d4ed8,#4f46e5)">설정 저장</button>
+          <span id="configResult" class="text-xs text-slate-400"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 매매 이력 -->
+    <div class="glass rounded-2xl overflow-hidden">
+      <button onclick="toggleSection('tradesBody');if(!tradesLoaded)loadTrades()" class="w-full px-5 py-4 flex items-center justify-between text-left">
+        <span class="text-sm font-semibold text-white flex items-center gap-2">
+          <span class="w-1.5 h-4 rounded-full bg-green-500 inline-block"></span>
+          매매 이력
+        </span>
+        <svg id="tradesChevron" class="w-4 h-4 text-slate-500 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div id="tradesBody" class="hidden border-t border-white/5">
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead><tr class="text-xs text-slate-600 border-b border-white/5">
+              <th class="text-left px-5 py-3">시간</th>
+              <th class="text-left px-4 py-3">종목</th>
+              <th class="text-center px-3 py-3">시장</th>
+              <th class="text-center px-3 py-3">구분</th>
+              <th class="text-right px-3 py-3">가격</th>
+              <th class="text-right px-3 py-3">수량</th>
+              <th class="text-right px-3 py-3">손익</th>
+              <th class="text-left px-5 py-3">사유</th>
+            </tr></thead>
+            <tbody id="tradesTable"><tr><td colspan="8" class="text-center py-8 text-slate-600 text-sm">로딩 중...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 로그 -->
+    <div class="glass rounded-2xl overflow-hidden">
+      <button onclick="toggleSection('logsBody');if(!logsLoaded)loadLogs()" class="w-full px-5 py-4 flex items-center justify-between text-left">
+        <span class="text-sm font-semibold text-white flex items-center gap-2">
+          <span class="w-1.5 h-4 rounded-full bg-yellow-500 inline-block"></span>
+          실시간 로그
+        </span>
+        <svg id="logsChevron" class="w-4 h-4 text-slate-500 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div id="logsBody" class="hidden border-t border-white/5 p-4">
+        <div id="logContainer" class="rounded-xl p-3 h-64 overflow-y-auto text-xs space-y-0.5 font-mono" style="background:rgba(0,0,0,.4)"></div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- API 설정 모달 -->
+<div id="modalSettings" class="hidden fixed inset-0 z-50 flex items-center justify-center px-4" style="background:rgba(0,0,0,.6)">
+  <div class="w-full max-w-md glass rounded-3xl p-6 fade-up">
+    <div class="flex items-center justify-between mb-5">
+      <h3 class="text-base font-bold text-white">API 키 설정 변경</h3>
+      <button onclick="closeSettings()" class="text-slate-400 hover:text-white">✕</button>
+    </div>
+    <div class="space-y-3">
+      <div><label class="text-xs text-slate-500 block mb-1.5">App Key</label><input id="modalAppKey" type="text"/></div>
+      <div><label class="text-xs text-slate-500 block mb-1.5">App Secret <span style="color:#f87171;font-size:11px">(저장 시 필수 입력)</span></label><input id="modalAppSecret" type="password" placeholder="App Secret 입력 (필수)"/></div>
+      <div><label class="text-xs text-slate-500 block mb-1.5">계좌번호</label><input id="modalAccountNo" type="text"/></div>
+      <div style="display:none"><label class="text-xs text-slate-500 block mb-1.5">투자 모드</label>
+        <select id="modalMock"><option value="true">모의투자</option><option value="false">실전투자 ⚠️</option></select>
+      </div>
+    </div>
+    <div id="modalSettingsError" class="text-red-400 text-xs mt-2 hidden"></div>
+    <div class="flex gap-2 mt-4">
+      <button id="btnSaveSettings" onclick="saveApiSettings()" class="flex-1 py-2.5 rounded-xl font-bold text-sm" style="background:linear-gradient(135deg,#1d4ed8,#4f46e5)">저장</button>
+      <button onclick="closeSettings()" class="flex-1 py-2.5 rounded-xl text-sm text-slate-400 glass">취소</button>
+    </div>
+  </div>
+</div>
+
+<!-- 토스트 -->
+<div id="toast" class="fixed bottom-5 right-5 glass rounded-2xl px-4 py-3 text-sm text-white shadow-2xl opacity-0 transition-opacity duration-300 pointer-events-none max-w-xs z-50 border border-white/10"></div>
+
+<script>
+// ════════════════════════════════════════════════════════
+//  앱 상태
+// ════════════════════════════════════════════════════════
+let currentTab='manual', currentMarket='KR', tradesLoaded=false, logsLoaded=false, currentStockCount=3;
+let _refreshTimer = null;
+window._nameCache = {};
+
+// ── 유틸 ──────────────────────────────────────────────
+const fmt    = n => { const v=parseFloat(n); return isNaN(v)?'-':v.toLocaleString('ko-KR')+'원'; };
+const fmtUSD = n => { const v=parseFloat(n); return isNaN(v)?'-':'$'+v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
+const fmtTime= iso=>{ if(!iso)return'-'; return new Date(iso).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit',second:'2-digit'}); };
+
+function updateInvestmentGuide() {
+  const hint = document.getElementById('cfgMaxPosHint');
+  const input = document.getElementById('cfgMaxPos');
+  if(!hint || !input) return;
+  const maxPosPct = parseFloat(input.value);
+  if(isNaN(maxPosPct) || maxPosPct <= 0) {
+    hint.textContent = '예: 10 입력 시 총자산의 10%를 종목당 사용';
+    return;
+  }
+  const baseCapital = 10000000; // 1,000만원 가정
+  const perStock = Math.floor(baseCapital * (maxPosPct / 100));
+  const totalIfSelected = perStock * currentStockCount;
+  hint.textContent = `1,000만원 기준: 종목당 약 ${perStock.toLocaleString('ko-KR')}원, ${currentStockCount}종목이면 최대 ${totalIfSelected.toLocaleString('ko-KR')}원 사용`;
+}
+
+async function fetchServerIp() {
+  const el = document.getElementById('serverIpDisplay');
+  if(!el || el.dataset.loaded) return;
+  try {
+    const data = await apiFetch('/api/myip');
+    if(data.ok) {
+      el.textContent = data.server_ip;
+      el.dataset.ip = data.server_ip;
+      el.dataset.loaded = '1';
+    }
+  } catch(_) { el.textContent = '조회 실패'; }
+}
+
+function copyServerIp() {
+  const el = document.getElementById('serverIpDisplay');
+  const ip = el?.dataset.ip || el?.textContent;
+  if(ip && ip !== '조회 중...' && ip !== '조회 실패') {
+    navigator.clipboard.writeText(ip).then(()=>showToast('IP 복사됨: '+ip,'success'));
+  }
+}
+
+function showToast(msg, type='info') {
+  const t=document.getElementById('toast');
+  const c={info:'text-white',success:'text-green-400',error:'text-red-400'};
+  t.textContent=msg; t.style.opacity='1';
+  t.className=t.className.replace(/text-\S+/g,'')+ ' '+(c[type]||c.info);
+  setTimeout(()=>t.style.opacity='0',3500);
+}
+
+// ════════════════════════════════════════════════════════
+//  페이지 전환
+// ════════════════════════════════════════════════════════
+function showPage(name) {
+  ['Login','Setup','App','PinLock'].forEach(p => {
+    document.getElementById('page'+p).classList.remove('active');
+  });
+  document.getElementById('page'+name).classList.add('active');
+}
+function showLogin() { showPage('Login'); }
+function showSetup() { showPage('Setup'); }
+
+// ════════════════════════════════════════════════════════
+//  Firebase 인증 콜백 (가장 단순하게)
+// ════════════════════════════════════════════════════════
+window._onFirebaseUser = function(user) {
+  // 로그인 됨 → 바로 앱 화면
+  console.log('Firebase user:', user.email);
+  showPage('App');
+  loadAll();
+};
+
+window._onFirebaseNull = function() {
+  // 비로그인 → 로그인 화면
+  console.log('Firebase: no user');
+  showPage('Login');
+};
+
+// ════════════════════════════════════════════════════════
+//  Google 로그인
+// ════════════════════════════════════════════════════════
+async function handleGoogleLogin() {
+  const btn = document.getElementById('btnGoogleLogin');
+  const txt = document.getElementById('btnGoogleLoginText');
+  if (txt) txt.textContent = '로그인 중...';
+  if (btn) btn.disabled = true;
+  try {
+    await window._signInWithGoogle();
+    // 성공하면 onAuthStateChanged → showPage('App') 자동 호출
+  } catch(e) {
+    if (txt) txt.textContent = 'Google 로그인';
+    if (btn) btn.disabled = false;
+    // 사용자가 직접 닫은 경우 조용히 처리
+    if (e.code === 'auth/popup-closed-by-user' ||
+        e.code === 'auth/cancelled-popup-request') {
+      return;
+    }
+    // 실제 에러는 화면에 크게 표시
+    const msg = e.code || e.message || String(e);
+    document.getElementById('loginErrorMsg').textContent = '오류: ' + msg;
+    document.getElementById('loginErrorBox').style.display = 'block';
+    console.error('Login error:', e);
+  }
+}
+
+// ════════════════════════════════════════════════════════
+//  PIN 로직
+// ════════════════════════════════════════════════════════
+const PIN_KEY      = 'autostock_pin';
+const LOCK_TIMEOUT = 5 * 60 * 1000; // 5분 자동 잠금
+
+let _pinBuffer      = '';
+let _lastActiveTime = Date.now();
+let _lockTimer      = null;
+
+function _getPin(uid)       { return uid ? localStorage.getItem(PIN_KEY+'_'+uid) : null; }
+function _setPin(uid, pin)  { localStorage.setItem(PIN_KEY+'_'+uid, pin); }
+function _clearPin(uid)     { if(uid) localStorage.removeItem(PIN_KEY+'_'+uid); }
+
+// ── PIN 입력 화면 ──────────────────────────────────────
+function _showPinLock(user) {
+  _pinBuffer = '';
+  updatePinDots('pin', 0);
+  document.getElementById('pinError').textContent = '';
+  const av      = document.getElementById('pinLockAvatar');
+  const initial = (user.displayName?.[0] || user.email?.[0] || 'U').toUpperCase();
+  av.innerHTML  = user.photoURL
+    ? `<img src="${user.photoURL}" class="w-full h-full object-cover" onerror="this.parentElement.textContent='${initial}'">`
+    : initial;
+  document.getElementById('pinLockName').textContent  = user.displayName || '';
+  document.getElementById('pinLockEmail').textContent = user.email || '';
+  showPage('PinLock');
+}
+
+function pinInput(digit) {
+  if (_pinBuffer.length >= 4) return;
+  _pinBuffer += digit;
+  updatePinDots('pin', _pinBuffer.length);
+  if (_pinBuffer.length === 4) setTimeout(_verifyPin, 150);
+}
+function pinDeleteOne() { _pinBuffer = _pinBuffer.slice(0,-1); updatePinDots('pin', _pinBuffer.length); }
+function pinClear()     { _pinBuffer = ''; updatePinDots('pin', 0); }
+
+function _verifyPin() {
+  const saved = _getPin(window._currentUser?.uid);
+  if (_pinBuffer === saved) {
+    document.getElementById('pinError').textContent = '';
+    _resetLockTimer();
+    _checkAndNavigate(window._currentUser);
+  } else {
+    document.getElementById('pinError').textContent = '잘못된 PIN입니다';
+    const dots = document.getElementById('pinDots');
+    dots.classList.add('shake');
+    setTimeout(() => { dots.classList.remove('shake'); _pinBuffer = ''; updatePinDots('pin', 0); }, 500);
+  }
+}
+
+// ── PIN 설정 모달 ──────────────────────────────────────
+let _pinSetupCallback = null;
+let _pinSetupBuffer   = '';
+let _pinSetupStep     = 'first';
+let _pinSetupFirst    = '';
+
+function _openPinSetup(user, callback) {
+  _pinSetupCallback = callback;
+  _pinSetupBuffer   = '';
+  _pinSetupFirst    = '';
+  _pinSetupStep     = 'first';
+  document.getElementById('pinSetupTitle').textContent = 'PIN 설정';
+  document.getElementById('pinSetupDesc').textContent  = '앱 보안을 위한 4자리 PIN을 설정하세요';
+  document.getElementById('pinSetupError').textContent = '';
+  updatePinDots('setup', 0);
+  document.getElementById('modalPinSetup').classList.remove('hidden');
+}
+
+function pinSetupInput(digit) {
+  if (_pinSetupBuffer.length >= 4) return;
+  _pinSetupBuffer += digit;
+  updatePinDots('setup', _pinSetupBuffer.length);
+  if (_pinSetupBuffer.length < 4) return;
+  setTimeout(() => {
+    if (_pinSetupStep === 'first') {
+      _pinSetupFirst  = _pinSetupBuffer;
+      _pinSetupBuffer = '';
+      _pinSetupStep   = 'confirm';
+      document.getElementById('pinSetupTitle').textContent = 'PIN 확인';
+      document.getElementById('pinSetupDesc').textContent  = '동일한 PIN을 한 번 더 입력하세요';
+      document.getElementById('pinSetupError').textContent = '';
+      updatePinDots('setup', 0);
+    } else {
+      if (_pinSetupBuffer === _pinSetupFirst) {
+        _setPin(window._currentUser?.uid, _pinSetupBuffer);
+        document.getElementById('modalPinSetup').classList.add('hidden');
+        showToast('✅ PIN 설정 완료', 'success');
+        _resetLockTimer();
+        _pinSetupCallback?.();
+      } else {
+        document.getElementById('pinSetupError').textContent = 'PIN이 일치하지 않습니다. 처음부터 다시';
+        const dots = document.getElementById('pinSetupDots');
+        dots.classList.add('shake');
+        setTimeout(() => {
+          dots.classList.remove('shake');
+          _pinSetupBuffer = ''; _pinSetupStep = 'first'; _pinSetupFirst = '';
+          document.getElementById('pinSetupTitle').textContent = 'PIN 설정';
+          document.getElementById('pinSetupDesc').textContent  = '앱 보안을 위한 4자리 PIN을 설정하세요';
+          document.getElementById('pinSetupError').textContent = '';
+          updatePinDots('setup', 0);
+        }, 700);
+      }
+    }
+  }, 150);
+}
+function pinSetupDeleteOne() { _pinSetupBuffer = _pinSetupBuffer.slice(0,-1); updatePinDots('setup', _pinSetupBuffer.length); }
+function pinSetupClear()     { _pinSetupBuffer = ''; updatePinDots('setup', 0); }
+function skipPinSetup()      { document.getElementById('modalPinSetup').classList.add('hidden'); _pinSetupCallback?.(); }
+
+function updatePinDots(type, count) {
+  const prefix = type === 'pin' ? 'dot' : 'setupDot';
+  for (let i = 0; i < 4; i++) {
+    const dot = document.getElementById(prefix+i);
+    if (!dot) continue;
+    dot.className = i < count
+      ? 'w-3.5 h-3.5 rounded-full bg-blue-400'
+      : 'w-3.5 h-3.5 rounded-full border-2 border-slate-600';
+  }
+}
+
+// ── 자동 잠금 ──────────────────────────────────────────
+function _resetLockTimer() {
+  _lastActiveTime = Date.now();
+  clearTimeout(_lockTimer);
+  _lockTimer = setTimeout(() => {
+    if (!window._currentUser) return;
+    if (!_getPin(window._currentUser.uid)) return;
+    _showPinLock(window._currentUser);
+  }, LOCK_TIMEOUT);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && window._currentUser) {
+    if (_getPin(window._currentUser.uid) && Date.now() - _lastActiveTime > LOCK_TIMEOUT)
+      _showPinLock(window._currentUser);
+  } else {
+    _lastActiveTime = Date.now();
+  }
+});
+
+['click','keydown','touchstart'].forEach(ev =>
+  document.addEventListener(ev, () => {
+    if (window._currentUser && document.getElementById('pageApp').classList.contains('active'))
+      _resetLockTimer();
+  }, { passive: true })
+);
+
+// ── PIN 초기화 / 로그아웃 ──────────────────────────────
+function doSignOut() {
+  try { localStorage.clear(); } catch(_) {}
+  if (typeof window._doSignOut === 'function') {
+    window._doSignOut(); // Firebase signOut → ?purge=1
+  } else {
+    location.href = location.pathname + '?purge=1';
+  }
+}
+
+function resetPin() {
+  try { localStorage.clear(); } catch(_) {}
+  if (typeof window._doSignOut === 'function') {
+    window._doSignOut();
+  } else {
+    location.href = location.pathname + '?purge=1';
+  }
+}
+
+// PIN 메뉴 처리
+function handlePinMenu() {
+  document.getElementById('userMenu').classList.add('hidden');
+  _openPinSetup(window._currentUser, () => {
+    _updatePinMenuButtons();
+    showToast('✅ PIN이 설정되었습니다', 'success');
+  });
+}
+
+function removePin() {
+  document.getElementById('userMenu').classList.add('hidden');
+  _clearPin(window._currentUser?.uid);
+  _updatePinMenuButtons();
+  showToast('🔓 PIN이 해제되었습니다', 'info');
+}
+
+function _updatePinMenuButtons() {
+  const hasPin = !!_getPin(window._currentUser?.uid);
+  const btnSet = document.getElementById('btnPinMenu');
+  const btnRemove = document.getElementById('btnPinRemove');
+  if (btnSet) {
+    btnSet.textContent = hasPin ? '🔒 PIN 변경' : '🔒 PIN 설정';
+  }
+  if (btnRemove) {
+    btnRemove.classList.toggle('hidden', !hasPin);
+  }
+}
+// ── 앱 화면 진입 (user 객체 + 이미 가져온 data 선택적 사용) ──
+function _mountApp(user, data) {
+  const avatar=document.getElementById('userAvatar');
+  const initial=document.getElementById('userInitial');
+  if(user.photoURL){ avatar.src=user.photoURL; avatar.style.display='block'; initial.style.display='none'; }
+  else {
+    avatar.style.display='none';
+    initial.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="12" cy="8" r="3.5" fill="rgba(255,255,255,.9)"/><path d="M5.5 19c0-3.2 2.9-5.5 6.5-5.5s6.5 2.3 6.5 5.5" stroke="rgba(255,255,255,.9)" stroke-width="2" stroke-linecap="round"/></svg>';
+    initial.style.display='flex';
+  }
+  document.getElementById('userMenuName').textContent = user.displayName||user.email||'';
+  _updatePinMenuButtons(); // PIN 메뉴 버튼 상태 업데이트
+  showPage('App');
+  _resetLockTimer();
+  if(data){ window._lastStatusData=data; renderWithData(data); }
+  else { loadAll(); }
+  if(_refreshTimer) clearInterval(_refreshTimer);
+  _refreshTimer = setInterval(()=>{
+    loadAll();
+    if(!document.getElementById('logsBody').classList.contains('hidden')) loadLogs();
+    if(!document.getElementById('tradesBody').classList.contains('hidden')) loadTrades();
+    if(currentTab==='auto') loadRecommendations();
+  }, 30000); // 30초마다 갱신 (KIS API 부하 감소)
+}
+
+// 하위 호환 래퍼
+function showApp(user) { _mountApp(user, null); }
+
+// ── 설정 마법사 초기화 ─────────────────────────────────────
+let _wizardStep = 1;
+let _wizardUser = null;
+
+function _initSetupWizard(user) {
+  _wizardUser = user;
+  _wizardStep = 1;
+  // 프로필 정보 채우기
+  const av = document.getElementById('wizardAvatar');
+  const initial = (user.displayName?.[0] || user.email?.[0] || 'U').toUpperCase();
+  av.innerHTML = user.photoURL
+    ? `<img src="${user.photoURL}" class="w-full h-full object-cover" onerror="this.parentElement.textContent='${initial}'">`
+    : initial;
+  document.getElementById('wizardName').textContent = user.displayName || '이름 없음';
+  document.getElementById('wizardEmail').textContent = user.email || '';
+  document.getElementById('setupDisplayName').value = user.displayName || '';
+  _updateWizardUI();
+}
+
+function _updateWizardUI() {
+  [1,2,3].forEach(i => {
+    document.getElementById('wStep'+i).classList.toggle('active', i === _wizardStep);
+    const dot = document.getElementById('sdot'+i);
+    if(i < _wizardStep) dot.className='step-dot done';
+    else if(i === _wizardStep) dot.className='step-dot active';
+    else dot.className='step-dot';
+  });
+  const labels = ['', '1 / 3 — 프로필', '2 / 3 — API 키 등록', '3 / 3 — 감시 종목'];
+  const subtitles = ['', '구글 계정으로 가입되었습니다. 프로필을 확인하세요.', 'KIS Open API 키를 등록해야 매매가 가능합니다.', '분석할 종목을 선택하세요. 나중에 변경 가능합니다.'];
+  document.getElementById('wizardStepLabel').textContent = labels[_wizardStep];
+  document.getElementById('wizardSubtitle').textContent = subtitles[_wizardStep];
+  ['setupError','setupError3'].forEach(id => {
+    const el=document.getElementById(id); if(el){ el.textContent=''; el.classList.add('hidden'); }
+  });
+}
+
+function wizardNext() {
+  if(_wizardStep === 1) {
+    _wizardStep = 2; _updateWizardUI();
+  } else if(_wizardStep === 2) {
+    // API 키 유효성 검사
+    const appKey = document.getElementById('setupAppKey').value.trim();
+    const appSecret = document.getElementById('setupAppSecret').value.trim();
+    const accountNo = document.getElementById('setupAccountNo').value.trim();
+    const errEl = document.getElementById('setupError');
+    if(!appKey || !appSecret || !accountNo) {
+      errEl.textContent = 'App Key, App Secret, 계좌번호는 모두 필수입니다.';
+      errEl.classList.remove('hidden'); return;
+    }
+    _wizardStep = 3; _updateWizardUI();
+  }
+}
+
+function wizardPrev() {
+  if(_wizardStep > 1) { _wizardStep--; _updateWizardUI(); }
+}
+
+function toggleUserMenu() { document.getElementById('userMenu').classList.toggle('hidden'); }
+document.addEventListener('click', e=>{ if(!e.target.closest('#userMenuWrap')) document.getElementById('userMenu').classList.add('hidden'); });
+
+function openSettings() {
+  document.getElementById('userMenu').classList.add('hidden');
+  document.getElementById('modalSettings').classList.remove('hidden');
+}
+function closeSettings() { document.getElementById('modalSettings').classList.add('hidden'); }
+
+function toggleSection(id) {
+  const el=document.getElementById(id);
+  const chev=document.getElementById(id.replace('Body','Chevron'));
+  const h=el.classList.toggle('hidden');
+  if(chev) chev.style.transform=h?'':'rotate(180deg)';
+}
+
+function switchTab(tab) {
+  currentTab=tab;
+  const isM=tab==='manual';
+  document.getElementById('panelManual').classList.toggle('hidden',!isM);
+  document.getElementById('panelAuto').classList.toggle('hidden',isM);
+  document.getElementById('tabManual').className='flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all '+(isM?'tab-active':'tab-inactive');
+  document.getElementById('tabAuto').className='flex-1 py-2.5 text-sm font-semibold rounded-xl transition-all '+(!isM?'tab-active':'tab-inactive');
+  if(!isM) loadRecommendations();
+}
+
+function switchMarket(mkt) {
+  currentMarket=mkt;
+  document.getElementById('mktKR').className='px-5 py-2.5 text-sm transition-all '+(mkt==='KR'?'mktab-active':'mktab-inactive');
+  document.getElementById('mktUS').className='px-5 py-2.5 text-sm transition-all '+(mkt==='US'?'mktab-active':'mktab-inactive');
+  document.getElementById('watchlistTitle').textContent=mkt==='KR'?'🇰🇷 한국 감시 종목':'🇺🇸 미국 감시 종목';
+  document.getElementById('manualMarketBadge').textContent=mkt==='KR'?'🇰🇷 한국':'🇺🇸 미국';
+  if(window._lastStatusData) renderWithData(window._lastStatusData);
+}
+
+async function setStockCount(n) {
+  currentStockCount=n;
+  [3,4,5].forEach(i=>{
+    document.getElementById('cnt'+i).className='flex-1 py-2.5 rounded-xl text-sm font-bold border transition-all '+(i===n?'cnt-active':'cnt-inactive');
+  });
+  updateInvestmentGuide();
+  await apiFetch('/api/config',{method:'POST',body:JSON.stringify({ai_stock_count:n})});
+  document.getElementById('stockCountSaved').textContent=`✅ ${n}종목 저장`;
+  setTimeout(()=>document.getElementById('stockCountSaved').textContent='',2000);
+}
+
+async function apiFetch(path, opts={}) {
+  if(!window._idToken) throw new Error('로그인 필요');
+  const res = await fetch(path, {
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+window._idToken},
+    ...opts
+  });
+  if(res.status===401) {
+    showToast('인증이 만료되었습니다. 다시 로그인해 주세요.','error');
+    setTimeout(() => window._doSignOut?.(), 1500);
+    throw new Error('인증 만료');
+  }
+  return res.json();
+}
+
+// ── 설정 마법사 최종 제출 (Step 3에서 호출) ─────────────
+async function submitSetup() {
+  const appKey=document.getElementById('setupAppKey').value.trim();
+  const appSecret=document.getElementById('setupAppSecret').value.trim();
+  const accountNo=document.getElementById('setupAccountNo').value.trim();
+  const isMock=document.getElementById('setupMock').value==='true';
+  const krWl=document.getElementById('setupKrWatchlist').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const usWl=document.getElementById('setupUsWatchlist').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
+  const displayName=document.getElementById('setupDisplayName').value.trim()||window._currentUser?.displayName||'';
+  const errEl=document.getElementById('setupError3');
+
+  if(!appKey||!appSecret||!accountNo) {
+    errEl.textContent='이전 단계로 돌아가 API 키를 입력해주세요.'; errEl.classList.remove('hidden'); return;
+  }
+  errEl.classList.add('hidden');
+  const btn=document.getElementById('btnSetupFinal');
+  btn.textContent='저장 중...'; btn.disabled=true;
+
+  try {
+    const data = await apiFetch('/api/setup',{method:'POST',body:JSON.stringify({
+      app_key:appKey, app_secret:appSecret, account_no:accountNo, is_mock:isMock,
+      kr_watchlist:krWl, us_watchlist:usWl,
+      display_name:displayName,
+      email:window._currentUser?.email||'',
+    })});
+    if(data.ok) {
+      showToast('✅ 설정 완료! AutoStock을 시작합니다.','success');
+      // 설정 완료 → 앱으로 바로 이동 (loadAll 로 데이터 갱신)
+      setTimeout(async () => {
+        try {
+          const statusData = await apiFetch('/api/status');
+          if(statusData.ok && !statusData.setup_required) {
+            _mountApp(window._currentUser, statusData);
+          } else {
+            _mountApp(window._currentUser, null);
+          }
+        } catch(_){ _mountApp(window._currentUser, null); }
+      }, 500);
+    } else {
+      errEl.textContent=data.error||'서버 오류가 발생했습니다.'; errEl.classList.remove('hidden');
+    }
+  } catch(e) {
+    errEl.textContent='네트워크 오류: '+e.message; errEl.classList.remove('hidden');
+  }
+  btn.textContent='✅ 설정 완료 — 시작!'; btn.disabled=false;
+}
+
+async function saveApiSettings() {
+  const appKey=document.getElementById('modalAppKey').value.trim();
+  const appSecret=document.getElementById('modalAppSecret').value.trim();
+  const accountNo=document.getElementById('modalAccountNo').value.trim();
+  const isMock=document.getElementById('modalMock').value==='true';
+  const errEl=document.getElementById('modalSettingsError');
+  const btn=document.getElementById('btnSaveSettings');
+
+  if(!appKey||!accountNo) {
+    errEl.textContent='App Key, 계좌번호는 필수입니다.';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  // App Secret이 비어있으면 저장 불가 (변경하지 않으려면 기존 값 입력 필요)
+  if(!appSecret) {
+    errEl.textContent='App Secret을 입력해주세요. (변경하지 않을 경우에도 다시 입력 필요)';
+    errEl.classList.remove('hidden');
+    return;
+  }
+
+  errEl.classList.add('hidden');
+  if(btn) { btn.textContent='저장 중...'; btn.disabled=true; }
+
+  const payload={app_key:appKey, app_secret:appSecret, account_no:accountNo, is_mock:isMock};
+  try {
+    const data=await apiFetch('/api/setup',{method:'POST',body:JSON.stringify(payload)});
+    if(data.ok){
+      showToast('✅ 설정이 저장되었습니다.','success');
+      closeSettings();
+      loadAll();
+    } else {
+      errEl.textContent='오류: '+(data.error||'서버 오류');
+      errEl.classList.remove('hidden');
+    }
+  } catch(e) {
+    errEl.textContent='요청 실패: '+e.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    if(btn) { btn.textContent='저장'; btn.disabled=false; }
+  }
+}
+
+// ── 전체 상태 로드 ──────────────────────────────────────
+async function loadAll() {
+  const icon=document.getElementById('refreshIcon');
+  if(icon) icon.classList.add('spin');
+  try {
+    const data=await apiFetch('/api/status');
+    if(!data.ok){ showToast(data.error||'API 오류','error'); return; }
+    if(data.setup_required){
+      if(window._currentUser) { _initSetupWizard(window._currentUser); showPage('Setup'); }
+      return;
+    }
+    // KIS API 에러 표시
+    const kisErrEl  = document.getElementById('kisApiError');
+    const kisErrMsg = document.getElementById('kisApiErrorMsg');
+    if(kisErrEl) {
+      if(data.kis_error) {
+        if(kisErrMsg) kisErrMsg.textContent = data.kis_error;
+        kisErrEl.style.display = 'block';
+        // 403 오류면 IP 등록 안내 표시
+        const is403 = data.kis_error.includes('403');
+        const help403 = document.getElementById('kis403Help');
+        const helpGen = document.getElementById('kisGenericHelp');
+        if(help403) help403.style.display = is403 ? 'block' : 'none';
+        if(helpGen) helpGen.style.display = is403 ? 'none' : 'block';
+        if(is403) fetchServerIp();
+      } else {
+        kisErrEl.style.display = 'none';
+      }
+    }
+    window._lastStatusData = data;
+    renderWithData(data);
+  } catch(e){ if(String(e).includes('로그인')) return; showToast('서버 연결 실패','error'); }
+  finally { if(icon) icon.classList.remove('spin'); }
+}
+
+function renderWithData(data) {
+  renderHeader(data);
+  renderStats(data);
+  const wld = currentMarket==='KR'?(data.watchlist_data||{}):(data.us_watchlist_data||{});
+  const pos = currentMarket==='KR'?(data.positions_kr||{}):(data.positions_us||{});
+  Object.entries(wld).forEach(([c,d])=>{ if(d.stock_name&&d.stock_name!==c) window._nameCache[c]=d.stock_name; });
+  Object.values({...(data.positions_kr||{}),...(data.positions_us||{})}).forEach(p=>{ if(p.stock_name&&p.stock_code) window._nameCache[p.stock_code]=p.stock_name; });
+  renderWatchlist(pos, data.config||{}, wld, currentMarket);
+  renderPositions({...(data.positions_kr||{}),...(data.positions_us||{})});
+  renderConfig(data.config||{});
+}
+
+function renderHeader(data) {
+  const state=data.state||{}, mode=data.mode||'모의투자';
+  const badge=document.getElementById('modeBadge');
+  badge.textContent=mode==='실전투자'?'실전투자 ⚠️':'모의투자';
+  badge.className='ml-2 px-2 py-0.5 rounded-full text-xs font-semibold '+(mode==='실전투자'?'bg-red-500/20 text-red-400':'bg-blue-500/20 text-blue-400');
+
+  const enabled=state.bot_enabled!==false, halted=state.trading_halted, open=state.is_market_open;
+  let dc,st,bt,bc;
+  if(!enabled){dc='bg-slate-500';st='봇 비활성';bt='비활성';bc='bg-slate-700 text-slate-400';}
+  else if(halted){dc='bg-yellow-400';st='목표달성';bt='목표달성 중단';bc='bg-yellow-500/20 text-yellow-400';}
+  else if(open){dc='bg-green-400 pulse-green';st='매매 중';bt='🟢 실행 중';bc='bg-green-500/20 text-green-400';}
+  else{dc='bg-slate-400';st='대기 중';bt='대기';bc='bg-slate-700 text-slate-400';}
+  document.getElementById('botDot').className='w-2 h-2 rounded-full '+dc;
+  document.getElementById('botStatusText').textContent=st;
+  const big=document.getElementById('botStatusBig');
+  if(big){big.textContent=bt;big.className='text-xs font-bold px-2.5 py-1 rounded-full '+bc;}
+  document.getElementById('updatedAt').textContent='갱신 '+(data.updated_at||'');
+
+  const btnStart=document.getElementById('btnStart'), btnStop=document.getElementById('btnStop');
+  if(btnStart&&btnStop){
+    if(enabled&&!halted){ btnStart.style.opacity='0.35';btnStart.style.cursor='not-allowed';btnStop.style.opacity='1';btnStop.style.cursor='pointer'; }
+    else { btnStart.style.opacity='1';btnStart.style.cursor='pointer';btnStop.style.opacity='0.35';btnStop.style.cursor='not-allowed'; }
+  }
+}
+
+function renderStats(data) {
+  const bal=data.balance||{}, state=data.state||{};
+  document.getElementById('totalEquity').textContent=fmt(bal.total_equity);
+  document.getElementById('availableCash').textContent=fmt(bal.available_cash);
+  const pnl=state.realized_pnl||0;
+  const el=document.getElementById('realizedPnl');
+  el.textContent=(pnl>=0?'+':'')+pnl.toLocaleString('ko-KR')+'원';
+  el.className='text-xl font-bold '+(pnl>0?'text-green-400':pnl<0?'text-red-400':'text-white');
+  const krCount=Object.keys(data.positions_kr||{}).length;
+  const usCount=Object.keys(data.positions_us||{}).length;
+  document.getElementById('positionSummary').textContent=(krCount+usCount)+'종목'+(krCount&&usCount?` (KR${krCount}+US${usCount})`:'');
+}
+
+// ── 감시 종목 티커 ──────────────────────────────────────
+function renderWatchlist(positions, cfg, watchlistData, market) {
+  const key=market==='KR'?'kr_watchlist':'us_watchlist';
+  const watchlist=Array.isArray(cfg[key])?cfg[key]:(cfg[key]||'').split(',').filter(Boolean);
+  document.getElementById('watchlistCount').textContent=watchlist.length+'종목 감시 중';
+  const grid=document.getElementById('watchlistGrid');
+  if(!watchlist.length){grid.innerHTML='<p class="text-slate-600 text-xs">감시 종목 없음</p>';return;}
+
+  grid.innerHTML=watchlist.map(code=>{
+    const pos=positions[code];
+    const wd=watchlistData[code]||{};
+    const hasPnl=pos&&pos.pnl!==undefined;
+    const pnl=hasPnl?pos.pnl:0;
+    const pr=hasPnl?(pos.pnl_ratio||0):0;
+    const current=pos&&pos.current_price?pos.current_price:(wd.current_price||null);
+    const isOwned=!!pos;
+    const changeRate=hasPnl?pr:parseFloat(wd.change_rate||'0');
+    const upDown=changeRate>0?'ticker-up':changeRate<0?'ticker-down':'ticker-flat';
+    const arrow=changeRate>0?'▲':changeRate<0?'▼':'–';
+    const bg=isOwned?'rgba(59,130,246,.1)':'rgba(255,255,255,.03)';
+    const border=isOwned?'rgba(59,130,246,.3)':'rgba(255,255,255,.07)';
+    const stockName=pos&&pos.stock_name?pos.stock_name:(wd.stock_name||window._nameCache[code]||'');
+    const breakout=wd.target_breakout||0;
+    const ma5=wd.ma5||0;
+    const aboveBreakout=current&&breakout>0&&current>=breakout;
+    const priceStr=market==='US'?(current?'$'+parseFloat(current).toFixed(2):'-'):(current?current.toLocaleString()+'원':'-');
+    return `
+      <div class="rounded-xl p-3 cursor-pointer transition-all glass-hover"
+           style="background:${bg};border:1px solid ${border}"
+           onclick="openFromWatchlist('${code}','${market}')">
+        <div class="flex items-center justify-between mb-0.5">
+          <span class="font-bold text-white text-sm">${code}</span>
+          ${isOwned?`<span class="text-xs bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded-full">보유</span>`
+            :aboveBreakout?`<span class="text-xs bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded-full">매수신호</span>`:''}
+        </div>
+        ${stockName?`<div class="text-xs text-slate-400 mb-1 truncate">${stockName}</div>`:'<div class="mb-1"></div>'}
+        <div class="flex items-baseline gap-1.5 mb-1">
+          <span class="text-sm font-bold text-slate-200">${priceStr}</span>
+          <span class="text-xs font-semibold ${upDown}">${arrow}${changeRate!==0?Math.abs(changeRate).toFixed(2)+'%':''}</span>
+        </div>
+        ${isOwned
+          ? `${hasPnl?`<div class="text-xs ${pnl>=0?'text-green-400':'text-red-400'} font-semibold">${pnl>=0?'+':''}${market==='US'?'$'+Math.abs(pnl).toFixed(2):pnl.toLocaleString()+'원'} (${pr>=0?'+':''}${pr}%)</div>`:''}
+             <div class="text-xs text-slate-600 mt-0.5">목표 ${(pos.target_sell_price||0).toLocaleString()||'-'} / 손절 ${(pos.stop_loss_price||0).toLocaleString()||'-'}</div>`
+          : breakout>0&&market==='KR'
+            ? `<div class="mt-1 pt-1 border-t border-white/5"><div class="flex justify-between text-xs">
+                <span class="${aboveBreakout?'text-green-400 font-semibold':'text-slate-500'}">돌파가 ${breakout.toLocaleString()}</span>
+                ${ma5>0?`<span class="text-slate-600">MA ${ma5.toLocaleString()}</span>`:''}
+               </div></div>`
+            : ''
+        }
+      </div>`;
+  }).join('');
+}
+
+// ── 포지션 렌더링 ────────────────────────────────────────
+function renderPositions(positions) {
+  const codes=Object.keys(positions);
+  document.getElementById('posCountAuto').textContent=codes.length?`(${codes.length}개)`:'';
+  if(!codes.length){
+    const empty='<p class="text-slate-600 text-xs text-center py-8">보유 포지션 없음</p>';
+    document.getElementById('posTableManual').innerHTML=empty;
+    document.getElementById('posTableAuto').innerHTML=empty;
+    return;
+  }
+  const html=codes.map(code=>{
+    const p=positions[code];
+    const isUS=(p.market||'KR')==='US';
+    const pnl=p.pnl||0, pr=p.pnl_ratio||0;
+    const pc=pnl>=0?'text-green-400':'text-red-400';
+    const bg=pnl>=0?'rgba(34,197,94,.08)':'rgba(239,68,68,.08)';
+    const border=pnl>=0?'rgba(34,197,94,.2)':'rgba(239,68,68,.2)';
+    const isAI=(p.source||'').includes('AI');
+    const target=p.target_sell_price||0;
+    const progress=target>0&&p.buy_price>0?Math.min(100,Math.max(0,((p.current_price||p.buy_price)-p.buy_price)/(target-p.buy_price)*100)):0;
+    const stockName=p.stock_name||window._nameCache[code]||'';
+    const pnlStr=isUS?'$'+(Math.abs(pnl)).toFixed(2):(Math.abs(pnl)).toLocaleString()+'원';
+    return `
+      <div class="rounded-2xl p-3.5 transition-all" style="background:${bg};border:1px solid ${border}">
+        <div class="flex items-center justify-between mb-1.5">
+          <div class="flex items-center gap-2">
+            <div>
+              <div class="flex items-center gap-1.5">
+                <span class="font-bold text-white">${code}</span>
+                <span class="text-xs px-1 py-0.5 rounded" style="background:rgba(255,255,255,.08);color:#94a3b8">${isUS?'🇺🇸':'🇰🇷'}</span>
+                ${isAI?`<span class="text-xs font-bold px-1.5 py-0.5 rounded-full" style="background:rgba(139,92,246,.2);color:#a78bfa">AI</span>`:''}
+              </div>
+              ${stockName?`<div class="text-xs text-slate-400">${stockName}</div>`:''}
+            </div>
+          </div>
+          <span class="${pc} font-bold text-sm">${pnl>=0?'+':'-'}${pnlStr}</span>
+        </div>
+        <div class="grid grid-cols-3 gap-1 text-xs mb-2.5">
+          <div class="text-center"><div class="text-slate-500 mb-0.5">매수가</div><div class="text-white font-medium">${isUS?'$'+(p.buy_price||0).toFixed(2):(p.buy_price||0).toLocaleString()}</div></div>
+          <div class="text-center"><div class="text-slate-500 mb-0.5">현재가</div><div class="font-bold ${pc}">${p.current_price?(isUS?'$'+parseFloat(p.current_price).toFixed(2):p.current_price.toLocaleString()):'-'}</div></div>
+          <div class="text-center"><div class="text-slate-500 mb-0.5">수익률</div><div class="font-bold ${pc}">${(pr>=0?'+':'')+pr}%</div></div>
+        </div>
+        ${target>0?`
+        <div class="mb-2">
+          <div class="flex justify-between text-xs text-slate-500 mb-1">
+            <span>목표 ${isUS?'$'+parseFloat(target).toFixed(2):target.toLocaleString()}</span>
+            <span>${progress.toFixed(0)}%</span>
+          </div>
+          <div class="h-1.5 rounded-full bg-white/10 overflow-hidden">
+            <div class="h-full rounded-full transition-all" style="width:${progress}%;background:linear-gradient(90deg,#3b82f6,#22c55e)"></div>
+          </div>
+        </div>`:''}
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-red-400">손절 ${isUS?'$'+(p.stop_loss_price||0).toFixed(2):(p.stop_loss_price||0).toLocaleString()}</span>
+          <button onclick="quickSell('${code}','${p.market||'KR'}')" class="text-xs font-semibold px-3 py-1.5 rounded-lg transition-all" style="background:rgba(239,68,68,.2);color:#fca5a5;border:1px solid rgba(239,68,68,.3)">매도</button>
+        </div>
+      </div>`;
+  }).join('');
+  document.getElementById('posTableManual').innerHTML=html;
+  document.getElementById('posTableAuto').innerHTML=html;
+}
+
+function renderConfig(cfg) {
+  const set=(id,v)=>{const e=document.getElementById(id);if(e&&v!==undefined)e.value=v;};
+  set('cfgK',cfg.k_factor);
+  set('cfgMA',cfg.ma_period);
+  set('cfgStopLoss',cfg.stop_loss_ratio!==undefined?(cfg.stop_loss_ratio*100).toFixed(1):'');
+  set('cfgMaxPos',cfg.max_position_ratio!==undefined?(cfg.max_position_ratio*100).toFixed(0):'');
+  set('cfgDailyTarget',cfg.daily_profit_target!==undefined?(cfg.daily_profit_target*100).toFixed(1):'');
+  set('cfgKrWatchlist',Array.isArray(cfg.kr_watchlist)?cfg.kr_watchlist.join(','):cfg.kr_watchlist);
+  set('cfgUsWatchlist',Array.isArray(cfg.us_watchlist)?cfg.us_watchlist.join(','):cfg.us_watchlist);
+  set('cfgMock',(cfg.is_mock===true||cfg.is_mock==='true')?'true':'false');
+  const n=parseInt(cfg.ai_stock_count)||3; currentStockCount=n;
+  [3,4,5].forEach(i=>{const b=document.getElementById('cnt'+i);if(b)b.className='flex-1 py-2.5 rounded-xl text-sm font-bold border transition-all '+(i===n?'cnt-active':'cnt-inactive');});
+  updateInvestmentGuide();
+  // API 설정 모달 프리필
+  if(cfg.app_key) { document.getElementById('modalAppKey').value=cfg.app_key; document.getElementById('modalAccountNo').value=cfg.account_no||''; document.getElementById('modalMock').value=cfg.is_mock?'true':'false'; }
+}
+
+function _renderMiniChart(points, rising=true) {
+  const svg = document.getElementById('miniChartSvg');
+  if(!svg || !Array.isArray(points) || points.length < 2) return;
+  const w = 280, h = 90, p = 6;
+  const min = Math.min(...points), max = Math.max(...points);
+  const span = Math.max(1e-6, max - min);
+  const step = (w - p*2) / (points.length - 1);
+  const coords = points.map((v, i) => {
+    const x = p + i * step;
+    const y = h - p - ((v - min) / span) * (h - p*2);
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(' ');
+  const stroke = rising ? '#22c55e' : '#ef4444';
+  const fill = rising ? 'rgba(34,197,94,.12)' : 'rgba(239,68,68,.12)';
+  const firstX = p, lastX = p + (points.length - 1) * step;
+  const area = `${coords} ${lastX.toFixed(2)},${(h-p).toFixed(2)} ${firstX.toFixed(2)},${(h-p).toFixed(2)}`;
+  svg.innerHTML = `
+    <polyline points="${area}" fill="${fill}" stroke="none"></polyline>
+    <polyline points="${coords}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></polyline>
+  `;
+}
+
+async function loadMiniChart(code, market=currentMarket) {
+  const wrap = document.getElementById('miniChartWrap');
+  const title = document.getElementById('miniChartTitle');
+  const price = document.getElementById('miniChartPrice');
+  const change = document.getElementById('miniChartChange');
+  if(!wrap || !title || !price || !change) return;
+  try {
+    const data = await apiFetch(`/api/chart?code=${encodeURIComponent(code)}&market=${encodeURIComponent(market)}`);
+    if(!data.ok || !data.points || data.points.length < 2) throw new Error(data.error || '차트 데이터 없음');
+    const rise = (data.change_pct || 0) >= 0;
+    title.textContent = `${market === 'US' ? '🇺🇸' : '🇰🇷'} ${code}`;
+    price.textContent = market === 'US' ? ` $${Number(data.latest||0).toFixed(2)}` : ` ${Number(data.latest||0).toLocaleString('ko-KR')}원`;
+    change.textContent = `${(data.change_pct||0) >= 0 ? '+' : ''}${(data.change_pct||0).toFixed(2)}%`;
+    change.className = `text-xs ${rise ? 'text-green-400' : 'text-red-400'}`;
+    _renderMiniChart(data.points, rise);
+    wrap.classList.remove('hidden');
+  } catch(e) {
+    title.textContent = `${market === 'US' ? '🇺🇸' : '🇰🇷'} ${code}`;
+    price.textContent = '';
+    change.textContent = '차트 데이터 없음';
+    change.className = 'text-xs text-slate-500';
+    const svg = document.getElementById('miniChartSvg');
+    if(svg) svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#64748b" font-size="11">데이터 없음</text>';
+    wrap.classList.remove('hidden');
+  }
+}
+
+function loadMiniChartFromInput() {
+  const code = (document.getElementById('orderCode')?.value || '').trim().toUpperCase();
+  if(!code) return;
+  const market = /^[A-Z]+$/.test(code) ? 'US' : 'KR';
+  loadMiniChart(code, market);
+}
+
+function openFromWatchlist(code, market) {
+  const input = document.getElementById('orderCode');
+  if(input) input.value = code;
+  switchTab('manual');
+  // 탭 전환 직후 렌더 타이밍 보장
+  setTimeout(() => loadMiniChart(code, market), 0);
+}
+
+// ── 주문 ────────────────────────────────────────────────
+async function placeOrder(side) {
+  const code=document.getElementById('orderCode').value.trim().toUpperCase();
+  const qty=parseInt(document.getElementById('orderQty').value)||0;
+  const price=parseFloat(document.getElementById('orderPrice').value)||0;
+  const el=document.getElementById('orderResult');
+  if(!code){el.textContent='종목코드를 입력하세요';return;}
+  // 미국 주식 자동 감지 (알파벳으로만 구성)
+  const mkt=/^[A-Z]+$/.test(code)?'US':'KR';
+  const label=side==='buy'?'매수':'매도';
+  if(!confirm(`[${label}][${mkt}] ${code}${qty>0?' '+qty+'주':' (자동수량)'}${price>0?' @ '+price:' (시장가)'}\n\n진행하시겠습니까?`)) return;
+  el.textContent=`${label} 주문 중...`;
+  try {
+    const data=await apiFetch('/api/order',{method:'POST',body:JSON.stringify({stock_code:code,side,quantity:qty,price,market:mkt})});
+    if(data.ok){ el.textContent=`✅ ${label} 완료 | ${data.quantity}주 @ ${mkt==='US'?'$'+data.price:fmt(data.price)}`; showToast(`✅ ${label} 완료`,'success'); setTimeout(loadAll,1500); }
+    else{ el.textContent='❌ '+(data.error||'오류'); showToast(data.error,'error'); }
+  } catch(e){ el.textContent='❌ 네트워크 오류'; }
+}
+
+async function quickSell(code, market='KR') {
+  if(!confirm(`[매도][${market}] ${code} 전량 시장가 매도\n\n진행하시겠습니까?`)) return;
+  const data=await apiFetch('/api/order',{method:'POST',body:JSON.stringify({stock_code:code,side:'sell',quantity:0,price:0,market})});
+  if(data.ok){showToast(`✅ ${code} 매도 완료`,'success');setTimeout(loadAll,1500);}
+  else showToast(data.error,'error');
+}
+
+async function botControl(action) {
+  const labels={start:'시작',stop:'중지',resume:'재개'};
+  if(!confirm(`봇을 ${labels[action]}하시겠습니까?`)) return;
+  try {
+    const data=await apiFetch('/api/bot',{method:'POST',body:JSON.stringify({action})});
+    if(data.ok){
+      showToast('✅ '+data.message,'success');
+      setTimeout(loadAll,500);
+    } else {
+      showToast('오류: '+(data.error||'알 수 없는 오류'),'error');
+    }
+  } catch(e) {
+    showToast('요청 실패: '+e.message,'error');
+    console.error('botControl error:', e);
+  }
+}
+
+async function runAI(session) {
+  const labels={morning:'오전 09:30',afternoon:'오후 13:00',late:'마감 15:30'};
+  if(!confirm(`AI ${labels[session]} 세션 실행 (${currentMarket})\n감시종목 분석 → 알고리즘 스코어링 → ${currentStockCount}종목 자동 매수\n\n진행하시겠습니까?`)) return;
+  const el=document.getElementById('aiRunStatus');
+  el.textContent='🤖 AI 분석 중... (20~30초)';
+  const data=await apiFetch('/api/ai/run',{method:'POST',body:JSON.stringify({session,market:currentMarket})});
+  if(data.ok){showToast(`✅ AI ${labels[session]} 완료`,'success');el.textContent='✅ 완료';setTimeout(()=>{loadAll();loadRecommendations();el.textContent='';},1000);}
+  else{el.textContent='❌ '+(data.error||'오류');showToast(data.error,'error');}
+}
+
+async function loadRecommendations() {
+  const el=document.getElementById('aiRecsPanel');
+  try {
+    const data=await apiFetch('/api/recommendations');
+    if(!data.ok||!data.recommendations.length){el.innerHTML='<p class="text-slate-600 text-xs text-center py-8">추천 이력 없음</p>';return;}
+    const sl={morning:'오전 09:30',afternoon:'오후 13:00',late:'마감 15:30'};
+    el.innerHTML=data.recommendations.map(rec=>{
+      const recs=rec.recommendations||[];
+      const mktFlag=rec.market==='US'?'🇺🇸':'🇰🇷';
+      return `<div class="rounded-2xl p-3.5 mb-1 fade-up" style="background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.2)">
+        <div class="flex items-center justify-between mb-2.5">
+          <span class="text-purple-300 font-semibold text-xs">${mktFlag} ✨ ${sl[rec.session]||rec.session}</span>
+          <div class="flex items-center gap-2">
+            <span class="text-slate-500 text-xs">${rec.timestamp?rec.timestamp.split('T')[0]:'-'}</span>
+            <span class="${rec.status==='completed'?'text-green-400':'text-yellow-400'} text-xs">${rec.status==='completed'?`✅ ${rec.executed_count||0}종목`:'⏳'}</span>
+          </div>
+        </div>
+        ${recs.map(r=>{
+          const sc=r.score>=70?'text-green-400':r.score>=40?'text-yellow-400':'text-slate-400';
+          const scBg=r.score>=70?'rgba(34,197,94,.15)':r.score>=40?'rgba(234,179,8,.15)':'rgba(100,116,139,.15)';
+          const isUS=rec.market==='US';
+          const sname=r.stock_name||(window._nameCache&&window._nameCache[r.code])||'';
+          const pFmt=v=>isUS?'$'+parseFloat(v||0).toFixed(2):(v||0).toLocaleString();
+          return `<div class="rounded-xl p-2.5 mb-1.5" style="background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06)">
+            <div class="flex items-center justify-between mb-1.5">
+              <div>
+                <span class="font-bold text-white">${r.code}</span>
+                ${sname?`<span class="text-xs text-slate-500 ml-1">${sname}</span>`:''}
+              </div>
+              <div class="flex gap-1.5 items-center">
+                <span class="text-xs font-bold px-2 py-0.5 rounded-full ${sc}" style="background:${scBg}">${r.score||0}점</span>
+                <span class="text-xs text-slate-500">RR ${(r.rr_ratio||0).toFixed(1)}</span>
+              </div>
+            </div>
+            ${r.reason?`<div class="text-xs text-slate-400 mb-2 leading-relaxed px-1 py-1.5 rounded-lg" style="background:rgba(139,92,246,.08);border-left:2px solid rgba(139,92,246,.4)">💬 ${r.reason}</div>`:''}
+            <div class="grid grid-cols-3 gap-1 text-center text-xs">
+              <div style="background:rgba(59,130,246,.15);border-radius:8px;padding:4px"><div class="text-slate-500">매수</div><div class="text-blue-300 font-bold">${pFmt(r.buy_price)}</div></div>
+              <div style="background:rgba(34,197,94,.15);border-radius:8px;padding:4px"><div class="text-slate-500">목표 +${r.profit_ratio||0}%</div><div class="text-green-300 font-bold">${pFmt(r.sell_price)}</div></div>
+              <div style="background:rgba(239,68,68,.15);border-radius:8px;padding:4px"><div class="text-slate-500">손절 -${r.risk_ratio||0}%</div><div class="text-red-300 font-bold">${pFmt(r.stop_loss)}</div></div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>`;
+    }).join('');
+  } catch(e){ el.innerHTML=`<p class="text-red-400 text-xs text-center py-4">오류: ${e.message}</p>`; }
+}
+
+async function saveConfig() {
+  const isMock=document.getElementById('cfgMock').value==='true';
+  if(!isMock&&!confirm('⚠️ 실전투자 모드 변경\n실제 자산 거래됩니다!\n\n정말 변경하시겠습니까?')) return;
+  const maxPosRaw = parseFloat(document.getElementById('cfgMaxPos').value);
+  const el=document.getElementById('configResult');
+  if(isNaN(maxPosRaw) || maxPosRaw <= 0 || maxPosRaw > 100) {
+    el.textContent='❌ 최대 비중은 1~100 사이로 입력해주세요.';
+    return;
+  }
+  const payload={
+    k_factor:parseFloat(document.getElementById('cfgK').value),
+    ma_period:parseInt(document.getElementById('cfgMA').value),
+    stop_loss_ratio:parseFloat(document.getElementById('cfgStopLoss').value)/100,
+    max_position_ratio:maxPosRaw/100,
+    daily_profit_target:parseFloat(document.getElementById('cfgDailyTarget').value)/100,
+    kr_watchlist:document.getElementById('cfgKrWatchlist').value.split(',').map(s=>s.trim()).filter(Boolean),
+    us_watchlist:document.getElementById('cfgUsWatchlist').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean),
+    is_mock:isMock,
+  };
+  el.textContent='저장 중...';
+  const data=await apiFetch('/api/config',{method:'POST',body:JSON.stringify(payload)});
+  if(data.ok){el.textContent='✅ 저장 완료';showToast('설정 저장됨','success');setTimeout(()=>{el.textContent='';loadAll();},2000);}
+  else el.textContent='❌ '+data.error;
+}
+
+async function loadTrades() {
+  tradesLoaded=true;
+  const tbody=document.getElementById('tradesTable');
+  const data=await apiFetch('/api/trades');
+  if(!data.ok||!data.trades.length){tbody.innerHTML='<tr><td colspan="8" class="text-center py-8 text-slate-600">매매 이력 없음</td></tr>';return;}
+  tbody.innerHTML=data.trades.map(t=>{
+    const isBuy=t.side==='buy'; const pnl=t.pnl||0;
+    const isUS=(t.market||'KR')==='US';
+    return `<tr class="border-b border-white/5 hover:bg-white/3 transition-colors">
+      <td class="px-5 py-3 text-xs text-slate-500">${fmtTime(t.timestamp)}</td>
+      <td class="px-4 py-3 font-bold text-white">${t.stock_code}</td>
+      <td class="px-3 py-3 text-center text-xs">${isUS?'🇺🇸':'🇰🇷'}</td>
+      <td class="px-3 py-3 text-center">
+        <span class="px-2.5 py-1 rounded-full text-xs font-semibold ${isBuy?'text-blue-300':'text-red-300'}" style="background:${isBuy?'rgba(59,130,246,.2)':'rgba(239,68,68,.2)'}">${isBuy?'매수':'매도'}</span>
+      </td>
+      <td class="px-3 py-3 text-right text-slate-300">${isUS?fmtUSD(t.price):fmt(t.price)}</td>
+      <td class="px-3 py-3 text-right text-slate-400">${(t.quantity||0).toLocaleString()}주</td>
+      <td class="px-3 py-3 text-right text-xs ${pnl>0?'text-green-400':pnl<0?'text-red-400':'text-slate-600'}">${pnl!==0?(pnl>=0?'+':'')+pnl.toLocaleString():'-'}</td>
+      <td class="px-5 py-3 text-xs text-slate-600">${t.reason||'-'}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadLogs() {
+  logsLoaded=true;
+  const el=document.getElementById('logContainer');
+  const data=await apiFetch('/api/logs');
+  if(!data.ok||!data.logs.length){el.innerHTML='<p class="text-slate-600">로그 없음</p>';return;}
+  const c={INFO:'text-slate-300',WARNING:'text-yellow-400',ERROR:'text-red-400',DEBUG:'text-slate-600'};
+  el.innerHTML=data.logs.map(l=>`
+    <div class="py-0.5">
+      <span class="text-slate-600">${fmtTime(l.timestamp)}</span>
+      <span class="${c[l.level]||'text-slate-400'} font-semibold"> [${l.level}]</span>
+      <span class="${c[l.level]||'text-slate-400'}"> ${l.message}</span>
+    </div>`).join('');
+}
+
+// 스크립트 로드 완료
+</script>
+</body>
+</html>

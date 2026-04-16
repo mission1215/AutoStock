@@ -1,0 +1,37 @@
+# 환경 변수 (절대 커밋 금지)
+.env
+functions/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 가상환경
+venv/
+env/
+.venv/
+
+# 로그
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Firebase 로컬 캐시
+.firebase/
+
+# Claude Code 로컬 설정
+.claude/
