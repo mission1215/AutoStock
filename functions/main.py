@@ -1399,14 +1399,18 @@ def calculate_optimal_prices_us(current_price: float, ohlcv: list[dict], cfg: di
     """미국 주식 최적 매수/매도/손절가 (ATR 1.8배 목표, RR ≥ 2.0 추구)"""
     atr = _calc_atr_us(ohlcv)
     buy_price = current_price
+    sl_ratio = cfg.get("stop_loss_ratio", 0.03)
     if atr > 0:
-        sell_price    = buy_price + atr * 1.8          # 미국 목표 배수 (KR 1.5 대비 넓게)
-        stop_by_atr   = buy_price - atr * 0.8          # 빠른 손절 (KR 1.0 대비 좁게)
-        stop_by_ratio = buy_price * (1 - cfg.get("stop_loss_ratio", 0.025))
+        # 목표: ATR 3.5배 또는 최소 10% 중 큰 값 (미국은 변동성 더 큼)
+        sell_by_atr = buy_price + atr * 3.5
+        sell_by_min = buy_price * 1.10
+        sell_price  = max(sell_by_atr, sell_by_min)
+        stop_by_atr   = buy_price - atr * 1.0
+        stop_by_ratio = buy_price * (1 - sl_ratio)
         stop_loss     = max(stop_by_atr, stop_by_ratio)
     else:
-        sell_price = buy_price * 1.025
-        stop_loss  = buy_price * (1 - cfg.get("stop_loss_ratio", 0.025))
+        sell_price = buy_price * 1.10
+        stop_loss  = buy_price * (1 - sl_ratio)
 
     profit_ratio = (sell_price - buy_price) / buy_price * 100
     risk_ratio   = (buy_price - stop_loss)  / buy_price * 100
@@ -1482,14 +1486,18 @@ def score_stock_algorithm(current_price: float, ohlcv: list[dict], cfg: dict) ->
 def calculate_optimal_prices(current_price: float, ohlcv: list[dict], cfg: dict) -> dict:
     atr = _calc_atr(ohlcv)
     buy_price = current_price
+    sl_ratio = cfg.get("stop_loss_ratio", 0.03)
     if atr > 0:
-        sell_price = buy_price + atr * 1.5
+        # 목표: ATR 3배 또는 최소 8% 중 큰 값
+        sell_by_atr = buy_price + atr * 3.0
+        sell_by_min = buy_price * 1.08
+        sell_price = max(sell_by_atr, sell_by_min)
         stop_by_atr = buy_price - atr * 1.0
-        stop_by_ratio = buy_price * (1 - cfg.get("stop_loss_ratio", 0.02))
+        stop_by_ratio = buy_price * (1 - sl_ratio)
         stop_loss = max(stop_by_atr, stop_by_ratio)
     else:
-        sell_price = buy_price * 1.02
-        stop_loss = buy_price * (1 - cfg.get("stop_loss_ratio", 0.02))
+        sell_price = buy_price * 1.08
+        stop_loss = buy_price * (1 - sl_ratio)
     profit_ratio = (sell_price - buy_price) / buy_price * 100
     risk_ratio = (buy_price - stop_loss) / buy_price * 100
     rr_ratio = profit_ratio / risk_ratio if risk_ratio > 0 else 0
@@ -1536,6 +1544,8 @@ def merge_position_after_avg_down(
         "stop_loss_price": sl,
         "avg_down_count": cnt,
         "avg_down_last_at": datetime.now(KST).isoformat(),
+        # 물타기 후 평단이 바뀌므로 분할익절 기준도 새 평단 기준으로 재활성화
+        "partial_tp_done": False,
     })
 
 
@@ -1566,9 +1576,9 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
 
             # 분할 익절 (포지션당 1회): 평단 대비 +N% 도달 시 일부 매도 후 손절선을 본전 부근으로 상향
             if cfg.get("partial_tp_enabled", True) and not pos.get("partial_tp_done") and qty > 1:
-                trig_pct = float(cfg.get("partial_tp_trigger_pct", 0.02))
+                trig_pct = float(cfg.get("partial_tp_trigger_pct", 0.05))
                 if current >= buy_avg * (1 + trig_pct):
-                    sell_ratio = float(cfg.get("partial_tp_sell_ratio", 0.33))
+                    sell_ratio = float(cfg.get("partial_tp_sell_ratio", 0.30))
                     sell_qty = max(1, math.floor(qty * sell_ratio))
                     if sell_qty >= qty:
                         sell_qty = qty - 1
@@ -1743,7 +1753,7 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                         sname = _stock_name(out.get("hts_kor_isnm", "") if isinstance(out, dict) else "", code, "KR")
                         tp = calculate_optimal_prices(current, ohlcv, cfg)["sell_price"]
                         register_buy(
-                            uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
+                            uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.03),
                             float(tp), "자동", sname,
                         )
                         add_trade(uid, "KR", code, "buy", current, qty, "자동매수", stock_name=sname)
@@ -2372,13 +2382,7 @@ def _run_ai_session_impl(
             uid, "INFO",
             f"[AI] 스코어 산출 {len(scored)}개 — 상한 {cap}종 중 최대 {len(scored)}개만 추천 가능",
         )
-    _add_log(
-        uid, "INFO",
-        f"[AI] 포트폴리오 상한 {cap}종 · 현재 보유 {held}종 · 잔여 슬롯 {slots} — "
-        f"이번 신규 매수 목표 {n_buy}건 ({'자동' if buy_mode == 'auto' else '사용자 지정'})",
-    )
-    top_stocks = scored[:cap]
-
+    # _ai_build_rec: 추천 카드 dict 생성 헬퍼 (슬롯 없음 분기에서도 사용하므로 먼저 정의)
     def _ai_build_rec(code: str, score: float, detail: dict) -> dict:
         info    = stock_details.get(code, {})
         current = info.get("current", 0)
@@ -2396,6 +2400,32 @@ def _run_ai_session_impl(
             "reason": gem_reason,
             **prices, "detail": detail,
         }
+
+    top_stocks = scored[:cap]
+
+    if n_buy == 0:
+        # 포트폴리오 상한 도달: 추천 카드만 저장하고 매수 없이 종료
+        recommendations = [_ai_build_rec(c, s, d) for c, s, d in top_stocks]
+        session_id = datetime.now(KST).strftime("%Y%m%d_") + session + "_" + market
+        _uref(uid).collection("recommendations").document(session_id).set({
+            "session_id": session_id, "session": session, "market": market,
+            "timestamp": datetime.now(KST), "candidates": candidate_codes,
+            "recommendations": recommendations, "status": "completed",
+            "portfolio_cap": cap, "held_before": held, "slots_remaining": 0,
+            "target_new_buys": 0, "executed_codes": [], "executed_count": 0,
+            "completed_at": datetime.now(KST),
+        })
+        _add_log(uid, "INFO",
+                 f"[AI {session}] 포트폴리오 상한 {cap}종 중 {held}종 보유 — 슬롯 없음. "
+                 f"현재 보유 종목을 매도하거나 'AI 추천 종목 수'를 늘려야 신규 매수 가능합니다.")
+        _add_log(uid, "INFO",
+                 f"[AI {session}] 완료 — 신규 0/0건 (추천 카드 {len(recommendations)}종목 · 상한 {cap}종 중 보유 {held})")
+        return
+    _add_log(
+        uid, "INFO",
+        f"[AI] 포트폴리오 상한 {cap}종 · 현재 보유 {held}종 · 잔여 슬롯 {slots} — "
+        f"이번 신규 매수 목표 {n_buy}건 ({'자동' if buy_mode == 'auto' else '사용자 지정'})",
+    )
 
     # ── 추천 목록 생성 (화면·이력용 상위 cap종목) ───────────────
     recommendations = [_ai_build_rec(c, s, d) for c, s, d in top_stocks]
@@ -2474,7 +2504,7 @@ def _run_ai_session_impl(
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 sname    = _stock_name("", code, "US")
                 register_buy(uid, "US", code, current, qty,
-                             cfg.get("stop_loss_ratio", 0.025),
+                             cfg.get("stop_loss_ratio", 0.03),
                              target_sell_price=float(rec["sell_price"]),
                              source=f"AI_{session}(점수{rec['score']})",
                              stock_name=sname)
@@ -2507,7 +2537,7 @@ def _run_ai_session_impl(
                     continue
                 result   = place_order_kr(uid, cfg, code, "buy", qty, 0)
                 order_no = result.get("output", {}).get("ODNO", "N/A")
-                register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
+                register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.03),
                              target_sell_price=float(rec["sell_price"]),
                              source=f"AI_{session}(점수{rec['score']})",
                              stock_name=rec.get("stock_name", ""))
@@ -2577,9 +2607,9 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
             sn      = pos.get("stock_name", "")
 
             if cfg.get("partial_tp_enabled", True) and not pos.get("partial_tp_done") and qty > 1:
-                trig_pct = float(cfg.get("partial_tp_trigger_pct", 0.02))
+                trig_pct = float(cfg.get("partial_tp_trigger_pct", 0.05))
                 if current >= buy_avg * (1 + trig_pct):
-                    sell_ratio = float(cfg.get("partial_tp_sell_ratio", 0.33))
+                    sell_ratio = float(cfg.get("partial_tp_sell_ratio", 0.30))
                     sell_qty = max(1, math.floor(qty * sell_ratio))
                     if sell_qty >= qty:
                         sell_qty = qty - 1
@@ -2735,7 +2765,7 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
             order_no = result.get("output", {}).get("ODNO", "N/A")
             sname    = _stock_name(out.get("rsym", ""), code, "US")
             register_buy(uid, "US", code, current, qty,
-                         cfg.get("stop_loss_ratio", 0.025),
+                         cfg.get("stop_loss_ratio", 0.03),
                          target_sell_price=prices["sell_price"],
                          source="자동_US", stock_name=sname)
             add_trade(uid, "US", code, "buy", current, qty, "자동매수_US", stock_name=sname)
@@ -3070,7 +3100,7 @@ def route_setup():
         "us_watchlist": body.get("us_watchlist", ["AAPL", "NVDA", "TSLA"]),
         "k_factor": float(body.get("k_factor", 0.5)),
         "ma_period": int(body.get("ma_period", 5)),
-        "stop_loss_ratio": float(body.get("stop_loss_ratio", 0.02)),
+        "stop_loss_ratio": float(body.get("stop_loss_ratio", 0.03)),
         "max_position_ratio": float(body.get("max_position_ratio", 0.10)),
         "daily_profit_target": float(body.get("daily_profit_target", 0.03)),
         "ai_stock_count": int(body.get("ai_stock_count", 3)),
@@ -3343,7 +3373,7 @@ def route_order():
                 tp_kr = calculate_optimal_prices(current, ohlcv_o, cfg)["sell_price"]
                 register_buy(
                     uid, "KR", stock_code, current, quantity,
-                    cfg.get("stop_loss_ratio", 0.02), float(tp_kr), "수동", sname,
+                    cfg.get("stop_loss_ratio", 0.03), float(tp_kr), "수동", sname,
                 )
                 add_trade(uid, "KR", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][KR] {stock_code} {quantity}주@{current:,} 주문={order_no}")
@@ -3385,7 +3415,7 @@ def route_order():
                 tp_us = calculate_optimal_prices_us(current, ohlcv_us_m, cfg)["sell_price"]
                 register_buy(
                     uid, "US", stock_code, current, quantity,
-                    cfg.get("stop_loss_ratio", 0.02), float(tp_us), "수동", sname,
+                    cfg.get("stop_loss_ratio", 0.03), float(tp_us), "수동", sname,
                 )
                 add_trade(uid, "US", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][US] {stock_code} {quantity}주@${current:.2f}")
