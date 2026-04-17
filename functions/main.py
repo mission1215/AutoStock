@@ -14,6 +14,8 @@ HTTP API (/api/*):
   GET  /api/trades          — 매매 이력
   GET  /api/logs            — 최근 로그
   GET  /api/recommendations — AI 추천 이력
+  GET  /api/research        — 오늘의 시장 리서치 (Gemini, 일 1회 캐시)
+  GET  /api/quote           — 종목 현재가·이름 (주문 전 참고용)
   POST /api/ai/run          — AI 추천 수동 실행
 """
 
@@ -53,11 +55,46 @@ _BALANCE_TTL = 30  # 초
 _OHLCV_TTL = 300   # 초 (일봉은 초단위로 자주 바뀌지 않음)
 
 def _cached_price(uid: str, cfg: dict, code: str, market: str) -> dict:
-    """현재가를 인메모리 캐시에서 반환. 만료 시 KIS API 재조회."""
+    """현재가를 인메모리 캐시에서 반환. 만료 시 KIS API 재조회.
+
+    조회 우선순위:
+    1. 인메모리 캐시 (TTL=60초)
+    2. Firestore realtime_prices/{code} — kis_ws.py 데몬이 15초마다 갱신 (KR만)
+    3. KIS REST API (폴백)
+    """
     key = f"{uid}:{market}:{code}"
     now = time_module.time()
+
+    # 1. 인메모리 캐시
     if key in _price_cache and now - _price_cache[key]["ts"] < _PRICE_TTL:
         return _price_cache[key]["data"]
+
+    # 2. Firestore 실시간 가격 (WebSocket 데몬 기록, KR 전용)
+    if market == "KR":
+        try:
+            rt_doc = get_db().collection("realtime_prices").document(code).get()
+            if rt_doc.exists:
+                rt = rt_doc.to_dict()
+                rt_ts = rt.get("timestamp")
+                if rt_ts:
+                    rt_age = (datetime.now(KST) - rt_ts.astimezone(KST)).total_seconds()
+                    if rt_age < 15:  # 15초 이내의 WebSocket 데이터
+                        price = int(rt.get("price", 0))
+                        if price > 0:
+                            data = {
+                                "output": {
+                                    "stck_prpr": str(price),
+                                    "stck_clpr": str(price),
+                                    "acml_vol":  str(rt.get("volume", 0)),
+                                    "_source":   "ws",
+                                }
+                            }
+                            _price_cache[key] = {"data": data, "ts": now}
+                            return data
+        except Exception:
+            pass  # WebSocket 데몬 미실행 시 REST API 폴백
+
+    # 3. KIS REST API
     if market == "KR":
         data = get_current_price_kr(uid, cfg, code)
     else:
@@ -73,6 +110,11 @@ def _cached_balance(uid: str, cfg: dict) -> dict:
     data = get_balance_kr(uid, cfg)
     _balance_cache[uid] = {"data": data, "ts": now}
     return data
+
+
+def _invalidate_balance_cache(uid: str) -> None:
+    """주문 직후 잔고·주문가능 금액이 바로 반영되도록 캐시 제거."""
+    _balance_cache.pop(uid, None)
 
 def _cached_ohlcv(uid: str, cfg: dict, code: str, market: str) -> list:
     """일봉 데이터를 인메모리 캐시에서 반환. 만료 시 KIS API 재조회."""
@@ -132,6 +174,63 @@ US_STOCK_NAMES: dict[str, str] = {
     "SOXL": "반도체 3X ETF", "TQQQ": "나스닥 3X ETF",
 }
 
+# ── 섹터 분류 맵 ───────────────────────────────────────────────────
+KR_SECTOR_MAP: dict[str, str] = {
+    # 반도체
+    "005930": "반도체", "000660": "반도체", "042700": "반도체",
+    "009150": "반도체", "011070": "반도체",
+    # IT/플랫폼
+    "035420": "IT플랫폼", "035720": "IT플랫폼", "018260": "IT플랫폼",
+    # 자동차
+    "005380": "자동차", "000270": "자동차", "012330": "자동차", "030600": "자동차",
+    # 2차전지
+    "247540": "2차전지", "086520": "2차전지", "373220": "2차전지",
+    "006400": "2차전지", "051910": "2차전지",
+    # 바이오/제약
+    "068270": "바이오", "128940": "바이오", "000100": "바이오",
+    "326030": "바이오", "207940": "바이오",
+    # 금융
+    "105560": "금융", "055550": "금융", "086790": "금융",
+    "316140": "금융", "024110": "금융", "039490": "금융",
+    "071050": "금융", "032830": "금융",
+    # 조선/방산
+    "267250": "조선방산", "009540": "조선방산", "064350": "조선방산",
+    # 엔터/게임
+    "352820": "엔터게임", "036570": "엔터게임", "251270": "엔터게임",
+    "263750": "엔터게임", "041510": "엔터게임", "035900": "엔터게임",
+    "293490": "엔터게임",
+    # 철강/소재
+    "005490": "철강소재", "010130": "철강소재", "004020": "철강소재",
+    # 기타
+    "017670": "통신", "030200": "통신", "015760": "에너지",
+    "028260": "지주", "034730": "지주", "003550": "지주",
+}
+
+US_SECTOR_MAP: dict[str, str] = {
+    # 반도체
+    "NVDA": "반도체", "AMD": "반도체", "QCOM": "반도체",
+    "INTC": "반도체", "AVGO": "반도체", "MU": "반도체",
+    "AMAT": "반도체", "TSM": "반도체", "ASML": "반도체",
+    "ARM": "반도체", "SOXL": "반도체",
+    # 빅테크
+    "AAPL": "빅테크", "MSFT": "빅테크", "GOOGL": "빅테크",
+    "AMZN": "빅테크", "META": "빅테크", "ORCL": "빅테크",
+    "ADBE": "빅테크", "CRM": "빅테크", "NOW": "빅테크",
+    "TQQQ": "빅테크", "QQQ": "빅테크",
+    # EV/자동차
+    "TSLA": "EV자동차", "RIVN": "EV자동차", "NIO": "EV자동차",
+    # 금융
+    "JPM": "금융", "V": "금융", "MA": "금융", "GS": "금융",
+    # 바이오
+    "UNH": "바이오", "JNJ": "바이오",
+    # AI/플랫폼
+    "PLTR": "AI플랫폼", "NFLX": "AI플랫폼",
+    # 기타
+    "COIN": "암호화폐", "SOFI": "핀테크",
+    "WMT": "유통", "HD": "유통",
+    "BIDU": "중국빅테크",
+}
+
 
 def _stock_name(api_name: str, code: str, market: str = "KR") -> str:
     name = (api_name or "").strip()
@@ -158,6 +257,62 @@ def _us_price_from_output(out: dict, ohlcv: list | None = None) -> float:
         except Exception:
             return 0.0
     return 0.0
+
+
+def _parse_num_kr(raw: Any) -> int:
+    """한국 시세 숫자 필드 — 콤마·대시 포함 문자열 대응 (int('217,500') 방지)."""
+    if raw is None:
+        return 0
+    try:
+        s = str(raw).strip().replace(",", "")
+        if not s or s in ("-", ".", "--"):
+            return 0
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def _kr_price_from_output(out: dict | Any, ohlcv: list | None = None) -> int:
+    """국내 주식현재가 시세 output에서 가격 추출. 누락·0이면 일봉·전일가 폴백."""
+    if not isinstance(out, dict):
+        out = {}
+    for key in ("stck_prpr", "antc_cnpr", "prdy_clpr", "bfdy_clpr"):
+        v = _parse_num_kr(out.get(key))
+        if v > 0:
+            return v
+    if ohlcv:
+        for row in ohlcv[:10]:
+            if not isinstance(row, dict):
+                continue
+            for k in ("stck_clpr", "stck_oprc", "stck_hgpr"):
+                v = _parse_num_kr(row.get(k))
+                if v > 0:
+                    return v
+    return 0
+
+
+def _kr_holdings_prpr_by_code(bal: dict) -> dict[str, int]:
+    """잔고 조회 output1의 종목별 현재가(prpr) — 시세 단독 실패 시 보유 종목 표시용."""
+    m: dict[str, int] = {}
+    for row in bal.get("output1") or []:
+        if not isinstance(row, dict):
+            continue
+        pd = str(row.get("pdno", "")).strip()
+        if not pd:
+            continue
+        if pd.isdigit() and len(pd) <= 6:
+            pd = pd.zfill(6)
+        pr = _parse_num_kr(row.get("prpr"))
+        if pr > 0:
+            m[pd] = pr
+    return m
+
+
+def _kr_price_from_api_data(data: dict, ohlcv: list | None = None) -> int:
+    out = data.get("output") or {}
+    if not isinstance(out, dict):
+        out = {}
+    return _kr_price_from_output(out, ohlcv)
 
 
 # ══════════════════════════════════════════════════════════
@@ -278,6 +433,54 @@ def invalidate_token(uid: str):
     _uref(uid).collection("state").document("token").delete()
 
 
+def get_token_real(uid: str, cfg: dict) -> str:
+    """미국 주식 전용 실서버 토큰.
+    is_mock 설정과 무관하게 항상 실서버(openapi.koreainvestment.com)에서 발급.
+    모의 토큰으로 실서버 US 시세 API를 호출하면 401 → 이 함수로 해결.
+    """
+    doc = _uref(uid).collection("state").document("token_real").get()
+    now = datetime.now(KST)
+    if doc.exists:
+        data = doc.to_dict()
+        token = data.get("access_token", "")
+        expires_at = data.get("expires_at")
+        if token and expires_at:
+            exp = expires_at if getattr(expires_at, "tzinfo", None) else expires_at.replace(tzinfo=KST)
+            if exp > now + timedelta(minutes=5):
+                return token
+    url = _base_url(False) + "/oauth2/tokenP"
+    resp = http_requests.post(
+        url,
+        json={"grant_type": "client_credentials",
+              "appkey": cfg["app_key"], "appsecret": cfg["app_secret"]},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "access_token" not in data:
+        raise ValueError(f"실서버 토큰 오류: {data}")
+    token = data["access_token"]
+    expires_at = datetime.now(KST) + timedelta(seconds=int(data.get("expires_in", 86400)))
+    _uref(uid).collection("state").document("token_real").set({
+        "access_token": token, "expires_at": expires_at,
+        "issued_at": datetime.now(KST),
+    })
+    _add_log(uid, "INFO", f"[US] 실서버 토큰 발급 | 만료: {expires_at.strftime('%H:%M:%S')}")
+    return token
+
+
+def _headers_us(uid: str, cfg: dict, tr_id: str) -> dict:
+    """미국 주식 시세 API 헤더 — 항상 실서버 토큰 사용 (모의/실전 무관)"""
+    return {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {get_token_real(uid, cfg)}",
+        "appkey": cfg["app_key"],
+        "appsecret": cfg["app_secret"],
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+
+
 # ══════════════════════════════════════════════════════════
 # KIS API 클라이언트
 # ══════════════════════════════════════════════════════════
@@ -304,7 +507,18 @@ def _parse(resp: http_requests.Response, uid: str, cfg: dict) -> dict:
     if resp.status_code == 401:
         invalidate_token(uid)
         raise ApiError("HTTP 401 — 토큰 만료", rt_cd="401")
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        try:
+            data = resp.json()
+        except ValueError:
+            raise ApiError(f"KIS HTTP {resp.status_code}: {resp.text[:600]}") from None
+        rt_cd = str(data.get("rt_cd", ""))
+        msg_cd = data.get("msg_cd", "")
+        msg1 = data.get("msg1", str(data))
+        if msg_cd in ("EGW00123", "EGW00121"):
+            invalidate_token(uid)
+            raise ApiError(f"토큰 만료: {msg_cd}", rt_cd=rt_cd, msg_cd=msg_cd)
+        raise ApiError(f"KIS HTTP {resp.status_code}: {msg1}", rt_cd=rt_cd, msg_cd=msg_cd)
     data = resp.json()
     rt_cd = data.get("rt_cd", "")
     msg_cd = data.get("msg_cd", "")
@@ -341,14 +555,32 @@ def _with_retry(func, *args, retries: int = 3, **kwargs):
 # ── 한국 주식 API ──────────────────────────────────────────
 
 def get_current_price_kr(uid: str, cfg: dict, stock_code: str) -> dict:
-    def _call():
+    """주식현재가 시세 — 코스피(J)·코스닥(Q) 순으로 조회해 빈 시세 완화."""
+
+    def _fetch(div: str):
         resp = http_requests.get(
             _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/quotations/inquire-price",
             headers=_headers(uid, cfg, "FHKST01010100"),
-            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code},
+            params={"FID_COND_MRKT_DIV_CODE": div, "FID_INPUT_ISCD": stock_code},
             timeout=10,
         )
         return _parse(resp, uid, cfg)
+
+    def _call():
+        last_ok: dict | None = None
+        for div in ("J", "Q"):
+            try:
+                data = _fetch(div)
+                out = data.get("output") or {}
+                if isinstance(out, dict) and _kr_price_from_output(out, None) > 0:
+                    return data
+                last_ok = data
+            except ApiError:
+                continue
+        if last_ok is not None:
+            return last_ok
+        return _fetch("J")
+
     return _with_retry(_call)
 
 
@@ -406,15 +638,23 @@ def place_order_kr(uid: str, cfg: dict, stock_code: str, side: str, quantity: in
     tr_id = _tr_id(cfg, "TTTC0802U" if side == "buy" else "TTTC0801U",
                         "VTTC0802U" if side == "buy" else "VTTC0801U")
     ord_dvsn = "01" if price == 0 else "00"
+    # KIS 문서·커뮤니티: 매도 시 SLL_TYPE 등 누락 시 order-cash 가 HTTP 500 반환하는 사례 있음
+    body: dict[str, str] = {
+        "CANO": _account_prefix(cfg["account_no"]),
+        "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
+        "PDNO": stock_code,
+        "ORD_DVSN": ord_dvsn,
+        "ORD_QTY": str(quantity),
+        "ORD_UNPR": str(int(price)),
+    }
+    if side == "sell":
+        body["SLL_TYPE"] = "01"  # 01: 일반매도
+        body["CTAC_TLNO"] = ""
+        body["ALGO_NO"] = ""
     resp = http_requests.post(
         _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/trading/order-cash",
         headers=_headers(uid, cfg, tr_id),
-        json={
-            "CANO": _account_prefix(cfg["account_no"]),
-            "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
-            "PDNO": stock_code, "ORD_DVSN": ord_dvsn,
-            "ORD_QTY": str(quantity), "ORD_UNPR": str(price),
-        },
+        json=body,
         timeout=10,
     )
     return _parse(resp, uid, cfg)
@@ -425,17 +665,24 @@ def place_order_kr(uid: str, cfg: dict, stock_code: str, side: str, quantity: in
 US_MARKET_MAP = {"NASD": "NASD", "NYSE": "NYSE", "AMEX": "AMEX"}
 
 def _us_excd(stock_code: str) -> str:
-    """종목 코드로 거래소 추정 (기본 NASD)"""
+    """매매 API용 거래소 코드 (4자리, 기본 NASD)"""
     return "NASD"
 
 
+def _us_excd_quote(stock_code: str) -> str:
+    """시세 조회 API용 거래소 코드 (3자리, 기본 NAS)
+    HHDFS00000300 / HHDFS76240000 등 조회 API는 3자리 코드 사용.
+    """
+    return "NAS"
+
+
 def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
-    """미국 주식 현재가 조회"""
+    """미국 주식 현재가 조회 — 항상 실서버 + 실서버 토큰"""
     def _call():
         resp = http_requests.get(
-            _base_url(False) + "/uapi/overseas-stock/v1/quotations/price",
-            headers=_headers(uid, cfg, "HHDFS00000300"),
-            params={"AUTH": "", "EXCD": _us_excd(stock_code), "SYMB": stock_code},
+            _base_url(False) + "/uapi/overseas-price/v1/quotations/price",
+            headers=_headers_us(uid, cfg, "HHDFS00000300"),
+            params={"AUTH": "", "EXCD": _us_excd_quote(stock_code), "SYMB": stock_code},
             timeout=10,
         )
         parsed = _parse(resp, uid, cfg)
@@ -447,12 +694,12 @@ def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
 
 
 def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
-    """미국 주식 일봉 조회"""
+    """미국 주식 일봉 조회 — 항상 실서버 + 실서버 토큰"""
     resp = http_requests.get(
-        _base_url(False) + "/uapi/overseas-stock/v1/quotations/dailyprice",
-        headers=_headers(uid, cfg, "HHDFS76240000"),
+        _base_url(False) + "/uapi/overseas-price/v1/quotations/dailyprice",
+        headers=_headers_us(uid, cfg, "HHDFS76240000"),
         params={
-            "AUTH": "", "EXCD": _us_excd(stock_code),
+            "AUTH": "", "EXCD": _us_excd_quote(stock_code),
             "SYMB": stock_code, "GUBN": "0", "BYMD": "", "MODP": "0",
         },
         timeout=10,
@@ -461,11 +708,10 @@ def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
 
 
 def get_balance_us(uid: str, cfg: dict) -> dict:
-    """미국 주식 잔고 조회"""
-    tr_id = _tr_id(cfg, "JTTT3012R", "VTTT3012R")
+    """미국 주식 잔고 조회 — 항상 실서버 (VTS 미지원)"""
     resp = http_requests.get(
-        _base_url(cfg.get("is_mock", True)) + "/uapi/overseas-stock/v1/trading/inquire-balance",
-        headers=_headers(uid, cfg, tr_id),
+        _base_url(False) + "/uapi/overseas-stock/v1/trading/inquire-balance",
+        headers=_headers_us(uid, cfg, "JTTT3012R"),
         params={
             "CANO": _account_prefix(cfg["account_no"]),
             "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
@@ -479,14 +725,12 @@ def get_balance_us(uid: str, cfg: dict) -> dict:
 
 def place_order_us(uid: str, cfg: dict, stock_code: str, side: str, quantity: int, price: float = 0) -> dict:
     """미국 주식 매수/매도 주문"""
-    if side == "buy":
-        tr_id = _tr_id(cfg, "JTTT1002U", "VTTT1002U")
-    else:
-        tr_id = _tr_id(cfg, "JTTT1006U", "VTTT1006U")
+    # KIS VTS(모의)는 미국 주식 매매 미지원 → 항상 실서버 + 실서버 TR ID
+    tr_id = "JTTT1002U" if side == "buy" else "JTTT1006U"
     ord_dvsn = "00" if price > 0 else "01"  # 00=지정가, 01=시장가
     resp = http_requests.post(
-        _base_url(cfg.get("is_mock", True)) + "/uapi/overseas-stock/v1/trading/order",
-        headers=_headers(uid, cfg, tr_id),
+        _base_url(False) + "/uapi/overseas-stock/v1/trading/order",
+        headers=_headers_us(uid, cfg, tr_id),
         json={
             "CANO": _account_prefix(cfg["account_no"]),
             "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
@@ -551,9 +795,11 @@ def register_sell(uid: str, market: str, stock_code: str, sell_price: float) -> 
 
 
 def add_trade(uid: str, market: str, stock_code: str, side: str,
-              price: float, quantity: int, reason: str = "", pnl: float = 0.0):
+              price: float, quantity: int, reason: str = "", pnl: float = 0.0,
+              stock_name: str = ""):
     _uref(uid).collection("trades").add({
-        "stock_code": stock_code, "market": market, "side": side,
+        "stock_code": stock_code, "stock_name": stock_name,
+        "market": market, "side": side,
         "price": price, "quantity": quantity, "reason": reason,
         "pnl": pnl, "timestamp": datetime.now(KST),
     })
@@ -618,6 +864,81 @@ def _is_us_market_open() -> bool:
     market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
     market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
     return market_open <= now_et <= market_close
+
+
+def _check_drawdown(uid: str, cfg: dict) -> bool:
+    """포트폴리오 드로우다운 체크 — 임계치 초과 시 매매 자동 중단.
+
+    peak_equity 대비 현재 자산이 max_drawdown_pct(기본 5%) 이상 하락하면
+    trading_halted=True로 설정하고 True를 반환합니다.
+    start_equity가 0이면 체크를 건너뜁니다 (장 시작 전 초기화 미완료).
+
+    Returns
+    -------
+    bool
+        True → 드로우다운 한도 초과, 이 사이클은 매매 건너뜀
+        False → 정상
+    """
+    max_dd = float(cfg.get("max_drawdown_pct", 0.05))
+    try:
+        state        = get_bot_state(uid)
+        start_equity = float(state.get("start_equity", 0))
+        if start_equity <= 0:
+            return False
+
+        current_equity = _get_total_equity_kr(uid, cfg)
+        if current_equity <= 0:
+            return False
+
+        # peak equity 갱신
+        peak = float(state.get("peak_equity", start_equity))
+        if current_equity > peak:
+            peak = current_equity
+            update_bot_state(uid, {"peak_equity": peak})
+
+        dd_pct = (peak - current_equity) / peak
+        if dd_pct >= max_dd:
+            update_bot_state(uid, {
+                "trading_halted": True,
+                "halt_reason": f"드로우다운 {dd_pct:.1%} ≥ 한도 {max_dd:.1%}",
+            })
+            _add_log(uid, "WARNING",
+                     f"[리스크] 드로우다운 {dd_pct:.1%} ≥ 한도 {max_dd:.1%} "
+                     f"| 고점={peak:,.0f} 현재={current_equity:,.0f} — 매매 자동 중단")
+            return True
+    except Exception as e:
+        _add_log(uid, "ERROR", f"[리스크] 드로우다운 체크 오류: {e}")
+    return False
+
+
+def _get_sector_exposure(uid: str, market: str) -> dict[str, int]:
+    """현재 보유 포지션의 섹터별 종목 수 반환.
+
+    Returns
+    -------
+    dict[str, int]
+        {"반도체": 2, "바이오": 1, ...}
+    """
+    positions  = get_positions(uid, market)
+    sector_map = KR_SECTOR_MAP if market == "KR" else US_SECTOR_MAP
+    exposure: dict[str, int] = {}
+    for code in positions:
+        sector = sector_map.get(code, "기타")
+        exposure[sector] = exposure.get(sector, 0) + 1
+    return exposure
+
+
+def _sector_ok(code: str, market: str, exposure: dict[str, int], max_per_sector: int) -> tuple[bool, str]:
+    """섹터 한도 초과 여부 판정.
+
+    Returns
+    -------
+    (ok: bool, sector: str)
+    """
+    sector_map = KR_SECTOR_MAP if market == "KR" else US_SECTOR_MAP
+    sector     = sector_map.get(code, "기타")
+    count      = exposure.get(sector, 0)
+    return count < max_per_sector, sector
 
 
 def _calc_rsi(closes: list[float], period: int = 14) -> float:
@@ -893,21 +1214,28 @@ def calculate_optimal_prices(current_price: float, ohlcv: list[dict], cfg: dict)
 def run_strategy_cycle_kr(uid: str, cfg: dict):
     state = get_bot_state(uid)
     if not state.get("bot_enabled", True): return
-    # is_market_open 플래그가 False여도 실시간 시간 기준으로 재확인 (스케줄러 누락 대비)
     if not state.get("is_market_open", False) and not _is_kr_market_open(): return
     if state.get("trading_halted", False): return
+    if _check_drawdown(uid, cfg): return
+
+    now_min = datetime.now(KST).minute
+    verbose = (now_min % 10 == 0)
 
     positions = get_positions(uid, "KR")
     for code, pos in list(positions.items()):
         try:
             data = get_current_price_kr(uid, cfg, code)
-            current = int(data["output"]["stck_prpr"])
+            ohlcv_pos = get_daily_ohlcv_kr(uid, cfg, code)
+            current = _kr_price_from_api_data(data, ohlcv_pos)
+            if current <= 0:
+                _add_log(uid, "WARNING", f"[KR][{code}] 현재가 0 — 목표/손절 건너뜀")
+                continue
             target = pos.get("target_sell_price", 0)
             if target > 0 and current >= target:
                 qty = pos["quantity"]
                 place_order_kr(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "KR", code, current)
-                add_trade(uid, "KR", code, "sell", current, qty, "목표가_달성", pnl)
+                add_trade(uid, "KR", code, "sell", current, qty, "목표가_달성", pnl, stock_name=pos.get("stock_name", ""))
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "INFO", f"[KR][{code}] 목표가 달성 매도 | 현재={current:,} 목표={target:,}")
                 continue
@@ -915,39 +1243,83 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                 qty = pos["quantity"]
                 place_order_kr(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "KR", code, current)
-                add_trade(uid, "KR", code, "sell", current, qty, "손절", pnl)
+                add_trade(uid, "KR", code, "sell", current, qty, "손절", pnl, stock_name=pos.get("stock_name", ""))
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "WARNING", f"[KR][{code}] 손절 | 현재={current:,}")
         except Exception as e:
             _add_log(uid, "ERROR", f"[KR][{code}] 포지션 체크 오류: {e}")
 
     positions = get_positions(uid, "KR")
-    for code in cfg.get("kr_watchlist", []):
-        if code in positions: continue
+    watchlist = cfg.get("kr_watchlist", [])
+    diag_parts: list[str] = []
+    max_per_sector  = int(cfg.get("max_positions_per_sector", 2))
+    sector_exposure = _get_sector_exposure(uid, "KR")
+
+    for code in watchlist:
+        if code in positions:
+            diag_parts.append(f"{code}=보유중")
+            continue
         try:
             data = get_current_price_kr(uid, cfg, code)
-            current = int(data["output"]["stck_prpr"])
             ohlcv = get_daily_ohlcv_kr(uid, cfg, code)
-            if len(ohlcv) >= 2:
-                today_open = float(ohlcv[0]["stck_oprc"])
-                prev_range = float(ohlcv[1]["stck_hgpr"]) - float(ohlcv[1]["stck_lwpr"])
-                target = today_open + cfg.get("k_factor", 0.5) * prev_range
-                ma5 = sum(float(r["stck_clpr"]) for r in ohlcv[:5]) / min(5, len(ohlcv))
-                if current > target and current > ma5:
-                    available = get_available_cash_kr(uid, cfg, code)
-                    equity = _get_total_equity_kr(uid, cfg) or available
-                    invest = min(available, equity * cfg.get("max_position_ratio", 0.1))
-                    qty = math.floor(invest / current)
-                    if qty > 0:
-                        result = place_order_kr(uid, cfg, code, "buy", qty, 0)
-                        order_no = result.get("output", {}).get("ODNO", "N/A")
-                        sname = _stock_name(data["output"].get("hts_kor_isnm", ""), code, "KR")
-                        register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
-                                     source="자동", stock_name=sname)
-                        add_trade(uid, "KR", code, "buy", current, qty, "자동매수")
-                        _add_log(uid, "INFO", f"[KR][{code}] 매수 | {qty}주@{current:,} 주문={order_no}")
+            current = _kr_price_from_api_data(data, ohlcv)
+            if current <= 0:
+                diag_parts.append(f"{code}=시세없음")
+                continue
+            if len(ohlcv) < 2:
+                diag_parts.append(f"{code}=일봉부족({len(ohlcv)})")
+                continue
+
+            today_open = float(str(ohlcv[0].get("stck_oprc", 0)).replace(",", "") or 0)
+            prev_range = float(str(ohlcv[1].get("stck_hgpr", 0)).replace(",", "") or 0) - float(
+                str(ohlcv[1].get("stck_lwpr", 0)).replace(",", "") or 0
+            )
+            k = cfg.get("k_factor", 0.5)
+            target = today_open + k * prev_range
+            ma5 = sum(
+                float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv[:5]
+            ) / min(5, len(ohlcv))
+
+            above_target = current > target
+            above_ma5 = current > ma5
+
+            if above_target and above_ma5:
+                # 섹터 한도 체크
+                sec_ok, sector = _sector_ok(code, "KR", sector_exposure, max_per_sector)
+                if not sec_ok:
+                    diag_parts.append(f"{code}=섹터한도({sector}{sector_exposure.get(sector,0)}/{max_per_sector})")
+                    continue
+                available = get_available_cash_kr(uid, cfg, code)
+                equity = _get_total_equity_kr(uid, cfg) or available
+                invest = min(available, equity * cfg.get("max_position_ratio", 0.1))
+                qty = math.floor(invest / current)
+                if qty <= 0:
+                    qty = 1 if available >= current else 0
+                if qty > 0:
+                    result = place_order_kr(uid, cfg, code, "buy", qty, 0)
+                    order_no = result.get("output", {}).get("ODNO", "N/A")
+                    out = data.get("output") or {}
+                    sname = _stock_name(out.get("hts_kor_isnm", "") if isinstance(out, dict) else "", code, "KR")
+                    register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
+                                 source="자동", stock_name=sname)
+                    add_trade(uid, "KR", code, "buy", current, qty, "자동매수", stock_name=sname)
+                    _add_log(uid, "INFO", f"[KR][{code}] 자동매수 | {qty}주@{current:,} 주문={order_no}")
+                    diag_parts.append(f"{code}=✅매수{qty}주")
+                    sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
+                else:
+                    diag_parts.append(f"{code}=돌파했으나잔액부족(가격{current:,}/잔액{available:,.0f})")
+            else:
+                gap = current - target
+                diag_parts.append(
+                    f"{code}:현재{current:,}/돌파{target:,.0f}({'O' if above_target else f'X gap{gap:+,.0f}'})"
+                    f"/MA5_{ma5:,.0f}({'O' if above_ma5 else 'X'})"
+                )
         except Exception as e:
+            diag_parts.append(f"{code}=오류")
             _add_log(uid, "ERROR", f"[KR][{code}] 매수 체크 오류: {e}")
+
+    if verbose and diag_parts:
+        _add_log(uid, "DEBUG", f"[전략] {' | '.join(diag_parts)}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -960,8 +1332,10 @@ def _collect_kr_stock_data(uid: str, cfg: dict) -> list[dict]:
         try:
             price_data = get_current_price_kr(uid, cfg, code)
             out = price_data.get("output", {})
-            current = int(out.get("stck_prpr", 0))
+            if not isinstance(out, dict):
+                out = {}
             ohlcv = get_daily_ohlcv_kr(uid, cfg, code)
+            current = _kr_price_from_output(out, ohlcv)
             result.append({
                 "code": code, "current_price": current,
                 "change_rate": out.get("prdy_ctrt", "0"),
@@ -1001,6 +1375,179 @@ def _collect_us_stock_data(uid: str, cfg: dict) -> list[dict]:
         except Exception as e:
             _add_log(uid, "WARNING", f"[US][{code}] 데이터 수집 실패: {e}")
     return result
+
+
+def _research_date_key(market: str) -> str:
+    """캐시 키용 캘린더 날짜 (KR=KST, US=ET)."""
+    if market == "US":
+        return datetime.now(ET).date().isoformat()
+    return datetime.now(KST).date().isoformat()
+
+
+def _parse_gemini_json_object(raw_text: str) -> dict:
+    clean = re.sub(r"```(?:json)?", "", raw_text.strip()).strip().rstrip("`").strip()
+    return json.loads(clean)
+
+
+def _is_gemini_quota_error(exc: BaseException) -> bool:
+    """429 / RESOURCE_EXHAUSTED / free tier limit 등."""
+    msg = str(exc).upper()
+    if "429" in str(exc):
+        return True
+    if "RESOURCE_EXHAUSTED" in msg:
+        return True
+    if "QUOTA" in msg and ("EXCEED" in msg or "LIMIT" in msg or "0" in msg):
+        return True
+    return False
+
+
+def _research_fallback_response(uid: str, market: str, dk: str, quota: bool, detail: str = "") -> dict:
+    """Gemini 실패 시 Firestore에 쓰지 않고 UI용 문구만 반환."""
+    if quota:
+        bullets = [
+            "Google Gemini API 무료(또는 현재 플랜) 호출 한도가 찼습니다(429). 잠시 후 다시 시도하거나 요금제·할당량을 확인해 주세요.",
+            "Google AI Studio 또는 Cloud Console에서 결제·쿼터를 설정하면 동일 키로 한도가 늘어날 수 있습니다.",
+            "문서: https://ai.google.dev/gemini-api/docs/rate-limits · 사용량: https://ai.dev/rate-limit",
+        ]
+        title = "AI 리서치 — 할당량 초과"
+    else:
+        bullets = [
+            "AI 요약 생성에 실패했습니다. 잠시 후 새로고침 해 주세요.",
+            (detail[:180] + "…") if len(detail) > 180 else detail or "Gemini API 오류",
+        ]
+        title = "AI 리서치 — 생성 실패"
+    logger.warning("[research] uid=%s market=%s fallback quota=%s %s", uid, market, quota, detail[:120] if detail else "")
+    return {
+        "market": market,
+        "date": dk,
+        "title": title,
+        "bullets": bullets,
+        "cached": False,
+        "fallback": True,
+        "quota_exceeded": quota,
+    }
+
+
+def _gemini_generate_with_fallback(
+    client: genai.Client,
+    prompt: str,
+    *,
+    log_prefix: str = "gemini",
+    primary_env: str | None = None,
+    default_model: str = "gemini-2.0-flash",
+) -> str:
+    """여러 모델 순차 시도 — 429·모델 미지원 시 다음 후보."""
+    primary = (os.environ.get(primary_env) or default_model).strip() if primary_env else default_model
+    models: list[str] = [primary]
+    for m in ("gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-2.0-flash-lite"):
+        if m not in models:
+            models.append(m)
+    last_exc: BaseException | None = None
+    for model in models:
+        try:
+            response = client.models.generate_content(model=model, contents=prompt)
+            text = (response.text or "").strip()
+            if text:
+                logger.info("[%s] ok model=%s", log_prefix, model)
+                return text
+        except Exception as e:
+            last_exc = e
+            logger.warning("[%s] model=%s error: %s", log_prefix, model, e)
+            continue
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Gemini 응답이 비었습니다.")
+
+
+def _generate_research_content(client: genai.Client, prompt: str) -> str:
+    return _gemini_generate_with_fallback(
+        client, prompt, log_prefix="research", primary_env="GEMINI_MODEL_RESEARCH", default_model="gemini-2.0-flash"
+    )
+
+
+def get_or_create_daily_research(uid: str, market: str, force_refresh: bool = False) -> dict:
+    """
+    일별 시장 리서치 (Firestore 캐시 + Gemini).
+    """
+    dk = _research_date_key(market)
+    doc_ref = _uref(uid).collection("cache").document(f"market_research_{market}_{dk}")
+    if not force_refresh:
+        snap = doc_ref.get()
+        if snap.exists:
+            d = snap.to_dict() or {}
+            return {
+                "market": market,
+                "date": dk,
+                "title": d.get("title", ""),
+                "bullets": d.get("bullets", []),
+                "cached": True,
+            }
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return {
+            "market": market,
+            "date": dk,
+            "title": "시장 리서치",
+            "bullets": [
+                "GEMINI_API_KEY가 Cloud Functions 환경에 없어 요약을 생성할 수 없습니다.",
+                "Firebase Console → Functions → 환경 변수에 키를 등록한 뒤 다시 시도해 주세요.",
+            ],
+            "cached": False,
+            "fallback": True,
+        }
+
+    client = genai.Client(api_key=api_key)
+    if market == "US":
+        prompt = """You are a US equity strategist. Write a concise Korean summary for retail investors about what to watch today in US markets (indices mood, key sectors, volatility/risk). Do not claim real-time prices.
+Respond ONLY with valid JSON:
+{"title":"한 줄 제목 (한국어)","bullets":["불릿1 한국어","불릿2","불릿3"]}
+Use exactly 3 bullets, each under 120 characters."""
+    else:
+        prompt = """당신은 한국 증시 전략가입니다. 개인 투자자가 오늘 장에서 확인하면 좋은 포인트를 한국어로 짧게 정리하세요. 실시간 시세 수치는 쓰지 말고 일반적인 관점만 제시하세요.
+반드시 아래 JSON만 출력하세요:
+{"title":"한 줄 제목","bullets":["불릿1","불릿2","불릿3"]}
+불릿은 정확히 3개, 각 120자 이내."""
+
+    try:
+        raw_text = _generate_research_content(client, prompt)
+    except Exception as e:
+        return _research_fallback_response(
+            uid, market, dk, quota=_is_gemini_quota_error(e), detail=str(e)
+        )
+
+    try:
+        parsed = _parse_gemini_json_object(raw_text)
+    except Exception:
+        parsed = {
+            "title": "오늘의 시장 포인트",
+            "bullets": [raw_text[:200] + ("…" if len(raw_text) > 200 else "")],
+        }
+    title = str(parsed.get("title", "오늘의 시장")).strip()
+    bullets_raw = parsed.get("bullets", [])
+    if isinstance(bullets_raw, str):
+        bullets = [bullets_raw]
+    else:
+        bullets = [str(b).strip() for b in bullets_raw if str(b).strip()][:5]
+    if len(bullets) < 1:
+        bullets = ["요약을 생성하지 못했습니다. 잠시 후 새로고침 해 주세요."]
+
+    doc_ref.set(
+        {
+            "title": title,
+            "bullets": bullets[:5],
+            "market": market,
+            "date_key": dk,
+            "updated_at": datetime.now(KST).isoformat(),
+        }
+    )
+    return {
+        "market": market,
+        "date": dk,
+        "title": title,
+        "bullets": bullets[:5],
+        "cached": False,
+    }
 
 
 def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, market: str = "KR") -> tuple[list[str], dict[str, str]]:
@@ -1063,8 +1610,9 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
     {{"code": "종목코드2", "reason": "추천 이유 1~2문장"}}
   ]
 }}"""
-    response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-    raw_text = response.text.strip()
+    raw_text = _gemini_generate_with_fallback(
+        client, prompt, log_prefix="candidates", primary_env="GEMINI_MODEL_AI", default_model="gemini-2.0-flash"
+    )
     clean = re.sub(r"```(?:json)?", "", raw_text).strip().rstrip("`").strip()
     parsed = json.loads(clean)
     raw_candidates = parsed.get("candidates", [])[:20]
@@ -1130,8 +1678,8 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
                 score_result = score_us_stock_algorithm(current, ohlcv, cfg)
             else:
                 data    = get_current_price_kr(uid, cfg, code)
-                current = int(data["output"]["stck_prpr"])
                 ohlcv   = get_daily_ohlcv_kr(uid, cfg, code)
+                current = _kr_price_from_api_data(data, ohlcv)
                 score_result = score_stock_algorithm(current, ohlcv, cfg)
             stock_details[code] = {"current": current, "ohlcv": ohlcv, "score": score_result}
             scored.append((code, score_result["score"], score_result["detail"]))
@@ -1179,7 +1727,9 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
     executed = []
     positions = get_positions(uid, market)
     # 미국 최소 점수: cfg에서 조절 가능 (기본 55점 / 125점 만점)
-    min_score_us = int(cfg.get("min_score_us", 55))
+    min_score_us     = int(cfg.get("min_score_us", 55))
+    max_per_sector   = int(cfg.get("max_positions_per_sector", 2))
+    sector_exposure  = _get_sector_exposure(uid, market)
 
     for rec in recommendations:
         code = rec["code"]
@@ -1187,6 +1737,13 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
             continue
         if market == "US" and rec["score"] < min_score_us:
             _add_log(uid, "INFO", f"[AI][US][{code}] 점수 미달({rec['score']}/{min_score_us}) — 건너뜀")
+            continue
+        # 섹터 노출 한도 체크
+        sec_ok, sector = _sector_ok(code, market, sector_exposure, max_per_sector)
+        if not sec_ok:
+            _add_log(uid, "INFO",
+                     f"[AI][{market}][{code}] 섹터 한도 | {sector} "
+                     f"{sector_exposure.get(sector, 0)}/{max_per_sector}개 — 건너뜀")
             continue
         try:
             if market == "US":
@@ -1210,16 +1767,25 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
                              target_sell_price=float(rec["sell_price"]),
                              source=f"AI_{session}(점수{rec['score']})",
                              stock_name=sname)
-                add_trade(uid, "US", code, "buy", current, qty, f"AI_{session}_US", 0.0)
+                add_trade(uid, "US", code, "buy", current, qty, f"AI_{session}_US", 0.0, stock_name=sname)
                 _add_log(uid, "INFO", f"[AI][US][{code}] 매수 | {qty}주@${current:.2f} 주문={order_no}")
             else:
                 data      = get_current_price_kr(uid, cfg, code)
-                current   = int(data["output"]["stck_prpr"])
+                ohlcv_ai  = get_daily_ohlcv_kr(uid, cfg, code)
+                current   = _kr_price_from_api_data(data, ohlcv_ai)
+                if current <= 0:
+                    _add_log(uid, "WARNING", f"[AI][KR][{code}] 현재가 0 — 매수 건너뜀")
+                    continue
                 available = get_available_cash_kr(uid, cfg, code)
                 equity    = _get_total_equity_kr(uid, cfg) or available
                 invest    = min(available, equity * cfg.get("max_position_ratio", 0.1))
                 qty       = math.floor(invest / current)
                 if qty <= 0:
+                    qty = 1 if available >= current else 0
+                if qty <= 0:
+                    _add_log(uid, "WARNING",
+                             f"[AI][KR][{code}] 매수불가 | 현재가={current:,} 주문가능={available:,.0f} "
+                             f"투자한도={invest:,.0f}(자산{equity:,.0f}×{cfg.get('max_position_ratio',0.1):.0%})")
                     continue
                 result   = place_order_kr(uid, cfg, code, "buy", qty, 0)
                 order_no = result.get("output", {}).get("ODNO", "N/A")
@@ -1227,9 +1793,11 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
                              target_sell_price=float(rec["sell_price"]),
                              source=f"AI_{session}(점수{rec['score']})",
                              stock_name=rec.get("stock_name", ""))
-                add_trade(uid, "KR", code, "buy", current, qty, f"AI_{session}", 0.0)
+                add_trade(uid, "KR", code, "buy", current, qty, f"AI_{session}", 0.0, stock_name=rec.get("stock_name", ""))
                 _add_log(uid, "INFO", f"[AI][{code}] 매수 | {qty}주@{current:,} 주문={order_no}")
             executed.append(code)
+            # 섹터 노출 카운트 업데이트 (루프 내 중복 매수 방지)
+            sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
         except Exception as e:
             _add_log(uid, "ERROR", f"[AI][{code}] 매수 오류: {e}")
 
@@ -1237,6 +1805,12 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
         "status": "completed", "executed_codes": executed,
         "executed_count": len(executed), "completed_at": datetime.now(KST),
     })
+
+    rec_codes = [r["code"] for r in recommendations]
+    wl_key = "us_watchlist" if market == "US" else "kr_watchlist"
+    if rec_codes:
+        save_config(uid, {wl_key: rec_codes})
+
     _add_log(uid, "INFO", f"[AI {session}] 완료 — {len(executed)}/{len(recommendations)}종목 매수")
 
 
@@ -1249,6 +1823,7 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
     state = get_bot_state(uid)
     if not state.get("bot_enabled", True): return
     if state.get("trading_halted", False): return
+    if _check_drawdown(uid, cfg): return
 
     # ── 보유 포지션 관리 ────────────────────────────────────
     positions = get_positions(uid, "US")
@@ -1265,14 +1840,14 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
             if target > 0 and current >= target:
                 place_order_us(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "US", code, current)
-                add_trade(uid, "US", code, "sell", current, qty, "목표가_달성", pnl)
+                add_trade(uid, "US", code, "sell", current, qty, "목표가_달성", pnl, stock_name=pos.get("stock_name", ""))
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "INFO", f"[US][{code}] 익절 | ${current:.2f} → 목표 ${target:.2f} | PnL ${pnl:+.2f}")
                 continue
             if slp > 0 and current <= slp:
                 place_order_us(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "US", code, current)
-                add_trade(uid, "US", code, "sell", current, qty, "손절", pnl)
+                add_trade(uid, "US", code, "sell", current, qty, "손절", pnl, stock_name=pos.get("stock_name", ""))
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "WARNING", f"[US][{code}] 손절 | ${current:.2f} ≤ 손절 ${slp:.2f}")
         except Exception as e:
@@ -1315,7 +1890,7 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                          cfg.get("stop_loss_ratio", 0.025),
                          target_sell_price=prices["sell_price"],
                          source="자동_US", stock_name=sname)
-            add_trade(uid, "US", code, "buy", current, qty, "자동매수_US")
+            add_trade(uid, "US", code, "buy", current, qty, "자동매수_US", stock_name=sname)
             _add_log(uid, "INFO",
                      f"[US][{code}] 매수 | {qty}주@${current:.2f} "
                      f"목표=${prices['sell_price']:.2f} 손절=${prices['stop_loss']:.2f} "
@@ -1401,8 +1976,10 @@ def scheduled_prepare(event: scheduler_fn.ScheduledEvent) -> None:
             get_token(uid, cfg)
             equity = _get_total_equity_kr(uid, cfg)
             update_bot_state(uid, {
-                "trading_halted": False, "realized_pnl": 0.0,
-                "start_equity": equity, "today": date.today().isoformat(),
+                "trading_halted": False, "halt_reason": "",
+                "realized_pnl": 0.0,
+                "start_equity": equity, "peak_equity": equity,
+                "today": date.today().isoformat(),
             })
             _add_log(uid, "INFO", f"[08:50] 준비 완료 | 기준자산={equity:,.0f}원")
         except Exception as e:
@@ -1427,13 +2004,15 @@ def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
     now = datetime.now(KST)
     if now.weekday() >= 5: return
     market_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=20, second=0, microsecond=0)  # 정규장 15:30, 여유 10분
+    market_end = now.replace(hour=15, minute=20, second=0, microsecond=0)
     if not (market_start <= now <= market_end): return
     for uid, cfg in _get_all_users():
         try:
             run_strategy_cycle_kr(uid, cfg)
         except Exception as e:
             _add_log(uid, "ERROR", f"전략 사이클 오류: {e}")
+    if now.minute % 10 == 0:
+        logging.info(f"[scheduled_strategy_cycle] heartbeat {now.strftime('%H:%M')}")
 
 
 @scheduler_fn.on_schedule(
@@ -1446,11 +2025,15 @@ def scheduled_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
         for code, pos in list(positions.items()):
             try:
                 data = get_current_price_kr(uid, cfg, code)
-                current = int(data["output"]["stck_prpr"])
+                ohlcv_c = get_daily_ohlcv_kr(uid, cfg, code)
+                current = _kr_price_from_api_data(data, ohlcv_c)
+                if current <= 0:
+                    _add_log(uid, "WARNING", f"[{code}] 장마감 청산: 현재가 0 — 건너뜀")
+                    continue
                 qty = pos["quantity"]
                 place_order_kr(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "KR", code, current)
-                add_trade(uid, "KR", code, "sell", current, qty, "장마감_청산", pnl)
+                add_trade(uid, "KR", code, "sell", current, qty, "장마감_청산", pnl, stock_name=pos.get("stock_name", ""))
                 state = get_bot_state(uid)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
             except Exception as e:
@@ -1576,7 +2159,7 @@ def scheduled_us_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
                 qty     = pos["quantity"]
                 place_order_us(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "US", code, current)
-                add_trade(uid, "US", code, "sell", current, qty, "US장마감_청산", pnl)
+                add_trade(uid, "US", code, "sell", current, qty, "US장마감_청산", pnl, stock_name=pos.get("stock_name", ""))
                 state = get_bot_state(uid)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "INFO", f"[US][{code}] 마감 청산 | ${current:.2f} | PnL ${pnl:+.2f}")
@@ -1655,15 +2238,23 @@ def route_status():
         positions_us = get_positions(uid, "US")
 
         balance_data: dict[str, Any] = {}
+        balance_prices_kr: dict[str, int] = {}
         kis_error: str = ""
         try:
             bal = _cached_balance(uid, cfg)
+            balance_prices_kr = _kr_holdings_prpr_by_code(bal)
             summary = bal.get("output2", [{}])
             if summary:
                 s = summary[0]
+                # 주문가능: inquire-balance 의 prvs_rcdl_excc_amt 는 모의투자에서 매수 후에도
+                # 초기 예수금처럼 보이는 경우가 있어, 매수가능조회(8908R) ord_psbl_cash 를 사용
+                try:
+                    ord_psbl = get_available_cash_kr(uid, cfg, "005930")
+                except Exception:
+                    ord_psbl = int(str(s.get("dnca_tot_amt", "0")).replace(",", "") or 0)
                 balance_data = {
                     "total_equity": s.get("tot_evlu_amt", "0").replace(",", ""),
-                    "available_cash": s.get("prvs_rcdl_excc_amt", "0").replace(",", ""),
+                    "available_cash": str(ord_psbl),
                     "stock_value": s.get("scts_evlu_amt", "0").replace(",", ""),
                 }
         except Exception as e:
@@ -1677,8 +2268,13 @@ def route_status():
                 try:
                     if market == "KR":
                         data = _cached_price(uid, cfg, code, "KR")
-                        out = data["output"]
-                        current = int(out["stck_prpr"])
+                        out = data.get("output") or {}
+                        if not isinstance(out, dict):
+                            out = {}
+                        ohlcv_kr = _cached_ohlcv(uid, cfg, code, "KR")
+                        current = _kr_price_from_output(out, ohlcv_kr)
+                        if current <= 0:
+                            current = balance_prices_kr.get(code, 0)
                         sname = _stock_name(out.get("hts_kor_isnm", ""), code, "KR")
                         change_rate = out.get("prdy_ctrt", "0")
                     else:
@@ -1687,8 +2283,10 @@ def route_status():
                         current = _us_price_from_output(out)
                         sname = _stock_name(out.get("rsym", ""), code, "US")
                         change_rate = out.get("diff", "0")
-                    pnl = (current - pos["buy_price"]) * pos["quantity"]
-                    pnl_ratio = (current - pos["buy_price"]) / pos["buy_price"] * 100
+                    bp = float(pos.get("buy_price") or 0)
+                    qty = int(pos.get("quantity") or 0)
+                    pnl = (current - bp) * qty
+                    pnl_ratio = ((current - bp) / bp * 100) if bp else 0.0
                     detail[code] = {
                         **pos,
                         "entry_time": _ts_to_str(pos.get("entry_time")),
@@ -1718,20 +2316,29 @@ def route_status():
             else:
                 try:
                     data = _cached_price(uid, cfg, code, "KR")
-                    out = data["output"]
+                    out = data.get("output") or {}
+                    if not isinstance(out, dict):
+                        out = {}
                     ohlcv = _cached_ohlcv(uid, cfg, code, "KR")
+                    cur_wl = _kr_price_from_output(out, ohlcv)
+                    if cur_wl <= 0:
+                        cur_wl = balance_prices_kr.get(code, 0)
                     entry: dict[str, Any] = {
-                        "current_price": int(out.get("stck_prpr", 0)),
+                        "current_price": cur_wl,
                         "stock_name": _stock_name(out.get("hts_kor_isnm", ""), code, "KR"),
                         "change_rate": out.get("prdy_ctrt", "0"),
                     }
                     if len(ohlcv) >= 2:
-                        today_open = float(ohlcv[0].get("stck_oprc", 0))
-                        prev_h = float(ohlcv[1].get("stck_hgpr", 0))
-                        prev_l = float(ohlcv[1].get("stck_lwpr", 0))
+                        today_open = float(str(ohlcv[0].get("stck_oprc", 0)).replace(",", "") or 0)
+                        prev_h = float(str(ohlcv[1].get("stck_hgpr", 0)).replace(",", "") or 0)
+                        prev_l = float(str(ohlcv[1].get("stck_lwpr", 0)).replace(",", "") or 0)
                         entry["target_breakout"] = int(today_open + cfg.get("k_factor", 0.5) * (prev_h - prev_l))
                     if len(ohlcv) >= 5:
-                        entry["ma5"] = int(sum(float(r.get("stck_clpr", 0)) for r in ohlcv[:5]) / 5)
+                        entry["ma5"] = int(
+                            sum(float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv[:5]) / 5
+                        )
+                    closes_wl = [float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv[:20]]
+                    entry["closes"] = [int(c) for c in reversed(closes_wl) if c > 0]
                     watchlist_data[code] = entry
                 except Exception:
                     watchlist_data[code] = {"current_price": 0, "stock_name": _stock_name("", code, "KR"), "change_rate": "0"}
@@ -1751,10 +2358,12 @@ def route_status():
                     data = _cached_price(uid, cfg, code, "US")
                     out = data["output"]
                     ohlcv_us = _cached_ohlcv(uid, cfg, code, "US")
+                    us_closes = [float(r.get("clos", 0)) for r in ohlcv_us[:20]]
                     us_watchlist_data[code] = {
                         "current_price": _us_price_from_output(out, ohlcv_us),
                         "stock_name": _stock_name(out.get("rsym", ""), code, "US"),
                         "change_rate": out.get("diff", "0"),
+                        "closes": [round(c, 2) for c in reversed(us_closes) if c > 0],
                     }
                 except Exception:
                     us_watchlist_data[code] = {"current_price": 0, "stock_name": _stock_name("", code, "US"), "change_rate": "0"}
@@ -1795,8 +2404,12 @@ def route_order():
 
         if market == "KR":
             data = get_current_price_kr(uid, cfg, stock_code)
-            current = int(data["output"]["stck_prpr"])
-            sname = _stock_name(data["output"].get("hts_kor_isnm", ""), stock_code, "KR")
+            ohlcv_o = get_daily_ohlcv_kr(uid, cfg, stock_code)
+            current = _kr_price_from_api_data(data, ohlcv_o)
+            if current <= 0:
+                return jsonify({"ok": False, "error": "현재가를 조회할 수 없습니다. 종목코드와 시장 구분을 확인해 주세요."}), 400
+            out_o = data.get("output") or {}
+            sname = _stock_name(out_o.get("hts_kor_isnm", ""), stock_code, "KR") if isinstance(out_o, dict) else _stock_name("", stock_code, "KR")
             if side == "buy":
                 if quantity <= 0:
                     available = get_available_cash_kr(uid, cfg, stock_code)
@@ -1809,9 +2422,13 @@ def route_order():
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 register_buy(uid, "KR", stock_code, current, quantity,
                              cfg.get("stop_loss_ratio", 0.02), stock_name=sname, source="수동")
-                add_trade(uid, "KR", stock_code, "buy", current, quantity, "수동매수")
+                add_trade(uid, "KR", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][KR] {stock_code} {quantity}주@{current:,} 주문={order_no}")
-                return jsonify({"ok": True, "order_no": order_no, "quantity": quantity, "price": current})
+                _invalidate_balance_cache(uid)
+                return jsonify({
+                    "ok": True, "order_no": order_no, "quantity": quantity, "price": current,
+                    "stock_name": sname, "note": "시장가 주문 시 아래 가격은 주문 직전 조회 시세이며, 실제 체결가는 거래소 확정입니다.",
+                })
             else:
                 positions = get_positions(uid, "KR")
                 pos = positions.get(stock_code)
@@ -1822,11 +2439,15 @@ def route_order():
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 if pos:
                     pnl = register_sell(uid, "KR", stock_code, current)
-                    add_trade(uid, "KR", stock_code, "sell", current, quantity, "수동매도", pnl)
+                    add_trade(uid, "KR", stock_code, "sell", current, quantity, "수동매도", pnl, stock_name=pos.get("stock_name", sname))
                     state = get_bot_state(uid)
                     update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "INFO", f"[수동매도][KR] {stock_code} {quantity}주@{current:,}")
-                return jsonify({"ok": True, "order_no": order_no, "quantity": quantity, "price": current})
+                _invalidate_balance_cache(uid)
+                return jsonify({
+                    "ok": True, "order_no": order_no, "quantity": quantity, "price": current,
+                    "stock_name": sname,
+                })
         else:
             data = get_current_price_us(uid, cfg, stock_code)
             out = data["output"]
@@ -1839,9 +2460,13 @@ def route_order():
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 register_buy(uid, "US", stock_code, current, quantity,
                              cfg.get("stop_loss_ratio", 0.02), stock_name=sname, source="수동")
-                add_trade(uid, "US", stock_code, "buy", current, quantity, "수동매수")
+                add_trade(uid, "US", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][US] {stock_code} {quantity}주@${current:.2f}")
-                return jsonify({"ok": True, "order_no": order_no, "quantity": quantity, "price": current})
+                _invalidate_balance_cache(uid)
+                return jsonify({
+                    "ok": True, "order_no": order_no, "quantity": quantity, "price": current,
+                    "stock_name": sname, "note": "Market order: price shown is quote at request time; fill may differ.",
+                })
             else:
                 positions = get_positions(uid, "US")
                 pos = positions.get(stock_code)
@@ -1852,11 +2477,12 @@ def route_order():
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 if pos:
                     pnl = register_sell(uid, "US", stock_code, current)
-                    add_trade(uid, "US", stock_code, "sell", current, quantity, "수동매도", pnl)
+                    add_trade(uid, "US", stock_code, "sell", current, quantity, "수동매도", pnl, stock_name=pos.get("stock_name", sname))
                     state = get_bot_state(uid)
                     update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "INFO", f"[수동매도][US] {stock_code} {quantity}주@${current:.2f}")
-                return jsonify({"ok": True, "order_no": order_no, "quantity": quantity, "price": current})
+                _invalidate_balance_cache(uid)
+                return jsonify({"ok": True, "order_no": order_no, "quantity": quantity, "price": current, "stock_name": sname})
 
     except ApiError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -1938,6 +2564,69 @@ def route_recommendations():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@flask_app.route("/api/research")
+def route_research():
+    """오늘의 시장 리서치 (일 1회 Firestore 캐시, ?refresh=1 로 강제 재생성)"""
+    uid, err = _require_auth()
+    if err:
+        return err
+    market = str(request.args.get("market", "KR")).upper()
+    if market not in ("KR", "US"):
+        market = "KR"
+    force = str(request.args.get("refresh", "")).strip() == "1"
+    try:
+        # KIS/설정과 무관 — Firebase 로그인만 되면 제공 (캐시는 users/{uid}/cache)
+        payload = get_or_create_daily_research(uid, market, force_refresh=force)
+        return jsonify({"ok": True, **payload})
+    except Exception as e:
+        logger.exception("route_research")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@flask_app.route("/api/quote")
+def route_quote():
+    """단일 종목 시세·종목명 — 수동 주문 전 현재가 표시용."""
+    uid, err = _require_auth()
+    if err:
+        return err
+    code = str(request.args.get("stock_code", "")).strip().upper()
+    market = str(request.args.get("market", "KR")).strip().upper()
+    if not code:
+        return jsonify({"ok": False, "error": "stock_code 필수"}), 400
+    if market not in ("KR", "US"):
+        market = "KR"
+    try:
+        cfg = get_config(uid)
+        if not cfg.get("setup_complete"):
+            return jsonify({"ok": False, "error": "설정을 먼저 완료해주세요"}), 400
+        if market == "KR":
+            data = get_current_price_kr(uid, cfg, code)
+            ohlcv_q = get_daily_ohlcv_kr(uid, cfg, code)
+            out = data.get("output") or {}
+            if not isinstance(out, dict):
+                out = {}
+            price = _kr_price_from_output(out, ohlcv_q)
+            if price <= 0:
+                return jsonify({"ok": False, "error": "시세를 조회할 수 없습니다"}), 400
+            name = _stock_name(out.get("hts_kor_isnm", ""), code, "KR")
+        else:
+            data = get_current_price_us(uid, cfg, code)
+            out = data["output"]
+            price = float(out.get("last", out.get("stck_prpr", 0)) or 0)
+            name = _stock_name(out.get("rsym", ""), code, "US")
+        return jsonify({
+            "ok": True,
+            "stock_code": code,
+            "market": market,
+            "name": name,
+            "price": price,
+        })
+    except ApiError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @flask_app.route("/api/chart")
 def route_chart():
     uid, err = _require_auth()
@@ -1971,7 +2660,9 @@ def route_chart():
             else:
                 cur_data = _cached_price(uid, cfg, code, "KR")
                 out = cur_data.get("output", {})
-                current = float(out.get("stck_prpr", 0) or 0)
+                if not isinstance(out, dict):
+                    out = {}
+                current = float(_kr_price_from_output(out, ohlcv))
             if current > 0:
                 points = [current, current]
             else:
@@ -1998,8 +2689,8 @@ def route_ai_run():
     body = request.get_json() or {}
     session = body.get("session", "morning")
     market = str(body.get("market", "KR")).upper()
-    if session not in ("morning", "afternoon", "late"):
-        return jsonify({"ok": False, "error": "session: morning/afternoon/late"}), 400
+    if session not in ("morning", "afternoon", "late", "manual"):
+        return jsonify({"ok": False, "error": "session: morning/afternoon/late/manual"}), 400
     try:
         cfg = get_config(uid)
         run_ai_session(uid, cfg, session, market)

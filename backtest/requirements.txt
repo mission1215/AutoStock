@@ -1,0 +1,10 @@
+# AutoStock Backtest Engine 의존성
+# pip install -r backtest/requirements.txt
+
+vectorbt>=0.24
+pandas>=1.5
+numpy>=1.23
+yfinance>=0.2
+matplotlib>=3.6
+seaborn>=0.12
+tabulate>=0.9
