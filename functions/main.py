@@ -1704,6 +1704,26 @@ Use exactly 3 bullets, each under 120 characters."""
     }
 
 
+def _resolve_allowed_stock_code(raw: str, stock_data: list[dict], market: str) -> str | None:
+    """Gemini가 낸 code를 감시 목록(stock_data)의 code와 매칭. 미허용·환각 티커는 None."""
+    s = str(raw).strip()
+    if not s:
+        return None
+    codes = [str(d.get("code", "")).strip() for d in stock_data if d.get("code")]
+    if not codes:
+        return None
+    if market == "US":
+        u = s.upper()
+        return u if u in codes else None
+    if s in codes:
+        return s
+    if s.isdigit():
+        z = s.zfill(6)
+        if z in codes:
+            return z
+    return None
+
+
 def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, market: str = "KR") -> tuple[list[str], dict[str, str]]:
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
@@ -1713,57 +1733,74 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
     us_sessions    = {"morning": "오전 (ET 10:30)", "afternoon": "오후 (ET 13:00)", "late": "마감 (ET 15:30)"}
     session_label  = (us_sessions if market == "US" else session_labels).get(session, session)
     data_json = json.dumps(stock_data, ensure_ascii=False, indent=2)
+    allowed_flat = ", ".join(
+        str(d.get("code", "")).strip()
+        for d in stock_data
+        if d.get("code")
+    ) or "(수집된 종목 없음)"
 
     if market == "US":
-        prompt = f"""당신은 미국 나스닥/NYSE 주식 단기 트레이딩 전문가입니다.
-오늘 {session_label} 세션 기준으로 아래 미국 주식들 중 당일~2일 단기 매매 가능성이 높은 후보를 최대 20개 선정하세요.
-각 종목의 추천 이유를 1~2문장으로 작성해주세요.
+        prompt = f"""[System Persona]
+You are a top-tier sell-side quant and short-term momentum specialist for US equities (NASDAQ/NYSE). Your task is to rank symbols from the PROVIDED DATA ONLY for the highest probability of favorable short-term (same session ~ 2 trading days) price action.
 
-분석할 종목 데이터:
+[Input Data — authoritative]
+The JSON below is the ONLY universe you may recommend from. Each row has: code (ticker), current_price, change_rate (%), volume, recent_ohlcv (up to 5 recent bars: date, open, high, low, close, volume when available).
+Session context: {session_label}
+
 {data_json}
 
-미국 주식 선정 기준 (우선순위 순):
-1. RVOL(상대거래량)이 1.5배 이상 — 기관/세력 진입 신호
-2. 9 EMA > 21 EMA 정배열 상태 (추세 확인)
-3. RSI 45~70 구간 (과매수 아닌 상승 모멘텀)
-4. 갭업 1.5~5% 후 지속 상승 패턴
-5. 10일 신고가 근접 또는 돌파 (저항 돌파 신호)
-6. 당일 변화율 1~6% (스윗스팟, 너무 급등 제외)
-7. 섹터 모멘텀 고려 (반도체, AI, 핀테크 선호)
+[Strict rules]
+- You MUST ONLY output tickers that appear in the JSON "code" field above. Never invent or guess tickers. Uppercase tickers as in the data.
+- Prefer up to 20 candidates; fewer is OK if data is thin. Order by conviction (best first).
+- Output MUST be a single JSON object, no markdown, no code fences, no commentary before or after the JSON.
 
-제외 기준:
-- 당일 8% 이상 급등 종목 (이미 과매수)
-- 거래량이 평소보다 적은 종목
-- RSI 75 초과 (단기 과매수)
+[Selection criteria — apply in order of importance]
+1) Liquidity / participation: favor names with strong volume vs peers in the same list (relative activity within this universe).
+2) Trend / momentum from OHLCV: avoid names that are clearly in a sharp breakdown; prefer stabilization, higher lows, or breakout-like structure using the bars provided.
+3) Theme / narrative (inferred only from symbol context + price/volume behavior in the data — do not claim external news).
+4) Session fit: align with a typical intraday/swing setup appropriate for {session_label} (e.g., avoid chasing extreme exhaustion spikes unless data supports it).
 
-아래 JSON 형식으로만 응답하세요:
+[Output schema — exact keys]
 {{
   "candidates": [
-    {{"code": "티커1", "reason": "추천 이유 1~2문장"}},
-    {{"code": "티커2", "reason": "추천 이유 1~2문장"}}
+    {{"code": "TICKER", "reason": "1–2 sentences in Korean, why this symbol within the data"}},
+    ...
   ]
-}}"""
+}}
+
+Allowed tickers (subset of codes you may use): {allowed_flat}
+"""
     else:
-        prompt = f"""당신은 한국 코스피/코스닥 주식 단기 트레이딩 전문가입니다.
-오늘 {session_label} 세션 기준으로 아래 종목들 중 단기 매매(당일~2일) 가능성이 높은 후보를 최대 20개 선정하고, 각 종목의 추천 이유를 1~2문장으로 작성해주세요.
+        prompt = f"""[System Persona]
+당신은 월스트리트급 헤지펀드 출신 수석 퀀트 애널리스트이자, 한국 주식(KOSPI/KOSDAQ) 단기 모멘텀·수급 관점의 권위자입니다. 목표는 아래 [Input Data]만을 근거로, 단기(당일~2거래일) 상승 확률이 상대적으로 높은 종목을 고르는 것입니다.
 
-분석할 종목 데이터:
+[Input Data — 유일한 근거]
+아래 JSON은 우리 서비스가 KIS API로 수집한 실데이터입니다. 각 행: code(종목코드), current_price, change_rate(전일대비%), volume(누적거래량 문자열), recent_ohlcv(최근 최대 5일: date, open, high, low, close).
+세션: {session_label}
+
 {data_json}
 
-선정 기준:
-- 거래량이 평소보다 많은 종목
-- 변동성 돌파 신호가 나타나는 종목 (오늘 시가 + K×전일변동폭 돌파)
-- 5일 이동평균 위에 있는 종목
-- RSI 45~65 구간 (과매수 아닌 상승 구간)
-- 변동성이 적당한 종목 (당일 4% 초과 급등 제외)
+[절대 규칙]
+- 추천 종목의 code는 반드시 위 JSON에 존재하는 종목코드만 사용하세요. 목록에 없는 코드·임의 종목·비상장명을 넣지 마세요. 6자리 숫자 형식을 데이터와 동일하게 맞추세요.
+- 최대 20개까지 후보를 제시하세요(데이터가 적으면 그보다 적어도 됨). 확신 순으로 나열하세요.
+- 응답은 JSON 하나만. 마크다운·코드블록·앞뒤 설명 금지.
 
-아래 JSON 형식으로만 응답하세요:
+[선정 기준 — 아래 4가지를 엄격히 반영]
+1) 거래대금/거래량: 동일 유니버스 안에서 누적거래량·가격 변동을 함께 볼 때 수급·관심이 상대적으로 큰 종목을 우선합니다.
+2) 과거 데이터·추세: recent_ohlcv로 최근 하락만 반복하는 형태보다, 지지·되돌림 후 재상승 시도, 또는 변동성 수축 후 방향성이 나오는 패턴을 선호합니다(데이터로 설명 가능할 때만).
+3) 인기·테마: 외부 뉴스를 사실로 단정하지 말고, 종목명·코드·섹터 연상이 가능할 때만 "테마"를 이유에 언급하세요.
+4) 시장·세션 부합: {session_label} 기준으로 과도한 이미 급등·유동성 극소 등은 피합니다.
+
+[출력 형식 — 키 이름 고정]
 {{
   "candidates": [
-    {{"code": "종목코드1", "reason": "추천 이유 1~2문장"}},
-    {{"code": "종목코드2", "reason": "추천 이유 1~2문장"}}
+    {{"code": "종목코드", "reason": "한국어 1~2문장, 위 데이터 근거만"}},
+    ...
   ]
-}}"""
+}}
+
+허용 종목코드(이 중에서만 선택): {allowed_flat}
+"""
     raw_text = _gemini_generate_with_fallback(
         client, prompt, log_prefix="candidates", primary_env="GEMINI_MODEL_AI", default_model="gemini-2.0-flash"
     )
@@ -1774,15 +1811,21 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
     reasons_map: dict[str, str] = {}
     for item in raw_candidates:
         if isinstance(item, dict):
-            code = str(item.get("code", "")).strip()
+            raw_code = str(item.get("code", "")).strip()
             reason = str(item.get("reason", "")).strip()
         else:
-            code = str(item).strip()
+            raw_code = str(item).strip()
             reason = ""
-        if code:
-            candidate_codes.append(code)
-            if reason:
-                reasons_map[code] = reason
+        code = _resolve_allowed_stock_code(raw_code, stock_data, market)
+        if not code:
+            if raw_code:
+                _add_log(uid, "WARNING", f"[Gemini] 허용 목록 외 코드 무시: {raw_code!r}")
+            continue
+        if code in candidate_codes:
+            continue
+        candidate_codes.append(code)
+        if reason:
+            reasons_map[code] = reason
     _add_log(uid, "INFO", f"[Gemini] {session_label} 후보 {len(candidate_codes)}종목")
     return candidate_codes, reasons_map
 
