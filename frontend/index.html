@@ -156,9 +156,60 @@
     @keyframes skeletonShimmer{
       100%{transform:translateX(100%);}
     }
+    /* AI 분석 풀스크린 로딩 */
+    #aiLoadingOverlay.ai-load-visible{display:flex!important;}
+    #aiLoadingOverlay{pointer-events:auto;}
+    .ai-load-spin{animation:aiLoadSpin 1.15s linear infinite;}
+    @keyframes aiLoadSpin{to{transform:rotate(360deg)}}
+    .ai-load-spin-rev{animation:aiLoadSpinRev 1.65s linear infinite;}
+    @keyframes aiLoadSpinRev{to{transform:rotate(-360deg)}}
+    .ai-load-pulse{animation:aiLoadPulse 2s ease-in-out infinite;}
+    @keyframes aiLoadPulse{0%,100%{opacity:.85;transform:scale(1)}50%{opacity:1;transform:scale(1.05)}}
+    .ai-indet-track{overflow:hidden;height:6px;border-radius:999px;background:rgba(30,41,59,.9);}
+    .ai-indet-bar{
+      height:100%;width:38%;
+      border-radius:999px;
+      background:linear-gradient(90deg,#7c3aed,#c084fc,#22d3ee,#7c3aed);
+      background-size:200% 100%;
+      animation:aiIndetMove 2.2s ease-in-out infinite;
+    }
+    @keyframes aiIndetMove{
+      0%{transform:translateX(-100%);}
+      100%{transform:translateX(320%);}
+    }
+    .ai-step-pill{transition:background .35s,color .35s,box-shadow .35s;}
+    .ai-step-pill.on{background:rgba(139,92,246,.25);color:#c4b5fd;box-shadow:0 0 20px rgba(139,92,246,.2);}
   </style>
 </head>
 <body class="text-white min-h-screen">
+
+<!-- AI 실행 중 풀스크린 로딩 (runAI에서 표시) -->
+<div id="aiLoadingOverlay" class="fixed inset-0 z-[200] hidden items-center justify-center px-4" style="background:rgba(6,11,24,.82);backdrop-filter:blur(10px)">
+  <div class="relative w-full max-w-[22rem] rounded-2xl p-6 overflow-hidden shadow-2xl" style="background:linear-gradient(165deg,rgba(30,27,75,.95),rgba(15,23,42,.98));border:1px solid rgba(139,92,246,.35);box-shadow:0 0 80px rgba(139,92,246,.12),0 25px 50px -12px rgba(0,0,0,.55)">
+    <div class="absolute -top-24 left-1/2 -translate-x-1/2 w-64 h-48 rounded-full pointer-events-none opacity-40" style="background:radial-gradient(ellipse,rgba(139,92,246,.45),transparent 70%)"></div>
+    <div class="relative flex flex-col items-center text-center">
+      <div class="relative w-[5.25rem] h-[5.25rem] mb-5 ai-load-pulse">
+        <div class="absolute inset-0 rounded-full border-2 border-violet-500/25"></div>
+        <div class="absolute inset-0 rounded-full border-2 border-transparent border-t-violet-400 border-r-fuchsia-400 ai-load-spin"></div>
+        <div class="absolute inset-[7px] rounded-full border border-emerald-500/20 border-b-teal-400/50 ai-load-spin-rev"></div>
+        <div class="absolute inset-0 flex items-center justify-center text-2xl select-none" aria-hidden="true">✨</div>
+      </div>
+      <p class="text-[15px] font-bold text-white tracking-tight mb-0.5">AI 분석 실행 중</p>
+      <p class="text-[11px] text-slate-500 mb-4 leading-relaxed">시세 수집 → Gemini 분석 → 스코어링</p>
+      <div id="aiLoadElapsed" class="text-[1.65rem] leading-none font-mono font-bold tabular-nums tracking-[0.2em] text-transparent bg-clip-text mb-1" style="background:linear-gradient(135deg,#e9d5ff,#a78bfa,#67e8f9);-webkit-background-clip:text">0:00</div>
+      <p class="text-[10px] text-slate-600 mb-4">경과 시간 · 예상 1~3분 소요</p>
+      <div class="ai-indet-track w-full mb-5" role="progressbar" aria-label="진행 중">
+        <div class="ai-indet-bar"></div>
+      </div>
+      <div class="flex gap-2 w-full justify-center flex-wrap" id="aiLoadSteps">
+        <span class="ai-step-pill on text-[10px] px-2.5 py-1 rounded-lg font-medium" data-step="0">① 데이터</span>
+        <span class="ai-step-pill text-[10px] px-2.5 py-1 rounded-lg font-medium text-slate-500" data-step="1">② AI</span>
+        <span class="ai-step-pill text-[10px] px-2.5 py-1 rounded-lg font-medium text-slate-500" data-step="2">③ 점수</span>
+      </div>
+      <p class="text-[10px] text-slate-600 mt-4 leading-snug">창을 닫거나 새로고침하지 마세요.<br/>서버가 끝날 때까지 기다려 주세요.</p>
+    </div>
+  </div>
+</div>
 
 <!-- ── 배경 그라디언트 ──────────────────────────────────── -->
 <div class="fixed inset-0 pointer-events-none overflow-hidden">
@@ -588,7 +639,17 @@
               <p id="stockCountSaved" class="text-xs text-center mt-2 text-slate-500"></p>
             </div>
             <div class="rounded-2xl p-4" style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07)">
-              <p class="text-sm font-semibold text-white mb-3">즉시 실행</p>
+              <p class="text-sm font-semibold text-white mb-2">즉시 실행</p>
+              <label for="aiAddBuySelect" class="text-[11px] text-slate-500 block mb-1">이번 실행 신규 매수 (최대 보유는 위 종목 수)</label>
+              <select id="aiAddBuySelect" class="w-full mb-2 py-2 px-2 rounded-lg text-xs text-slate-200 bg-slate-900/80 border border-white/10">
+                <option value="auto">자동 — 잔여 슬롯만큼 (상한까지)</option>
+                <option value="0">0종 — 분석만</option>
+                <option value="1">1종</option>
+                <option value="2">2종</option>
+                <option value="3">3종</option>
+                <option value="4">4종</option>
+                <option value="5">5종</option>
+              </select>
               <div class="space-y-2">
                 <button onclick="runAI('manual')" class="w-full py-3 rounded-xl text-sm font-bold transition-all text-white border border-green-400/40" style="background:linear-gradient(135deg,#15803d,#059669)">⚡ 지금 즉시 AI 매매</button>
                 <div class="grid grid-cols-3 gap-1.5">
@@ -699,6 +760,20 @@
           <div><label class="text-xs text-slate-500 block mb-1.5">일일 목표 수익 (%)</label><input id="cfgDailyTarget" type="number" step="0.1"/></div>
           <div class="md:col-span-2"><label class="text-xs text-slate-500 block mb-1.5">한국 추천 종목 (쉼표 구분)</label><input id="cfgKrWatchlist" placeholder="005930,000660"/></div>
           <div><label class="text-xs text-slate-500 block mb-1.5">미국 추천 종목 (쉼표 구분)</label><input id="cfgUsWatchlist" placeholder="AAPL,NVDA"/></div>
+          <div class="md:col-span-2 lg:col-span-4 pt-3 mt-1 border-t border-white/10">
+            <p class="text-xs font-medium text-slate-400 mb-2">고급 · 자동 분할익절 / 물타기 <span class="text-slate-600 font-normal">(한·미 봇 보유 종목)</span></p>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="cfgPartialTpEn" class="rounded border-white/20"/> 분할익절 사용</label>
+              <div><label class="text-[11px] text-slate-500 block mb-1">분할익절 시작(%)</label><input id="cfgPartialTpTrig" type="number" step="0.1" min="0.5" title="평단 대비"/></div>
+              <div><label class="text-[11px] text-slate-500 block mb-1">분할 매도 비중(%)</label><input id="cfgPartialTpSell" type="number" step="1" min="10" max="90" title="보유 수량 중"/></div>
+              <label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer md:col-span-1"><input type="checkbox" id="cfgPartialTpTight" class="rounded border-white/20"/> 익절 후 손절선 본전 상향</label>
+              <label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="cfgAvgDownEn" class="rounded border-white/20"/> 물타기 사용</label>
+              <div><label class="text-[11px] text-slate-500 block mb-1">물타기 하락폭(%)</label><input id="cfgAvgDownTrig" type="number" step="0.1" min="1" title="평단 대비"/></div>
+              <div><label class="text-[11px] text-slate-500 block mb-1">물타기 최대 횟수</label><input id="cfgAvgDownMax" type="number" step="1" min="0" max="5"/></div>
+              <div><label class="text-[11px] text-slate-500 block mb-1">추가 매수 비율(%)</label><input id="cfgAvgDownQty" type="number" step="1" min="10" max="80" title="당시 보유주 대비"/></div>
+              <div><label class="text-[11px] text-slate-500 block mb-1">물타기 최소 간격(h)</label><input id="cfgAvgDownGapH" type="number" step="1" min="1" max="168"/></div>
+            </div>
+          </div>
           <div style="display:none"><label class="text-xs text-slate-500 block mb-1.5">투자 모드</label>
             <select id="cfgMock"><option value="true">모의투자</option><option value="false">실전투자 ⚠️</option></select>
           </div>
@@ -783,7 +858,31 @@
 </div>
 
 <!-- 토스트 -->
-<div id="toast" class="fixed bottom-5 right-5 glass rounded-2xl px-4 py-3 text-sm text-white shadow-2xl opacity-0 transition-opacity duration-300 pointer-events-none max-w-xs z-50 border border-white/10"></div>
+<div id="toast" class="fixed bottom-5 right-5 glass rounded-2xl px-4 py-3 text-sm text-white shadow-2xl opacity-0 transition-opacity duration-300 pointer-events-none max-w-xs z-[90] border border-white/10"></div>
+
+<!-- 주문 성공 안내 (매도 등 눈에 띄게) -->
+<div id="modalOrderSuccess" class="hidden fixed inset-0 z-[160] flex items-center justify-center px-4" style="background:rgba(6,11,24,.75);backdrop-filter:blur(6px)" onclick="if(event.target===this)closeOrderSuccessModal()">
+  <div class="w-full max-w-sm glass rounded-3xl p-6 border border-white/10 shadow-2xl fade-up" role="dialog" aria-modal="true" aria-labelledby="modalOrderSuccessTitle" onclick="event.stopPropagation()">
+    <div class="flex items-start justify-between gap-3 mb-4">
+      <div>
+        <div id="modalOrderSuccessBadge" class="text-[10px] font-semibold uppercase tracking-wide text-emerald-400/90 mb-1">주문 접수</div>
+        <h3 id="modalOrderSuccessTitle" class="text-lg font-bold text-white">매도 주문 완료</h3>
+        <p id="modalOrderSuccessSub" class="text-sm text-slate-400 mt-1">증권사에서 체결·미체결이 확정됩니다.</p>
+      </div>
+      <button type="button" onclick="closeOrderSuccessModal()" class="text-slate-500 hover:text-white text-xl leading-none shrink-0" aria-label="닫기">✕</button>
+    </div>
+    <div class="rounded-2xl p-4 space-y-3 text-sm" style="background:rgba(255,255,255,.05)">
+      <div class="flex justify-between gap-2"><span class="text-slate-500">종목</span><span id="modalOrderSuccessName" class="text-white font-medium text-right"></span></div>
+      <div class="flex justify-between gap-2"><span class="text-slate-500">코드</span><span id="modalOrderSuccessCode" class="text-slate-200 font-mono"></span></div>
+      <div class="flex justify-between gap-2"><span class="text-slate-500">시장</span><span id="modalOrderSuccessMkt" class="text-slate-200"></span></div>
+      <div class="flex justify-between gap-2"><span class="text-slate-500">수량</span><span id="modalOrderSuccessQty" class="text-slate-200"></span></div>
+      <div class="flex justify-between gap-2"><span class="text-slate-500">참고가(기록)</span><span id="modalOrderSuccessPrice" class="text-slate-200"></span></div>
+      <div class="flex justify-between gap-2"><span class="text-slate-500">주문번호</span><span id="modalOrderSuccessOdno" class="text-emerald-300/90 font-mono text-xs break-all text-right"></span></div>
+    </div>
+    <p id="modalOrderSuccessNote" class="text-[11px] text-slate-500 mt-3 leading-relaxed"></p>
+    <button type="button" onclick="closeOrderSuccessModal()" class="w-full mt-5 py-3 rounded-xl font-bold text-sm text-white" style="background:linear-gradient(135deg,#2563eb,#4f46e5)">확인</button>
+  </div>
+</div>
 
 <script>
 // ════════════════════════════════════════════════════════
@@ -1002,12 +1101,55 @@ function copyServerIp() {
   }
 }
 
-function showToast(msg, type='info') {
+function showToast(msg, type='info', durationMs) {
   const t=document.getElementById('toast');
   const c={info:'text-white',success:'text-green-400',error:'text-red-400'};
   t.textContent=msg; t.style.opacity='1';
   t.className=t.className.replace(/text-\S+/g,'')+ ' '+(c[type]||c.info);
-  setTimeout(()=>t.style.opacity='0',3500);
+  const ms = typeof durationMs === 'number' ? durationMs : 3500;
+  setTimeout(()=>t.style.opacity='0', ms);
+}
+
+function closeOrderSuccessModal() {
+  const m = document.getElementById('modalOrderSuccess');
+  if (m) m.classList.add('hidden');
+}
+
+/** 수동 주문 성공 시 — 매도 시 특히 한눈에 보이도록 모달 */
+function showOrderSuccessModal(side, market, data) {
+  const sell = side === 'sell';
+  const mktLabel = market === 'US' ? '미국(US)' : '한국(KR)';
+  const name = (data.stock_name && String(data.stock_name).trim()) ? data.stock_name : '—';
+  const code = data.stock_code || '';
+  const qty = data.quantity;
+  const odno = data.order_no != null ? String(data.order_no) : '—';
+  const priceStr = market === 'US'
+    ? '$' + parseFloat(data.price || 0).toFixed(2)
+    : fmt(data.price);
+  document.getElementById('modalOrderSuccessBadge').textContent = sell ? '매도 접수' : '매수 접수';
+  document.getElementById('modalOrderSuccessBadge').className = sell
+    ? 'text-[10px] font-semibold uppercase tracking-wide text-rose-400/90 mb-1'
+    : 'text-[10px] font-semibold uppercase tracking-wide text-emerald-400/90 mb-1';
+  document.getElementById('modalOrderSuccessTitle').textContent = sell ? '매도 주문이 접수되었습니다' : '매수 주문이 접수되었습니다';
+  document.getElementById('modalOrderSuccessSub').textContent =
+    'KIS에 주문이 전달되었습니다. 체결 여부는 증권사 앱·미체결에서 확인하세요.';
+  document.getElementById('modalOrderSuccessName').textContent = name;
+  document.getElementById('modalOrderSuccessCode').textContent = code;
+  document.getElementById('modalOrderSuccessMkt').textContent = mktLabel;
+  document.getElementById('modalOrderSuccessQty').textContent = qty + '주';
+  document.getElementById('modalOrderSuccessPrice').textContent = priceStr;
+  document.getElementById('modalOrderSuccessOdno').textContent = odno;
+  const noteEl = document.getElementById('modalOrderSuccessNote');
+  const note = data.note ? String(data.note).trim() : '';
+  if (note) {
+    noteEl.textContent = note;
+    noteEl.classList.remove('hidden');
+  } else {
+    noteEl.textContent = '';
+    noteEl.classList.add('hidden');
+  }
+  document.getElementById('modalOrderSuccess').classList.remove('hidden');
+  showToast(sell ? `매도 접수 · ${code || '주문'}` : `매수 접수 · ${code || '주문'}`, 'success', 5000);
 }
 
 // ════════════════════════════════════════════════════════
@@ -1414,9 +1556,23 @@ async function setStockCount(n) {
   setTimeout(()=>document.getElementById('stockCountSaved').textContent='',2000);
 }
 
+/** Hosting /api 리라이트 ≈60초 제한 → AI 502. localhost만 상대경로, 그 외 HTTPS는 Cloud Run 직접(커스텀 도메인 포함) */
+var AUTOSTOCK_API_DIRECT_BASE='https://api-eq2ncfx6gq-uc.a.run.app';
+function autostockApiBase() {
+  if (typeof window.__AUTOSTOCK_API_BASE__ === 'string') return window.__AUTOSTOCK_API_BASE__;
+  var h = window.location.hostname;
+  if (h === 'localhost' || h === '127.0.0.1') return '';
+  if (window.location.protocol === 'https:') return AUTOSTOCK_API_DIRECT_BASE;
+  return '';
+}
+function autostockApiUrl(path) {
+  const b = autostockApiBase();
+  if (!b || !path.startsWith('/api')) return path;
+  return b.replace(/\/$/,'') + path;
+}
 async function apiFetch(path, opts={}) {
   if(!window._idToken) throw new Error('로그인 필요');
-  const res = await fetch(path, {
+  const res = await fetch(autostockApiUrl(path), {
     headers:{'Content-Type':'application/json','Authorization':'Bearer '+window._idToken},
     ...opts
   });
@@ -1678,22 +1834,26 @@ function renderWatchlist(positions, cfg, watchlistData, market) {
     const ma5=wd.ma5||0;
     const aboveBreakout=current&&breakout>0&&current>=breakout;
     const priceStr=market==='US'?(current?'$'+parseFloat(current).toFixed(2):'-'):(current?current.toLocaleString()+'원':'-');
+    const buyLineDisplay=pos&&(market==='US'
+      ? '$'+parseFloat(pos.buy_price||0).toFixed(2)
+      :(pos.buy_price||0).toLocaleString()+'원');
     return `
-      <div class="rounded-xl p-3 cursor-pointer transition-all glass-hover"
+      <div class="rounded-xl p-3 cursor-pointer transition-all glass-hover h-full flex flex-col min-h-[200px]"
            style="background:${bg};border:1px solid ${border}"
            data-wl-code="${safeCode}" data-wl-market="${market}" role="button" tabindex="0">
-        <div class="flex items-center justify-between mb-0.5">
+        <div class="flex items-center justify-between mb-0.5 shrink-0">
           <span class="font-bold text-white text-sm">${escapeHtml(safeCode)}</span>
           ${isOwned?`<span class="text-xs bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded-full">보유</span>`
-            :aboveBreakout?`<span class="text-xs bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded-full">매수신호</span>`:''}
+            :aboveBreakout?`<span class="text-xs bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded-full">매수신호</span>`:`<span class="text-[10px] text-transparent select-none">·</span>`}
         </div>
-        ${stockName?`<div class="text-xs text-slate-400 mb-1 truncate">${escapeHtml(stockName)}</div>`:'<div class="mb-1"></div>'}
-        <div class="flex items-baseline gap-1.5 mb-1">
+        ${stockName?`<div class="text-xs text-slate-400 mb-1 truncate shrink-0">${escapeHtml(stockName)}</div>`:'<div class="mb-1 h-4 shrink-0"></div>'}
+        <div class="flex items-baseline gap-1.5 mb-1 shrink-0">
           <span class="text-sm font-bold text-slate-200">${priceStr}</span>
           <span class="text-xs font-semibold ${upDown}">${arrow}${changeRate!==0?Math.abs(changeRate).toFixed(2)+'%':''}</span>
         </div>
+        <div class="shrink-0 space-y-0.5 min-h-[3.25rem]">
         ${isOwned
-          ? `${hasPnl?`<div class="text-xs ${pnl>=0?'text-green-400':'text-red-400'} font-semibold">${pnl>=0?'+':''}${market==='US'?'$'+Math.abs(pnl).toFixed(2):pnl.toLocaleString()+'원'} (${pr>=0?'+':''}${pr}%)</div>`:''}
+          ? `<div class="text-xs text-slate-600">매수 ${buyLineDisplay}</div>${hasPnl?`<div class="text-xs ${pnl>=0?'text-green-400':'text-red-400'} font-semibold">${pnl>=0?'+':''}${market==='US'?'$'+Math.abs(pnl).toFixed(2):pnl.toLocaleString()+'원'} (${pr>=0?'+':''}${pr}%)</div>`:''}
              <div class="text-xs text-slate-600 mt-0.5">목표 ${(pos.target_sell_price||0).toLocaleString()||'-'} / 손절 ${(pos.stop_loss_price||0).toLocaleString()||'-'}</div>`
           : breakout>0&&market==='KR'
             ? `<div class="mt-1 pt-1 border-t border-white/5"><div class="flex justify-between text-xs">
@@ -1702,7 +1862,9 @@ function renderWatchlist(positions, cfg, watchlistData, market) {
                </div></div>`
             : ''
         }
-        <div class="spark-slot mt-2.5" style="height:60px">${_sparklineSvg(wd.closes||[], changeRate)}</div>
+        </div>
+        <div class="flex-1 min-h-2 shrink-0"></div>
+        <div class="spark-slot mt-auto pt-2 shrink-0" style="height:60px">${_sparklineSvg(wd.closes||[], changeRate)}</div>
       </div>`;
   }).filter(Boolean).join('');
   if(!grid.innerHTML.trim()){grid.innerHTML='<p class="text-slate-600 text-xs">유효한 티커가 없습니다 (형식: 한국 6자리, 미국 티커)</p>';}
@@ -1788,6 +1950,15 @@ function renderConfig(cfg) {
   set('cfgKrWatchlist',Array.isArray(cfg.kr_watchlist)?cfg.kr_watchlist.join(','):cfg.kr_watchlist);
   set('cfgUsWatchlist',Array.isArray(cfg.us_watchlist)?cfg.us_watchlist.join(','):cfg.us_watchlist);
   set('cfgMock',(cfg.is_mock===true||cfg.is_mock==='true')?'true':'false');
+  const pe=document.getElementById('cfgPartialTpEn');if(pe)pe.checked=cfg.partial_tp_enabled!==false;
+  set('cfgPartialTpTrig',cfg.partial_tp_trigger_pct!=null?(cfg.partial_tp_trigger_pct*100).toFixed(1):'2');
+  set('cfgPartialTpSell',cfg.partial_tp_sell_ratio!=null?(cfg.partial_tp_sell_ratio*100).toFixed(0):'33');
+  const pt=document.getElementById('cfgPartialTpTight');if(pt)pt.checked=cfg.partial_tp_tighten_stop!==false;
+  const ae=document.getElementById('cfgAvgDownEn');if(ae)ae.checked=cfg.avg_down_enabled!==false;
+  set('cfgAvgDownTrig',cfg.avg_down_trigger_pct!=null?(cfg.avg_down_trigger_pct*100).toFixed(1):'4');
+  set('cfgAvgDownMax',cfg.avg_down_max_times!=null?String(cfg.avg_down_max_times):'2');
+  set('cfgAvgDownQty',cfg.avg_down_qty_ratio!=null?(cfg.avg_down_qty_ratio*100).toFixed(0):'35');
+  set('cfgAvgDownGapH',cfg.avg_down_min_interval_hours!=null?String(cfg.avg_down_min_interval_hours):'20');
   const n=parseInt(cfg.ai_stock_count)||3; currentStockCount=n;
   [3,4,5].forEach(i=>{const b=document.getElementById('cnt'+i);if(b)b.className='flex-1 py-2.5 rounded-xl text-sm font-bold border transition-all '+(i===n?'cnt-active':'cnt-inactive');});
   updateInvestmentGuide();
@@ -1910,7 +2081,7 @@ async function placeOrder(side) {
       const nm=data.stock_name?(' · '+escapeHtml(data.stock_name)):'';
       el.innerHTML='✅ <strong>'+label+' 완료</strong><br/><span class="text-slate-200">'+data.quantity+'주 · 기준가(기록) '+pStr+nm+'</span>'+
         (data.note?'<br/><span class="text-[10px] text-slate-500 leading-snug">'+escapeHtml(data.note)+'</span>':'');
-      showToast(`${label} 완료 · ${data.quantity}주 · ${pStr}`,'success');
+      showOrderSuccessModal(side, mkt, Object.assign({}, data, { stock_code: code }));
       setTimeout(loadAll,1500);
     }
     else{ el.textContent='❌ '+(data.error||'오류'); showToast(data.error,'error'); }
@@ -1919,9 +2090,16 @@ async function placeOrder(side) {
 
 async function quickSell(code, market='KR') {
   if(!confirm(`[매도][${market}] ${code} 전량 시장가 매도\n\n진행하시겠습니까?`)) return;
-  const data=await apiFetch('/api/order',{method:'POST',body:JSON.stringify({stock_code:code,side:'sell',quantity:0,price:0,market})});
-  if(data.ok){showToast(`✅ ${code} 매도 완료`,'success');setTimeout(loadAll,1500);}
-  else showToast(data.error,'error');
+  try {
+    const data=await apiFetch('/api/order',{method:'POST',body:JSON.stringify({stock_code:code,side:'sell',quantity:0,price:0,market})});
+    if(data.ok){
+      showOrderSuccessModal('sell', market, Object.assign({}, data, { stock_code: code }));
+      setTimeout(loadAll,1500);
+    }
+    else showToast(data.error || '매도 실패','error');
+  } catch(e){
+    showToast(e && e.message ? e.message : '매도 요청 실패','error');
+  }
 }
 
 async function botControl(action) {
@@ -1941,14 +2119,72 @@ async function botControl(action) {
   }
 }
 
+let _aiLoadTimer=null,_aiStepTimer=null,_aiLoadStart=0,_aiStepIdx=0;
+function _formatAiElapsed(sec){
+  const m=Math.floor(sec/60),s=sec%60;
+  return m+':'+String(s).padStart(2,'0');
+}
+function _tickAiElapsed(){
+  const el=document.getElementById('aiLoadElapsed');
+  if(!el||!_aiLoadStart)return;
+  el.textContent=_formatAiElapsed(Math.floor((Date.now()-_aiLoadStart)/1000));
+}
+function _rotateAiStepPills(){
+  _aiStepIdx=(_aiStepIdx+1)%3;
+  const pills=document.querySelectorAll('#aiLoadSteps .ai-step-pill');
+  pills.forEach((p,i)=>{
+    p.classList.toggle('on',i===_aiStepIdx);
+    p.classList.toggle('text-slate-500',i!==_aiStepIdx);
+  });
+}
+function showAiLoadingOverlay(){
+  const ov=document.getElementById('aiLoadingOverlay');
+  if(!ov)return;
+  ov.classList.remove('hidden');
+  ov.classList.add('flex');
+  _aiLoadStart=Date.now();
+  _aiStepIdx=0;
+  const el=document.getElementById('aiLoadElapsed');
+  if(el)el.textContent='0:00';
+  document.querySelectorAll('#aiLoadSteps .ai-step-pill').forEach((p,i)=>{
+    p.classList.toggle('on',i===0);
+    p.classList.toggle('text-slate-500',i!==0);
+  });
+  if(_aiLoadTimer)clearInterval(_aiLoadTimer);
+  _aiLoadTimer=setInterval(_tickAiElapsed,1000);
+  if(_aiStepTimer)clearInterval(_aiStepTimer);
+  _aiStepTimer=setInterval(_rotateAiStepPills,3800);
+}
+function hideAiLoadingOverlay(){
+  const ov=document.getElementById('aiLoadingOverlay');
+  if(ov){ov.classList.add('hidden');ov.classList.remove('flex');}
+  if(_aiLoadTimer){clearInterval(_aiLoadTimer);_aiLoadTimer=null;}
+  if(_aiStepTimer){clearInterval(_aiStepTimer);_aiStepTimer=null;}
+}
+
 async function runAI(session) {
   const labels={manual:'즉시 실행',morning:'오전 09:30',afternoon:'오후 13:00',late:'마감 15:30'};
-  if(!confirm(`AI ${labels[session]} 세션 실행 (${currentMarket})\n추천 종목 분석 → 알고리즘 스코어링 → ${currentStockCount}종목 자동 매수\n\n진행하시겠습니까?`)) return;
+  const sel=document.getElementById('aiAddBuySelect');
+  const addVal=sel?sel.value:'auto';
+  const addNote=addVal==='auto'
+    ? `잔여 슬롯까지 자동 (최대 보유 ${currentStockCount}종)`
+    : `신규 ${addVal}종만 매수 시도`;
+  if(!confirm(`AI ${labels[session]} 세션 (${currentMarket})\n${addNote}\n\n진행하시겠습니까?`)) return;
   const el=document.getElementById('aiRunStatus');
-  el.textContent='🤖 AI 분석 중... (20~30초)';
-  const data=await apiFetch('/api/ai/run',{method:'POST',body:JSON.stringify({session,market:currentMarket})});
-  if(data.ok){showToast(`✅ AI ${labels[session]} 완료`,'success');el.textContent='✅ 완료';setTimeout(()=>{loadAll();loadRecommendations();loadTrades();el.textContent='';},1000);}
-  else{el.textContent='❌ '+(data.error||'오류');showToast(data.error,'error');}
+  showAiLoadingOverlay();
+  el.textContent='';
+  try{
+    const payload={session,market:currentMarket};
+    if(addVal&&addVal!=='auto')payload.add_buy_count=parseInt(addVal,10);
+    const data=await apiFetch('/api/ai/run',{method:'POST',body:JSON.stringify(payload)});
+    if(data.ok){showToast(`✅ AI ${labels[session]} 완료`,'success');el.textContent='✅ 완료';setTimeout(()=>{loadAll();loadRecommendations();loadTrades();el.textContent='';},1000);}
+    else{el.textContent='❌ '+(data.error||'오류');showToast(data.error,'error');}
+  }catch(e){
+    el.textContent='❌ 네트워크 오류';
+    showToast(e.message||'오류','error');
+  }finally{
+    hideAiLoadingOverlay();
+  }
 }
 
 async function loadRecommendations() {
@@ -2020,6 +2256,15 @@ async function saveConfig() {
     kr_watchlist:document.getElementById('cfgKrWatchlist').value.split(',').map(s=>s.trim()).filter(Boolean),
     us_watchlist:document.getElementById('cfgUsWatchlist').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean),
     is_mock:isMock,
+    partial_tp_enabled:!!document.getElementById('cfgPartialTpEn')?.checked,
+    partial_tp_trigger_pct:parseFloat(document.getElementById('cfgPartialTpTrig').value)/100,
+    partial_tp_sell_ratio:parseFloat(document.getElementById('cfgPartialTpSell').value)/100,
+    partial_tp_tighten_stop:!!document.getElementById('cfgPartialTpTight')?.checked,
+    avg_down_enabled:!!document.getElementById('cfgAvgDownEn')?.checked,
+    avg_down_trigger_pct:parseFloat(document.getElementById('cfgAvgDownTrig').value)/100,
+    avg_down_max_times:parseInt(document.getElementById('cfgAvgDownMax').value,10)||0,
+    avg_down_qty_ratio:parseFloat(document.getElementById('cfgAvgDownQty').value)/100,
+    avg_down_min_interval_hours:parseFloat(document.getElementById('cfgAvgDownGapH').value)||20,
   };
   el.textContent='저장 중...';
   const data=await apiFetch('/api/config',{method:'POST',body:JSON.stringify(payload)});

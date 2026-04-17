@@ -32,6 +32,7 @@ import re
 import requests as http_requests
 import firebase_admin
 from firebase_admin import firestore, auth as fb_auth
+from google.cloud.firestore_v1 import transactional
 from firebase_functions import https_fn, scheduler_fn, options
 from flask import Flask, request, jsonify
 from google import genai
@@ -41,6 +42,27 @@ KST = ZoneInfo("Asia/Seoul")
 ET  = ZoneInfo("America/New_York")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# KIS OpenAPI: 초당 거래(조회·주문) 건수 제한 — HTTP 500 "초당 거래건수를 초과하였습니다"
+# 주문·주문가능까지 같은 간격으로 묶이므로 0.2 미만이면 AI 연속 매수에서 자주 걸림
+KIS_MIN_INTERVAL_SEC = 0.26
+_kis_last_http_ts: float = 0.0
+
+
+def _kis_pace() -> None:
+    """국내·해외 시세 등 KIS REST 요청 직전 호출(프로세스당 간격)."""
+    global _kis_last_http_ts
+    now = time_module.time()
+    gap = now - _kis_last_http_ts
+    if gap < KIS_MIN_INTERVAL_SEC:
+        time_module.sleep(KIS_MIN_INTERVAL_SEC - gap)
+    _kis_last_http_ts = time_module.time()
+
+
+def _is_kis_tps_exceeded(exc: BaseException) -> bool:
+    s = str(exc)
+    return "초당" in s and ("초과" in s or "거래건수" in s)
+
 
 flask_app = Flask(__name__)
 _firebase_app = None
@@ -616,6 +638,10 @@ def _with_retry(func, *args, retries: int = 3, **kwargs):
                 time_module.sleep(1)
                 last_exc = e
                 continue
+            if _is_kis_tps_exceeded(e) and attempt < retries - 1:
+                time_module.sleep(0.55 + 0.45 * attempt)
+                last_exc = e
+                continue
             raise
         except Exception as e:
             last_exc = e
@@ -630,6 +656,7 @@ def get_current_price_kr(uid: str, cfg: dict, stock_code: str) -> dict:
     """주식현재가 시세 — 코스피(J)·코스닥(Q) 순으로 조회해 빈 시세 완화."""
 
     def _fetch(div: str):
+        _kis_pace()
         resp = http_requests.get(
             _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/quotations/inquire-price",
             headers=_headers(uid, cfg, "FHKST01010100"),
@@ -657,18 +684,30 @@ def get_current_price_kr(uid: str, cfg: dict, stock_code: str) -> dict:
 
 
 def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
-    resp = http_requests.get(
-        _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
-        headers=_headers(uid, cfg, "FHKST01010400"),
-        params={
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": stock_code,
-            "FID_PERIOD_DIV_CODE": "D",
-            "FID_ORG_ADJ_PRC": "0",
-        },
-        timeout=10,
-    )
-    return _parse(resp, uid, cfg).get("output2", [])
+    last_exc: BaseException | None = None
+    for attempt in range(4):
+        try:
+            _kis_pace()
+            resp = http_requests.get(
+                _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
+                headers=_headers(uid, cfg, "FHKST01010400"),
+                params={
+                    "FID_COND_MRKT_DIV_CODE": "J",
+                    "FID_INPUT_ISCD": stock_code,
+                    "FID_PERIOD_DIV_CODE": "D",
+                    "FID_ORG_ADJ_PRC": "0",
+                },
+                timeout=10,
+            )
+            return _parse(resp, uid, cfg).get("output2", [])
+        except ApiError as e:
+            last_exc = e
+            if attempt < 3 and _is_kis_tps_exceeded(e):
+                time_module.sleep(0.55 + 0.45 * attempt)
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
 
 
 def get_balance_kr(uid: str, cfg: dict) -> dict:
@@ -691,19 +730,24 @@ def get_balance_kr(uid: str, cfg: dict) -> dict:
 
 def get_available_cash_kr(uid: str, cfg: dict, stock_code: str = "005930") -> int:
     tr_id = _tr_id(cfg, "TTTC8908R", "VTTC8908R")
-    resp = http_requests.get(
-        _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
-        headers=_headers(uid, cfg, tr_id),
-        params={
-            "CANO": _account_prefix(cfg["account_no"]),
-            "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
-            "PDNO": stock_code, "ORD_UNPR": "0", "ORD_DVSN": "01",
-            "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N",
-        },
-        timeout=10,
-    )
-    raw = _parse(resp, uid, cfg).get("output", {}).get("ord_psbl_cash", "0")
-    return int(raw.replace(",", "") or 0)
+
+    def _call():
+        _kis_pace()
+        resp = http_requests.get(
+            _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+            headers=_headers(uid, cfg, tr_id),
+            params={
+                "CANO": _account_prefix(cfg["account_no"]),
+                "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
+                "PDNO": stock_code, "ORD_UNPR": "0", "ORD_DVSN": "01",
+                "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N",
+            },
+            timeout=10,
+        )
+        raw = _parse(resp, uid, cfg).get("output", {}).get("ord_psbl_cash", "0")
+        return int(raw.replace(",", "") or 0)
+
+    return _with_retry(_call, retries=4)
 
 
 def place_order_kr(uid: str, cfg: dict, stock_code: str, side: str, quantity: int, price: int = 0) -> dict:
@@ -723,13 +767,18 @@ def place_order_kr(uid: str, cfg: dict, stock_code: str, side: str, quantity: in
         body["SLL_TYPE"] = "01"  # 01: 일반매도
         body["CTAC_TLNO"] = ""
         body["ALGO_NO"] = ""
-    resp = http_requests.post(
-        _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/trading/order-cash",
-        headers=_headers(uid, cfg, tr_id),
-        json=body,
-        timeout=10,
-    )
-    return _parse(resp, uid, cfg)
+
+    def _call():
+        _kis_pace()
+        resp = http_requests.post(
+            _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/trading/order-cash",
+            headers=_headers(uid, cfg, tr_id),
+            json=body,
+            timeout=15,
+        )
+        return _parse(resp, uid, cfg)
+
+    return _with_retry(_call, retries=5)
 
 
 # ── 미국 주식 API ──────────────────────────────────────────
@@ -751,6 +800,7 @@ def _us_excd_quote(stock_code: str) -> str:
 def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
     """미국 주식 현재가 조회 — 항상 실서버 + 실서버 토큰"""
     def _call():
+        _kis_pace()
         resp = http_requests.get(
             _base_url(False) + "/uapi/overseas-price/v1/quotations/price",
             headers=_headers_us(uid, cfg, "HHDFS00000300"),
@@ -767,16 +817,28 @@ def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
 
 def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
     """미국 주식 일봉 조회 — 항상 실서버 + 실서버 토큰"""
-    resp = http_requests.get(
-        _base_url(False) + "/uapi/overseas-price/v1/quotations/dailyprice",
-        headers=_headers_us(uid, cfg, "HHDFS76240000"),
-        params={
-            "AUTH": "", "EXCD": _us_excd_quote(stock_code),
-            "SYMB": stock_code, "GUBN": "0", "BYMD": "", "MODP": "0",
-        },
-        timeout=10,
-    )
-    return _parse(resp, uid, cfg).get("output2", [])
+    last_exc: BaseException | None = None
+    for attempt in range(4):
+        try:
+            _kis_pace()
+            resp = http_requests.get(
+                _base_url(False) + "/uapi/overseas-price/v1/quotations/dailyprice",
+                headers=_headers_us(uid, cfg, "HHDFS76240000"),
+                params={
+                    "AUTH": "", "EXCD": _us_excd_quote(stock_code),
+                    "SYMB": stock_code, "GUBN": "0", "BYMD": "", "MODP": "0",
+                },
+                timeout=10,
+            )
+            return _parse(resp, uid, cfg).get("output2", [])
+        except ApiError as e:
+            last_exc = e
+            if attempt < 3 and _is_kis_tps_exceeded(e):
+                time_module.sleep(0.55 + 0.45 * attempt)
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
 
 
 def get_balance_us(uid: str, cfg: dict) -> dict:
@@ -800,21 +862,27 @@ def place_order_us(uid: str, cfg: dict, stock_code: str, side: str, quantity: in
     # KIS VTS(모의)는 미국 주식 매매 미지원 → 항상 실서버 + 실서버 TR ID
     tr_id = "JTTT1002U" if side == "buy" else "JTTT1006U"
     ord_dvsn = "00" if price > 0 else "01"  # 00=지정가, 01=시장가
-    resp = http_requests.post(
-        _base_url(False) + "/uapi/overseas-stock/v1/trading/order",
-        headers=_headers_us(uid, cfg, tr_id),
-        json={
-            "CANO": _account_prefix(cfg["account_no"]),
-            "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
-            "OVRS_EXCG_CD": _us_excd(stock_code),
-            "PDNO": stock_code,
-            "ORD_DVSN": ord_dvsn,
-            "ORD_QTY": str(quantity),
-            "OVRS_ORD_UNPR": f"{price:.2f}",
-        },
-        timeout=10,
-    )
-    return _parse(resp, uid, cfg)
+    body = {
+        "CANO": _account_prefix(cfg["account_no"]),
+        "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
+        "OVRS_EXCG_CD": _us_excd(stock_code),
+        "PDNO": stock_code,
+        "ORD_DVSN": ord_dvsn,
+        "ORD_QTY": str(quantity),
+        "OVRS_ORD_UNPR": f"{price:.2f}",
+    }
+
+    def _call():
+        _kis_pace()
+        resp = http_requests.post(
+            _base_url(False) + "/uapi/overseas-stock/v1/trading/order",
+            headers=_headers_us(uid, cfg, tr_id),
+            json=body,
+            timeout=15,
+        )
+        return _parse(resp, uid, cfg)
+
+    return _with_retry(_call, retries=5)
 
 
 # ══════════════════════════════════════════════════════════
@@ -853,7 +921,37 @@ def register_buy(uid: str, market: str, stock_code: str, buy_price: float,
         "buy_price": buy_price, "quantity": quantity,
         "stop_loss_price": stop_loss_price, "target_sell_price": target_sell_price,
         "source": source, "entry_time": datetime.now(KST),
+        "partial_tp_done": False,
+        "avg_down_count": 0,
     })
+
+
+def register_partial_sell(
+    uid: str, market: str, stock_code: str, sell_price: float, sell_qty: int,
+    tighten_stop_to_breakeven: bool = True,
+) -> tuple[float, bool]:
+    """일부 매도 후 잔여 수량·손절 갱신. 반환: (해당 구간 실현손익, 포지션 전량 청산 여부)."""
+    ref = _uref(uid).collection(f"positions_{market}").document(stock_code)
+    doc_snap = ref.get()
+    if not doc_snap.exists:
+        return 0.0, True
+    pos = doc_snap.to_dict()
+    bp = float(pos["buy_price"])
+    q = int(pos["quantity"])
+    sell_qty = max(0, min(sell_qty, q))
+    if sell_qty <= 0:
+        return 0.0, False
+    pnl = (sell_price - bp) * sell_qty
+    new_q = q - sell_qty
+    if new_q <= 0:
+        ref.delete()
+        return pnl, True
+    upd: dict = {"quantity": new_q, "partial_tp_done": True}
+    if tighten_stop_to_breakeven:
+        old_sl = float(pos.get("stop_loss_price") or 0)
+        upd["stop_loss_price"] = max(old_sl, bp)
+    ref.update(upd)
+    return pnl, False
 
 
 def register_sell(uid: str, market: str, stock_code: str, sell_price: float) -> float:
@@ -1000,6 +1098,21 @@ def _get_sector_exposure(uid: str, market: str) -> dict[str, int]:
     return exposure
 
 
+@transactional
+def _buy_lock_txn(transaction, lock_ref, market: str, code: str) -> bool:
+    """트랜잭션 내에서 매수 락 획득 시도 (내부용)."""
+    snap = lock_ref.get(transaction=transaction)
+    if snap.exists:
+        data = snap.to_dict() or {}
+        locked_at = data.get("locked_at")
+        if locked_at is not None:
+            age = _firestore_dt_age_seconds(locked_at)
+            if age < 180:
+                return False
+    transaction.set(lock_ref, {"locked_at": datetime.now(KST), "market": market, "code": code})
+    return True
+
+
 def _try_acquire_buy_lock(uid: str, market: str, code: str) -> bool:
     """Firestore 트랜잭션으로 매수 락을 획득합니다.
 
@@ -1013,25 +1126,12 @@ def _try_acquire_buy_lock(uid: str, market: str, code: str) -> bool:
         False → 이미 다른 인스턴스가 매수 중 (또는 트랜잭션 실패)
     """
     lock_ref = _uref(uid).collection("locks").document(f"{market}_{code}")
-
-    def _in_txn(transaction) -> bool:
-        snap = lock_ref.get(transaction=transaction)
-        if snap.exists:
-            data       = snap.to_dict()
-            locked_at  = data.get("locked_at")
-            if locked_at:
-                age = (datetime.now(KST) - locked_at.astimezone(KST)).total_seconds()
-                if age < 180:   # 3분 이내: 유효한 락
-                    return False
-        # 락 설정 (기존 락이 없거나 만료됨)
-        transaction.set(lock_ref, {"locked_at": datetime.now(KST), "market": market, "code": code})
-        return True
-
     try:
-        return get_db().run_in_transaction(_in_txn)
+        txn = get_db().transaction()
+        return _buy_lock_txn(txn, lock_ref, market, code)
     except Exception as e:
         _add_log(uid, "WARNING", f"[락] {market}/{code} 락 획득 실패: {e}")
-        return False   # 실패 시 안전하게 매수 건너뜀
+        return False
 
 
 def _release_buy_lock(uid: str, market: str, code: str) -> None:
@@ -1040,6 +1140,60 @@ def _release_buy_lock(uid: str, market: str, code: str) -> None:
         _uref(uid).collection("locks").document(f"{market}_{code}").delete()
     except Exception:
         pass  # 락 해제 실패는 무시 (3분 후 자동 만료)
+
+
+def _firestore_dt_age_seconds(ts) -> float:
+    """Firestore에 저장된 시각의 나이(초). 파싱 실패 시 오래된 것으로 간주."""
+    if ts is None:
+        return float("inf")
+    try:
+        if hasattr(ts, "timestamp"):
+            return max(0.0, datetime.now(KST).timestamp() - float(ts.timestamp()))
+        if isinstance(ts, datetime):
+            t = ts
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=KST)
+            return (datetime.now(KST) - t.astimezone(KST)).total_seconds()
+    except Exception:
+        pass
+    return float("inf")
+
+
+AI_SESSION_LOCK_SEC = 600  # 동시에 두 AI 세션(스케줄+즉시) 방지
+
+
+@transactional
+def _ai_session_lock_txn(transaction, lock_ref, market: str, session: str) -> bool:
+    """트랜잭션 내에서 AI 세션 락 획득 시도 (내부용)."""
+    snap = lock_ref.get(transaction=transaction)
+    if snap.exists:
+        data = snap.to_dict() or {}
+        started = data.get("started_at")
+        if _firestore_dt_age_seconds(started) < AI_SESSION_LOCK_SEC:
+            return False
+    transaction.set(
+        lock_ref,
+        {"started_at": datetime.now(KST), "market": market, "session": session},
+    )
+    return True
+
+
+def _try_acquire_ai_session_lock(uid: str, market: str, session: str) -> bool:
+    """동일 uid·시장에서 run_ai_session 중복 실행 방지 (스케줄 AI와 즉시 버튼 충돌)."""
+    lock_ref = _uref(uid).collection("locks").document(f"ai_session_{market}")
+    try:
+        txn = get_db().transaction()
+        return _ai_session_lock_txn(txn, lock_ref, market, session)
+    except Exception as e:
+        _add_log(uid, "WARNING", f"[AI][세션락] 획득 실패: {e}")
+        return False
+
+
+def _release_ai_session_lock(uid: str, market: str) -> None:
+    try:
+        _uref(uid).collection("locks").document(f"ai_session_{market}").delete()
+    except Exception:
+        pass
 
 
 def _sector_ok(code: str, market: str, exposure: dict[str, int], max_per_sector: int) -> tuple[bool, str]:
@@ -1347,6 +1501,44 @@ def calculate_optimal_prices(current_price: float, ohlcv: list[dict], cfg: dict)
     }
 
 
+def merge_position_after_avg_down(
+    uid: str, market: str, stock_code: str, add_price: float, add_qty: int,
+    ohlcv: list, cfg: dict,
+) -> None:
+    """물타기 체결 후 평단·목표·손절 재계산.
+    
+    손절선은 보수적으로: min(기존 손절, ATR 기반 새 손절) — 평단은 낮아졌으므로
+    손절선이 오히려 올라가는 것을 방지.
+    """
+    ref = _uref(uid).collection(f"positions_{market}").document(stock_code)
+    doc_snap = ref.get()
+    if not doc_snap.exists:
+        return
+    pos = doc_snap.to_dict()
+    old_bp = float(pos["buy_price"])
+    old_q = int(pos["quantity"])
+    old_sl = float(pos.get("stop_loss_price") or 0)
+    new_avg = (old_bp * old_q + add_price * add_qty) / (old_q + add_qty)
+    new_q = old_q + add_qty
+    if market == "KR":
+        prices = calculate_optimal_prices(new_avg, ohlcv, cfg)
+        tp, new_sl = float(prices["sell_price"]), float(prices["stop_loss"])
+    else:
+        prices = calculate_optimal_prices_us(new_avg, ohlcv, cfg)
+        tp, new_sl = float(prices["sell_price"]), float(prices["stop_loss"])
+    # 손절선은 기존과 새 ATR 기반 중 더 낮은 값 사용 (보수적)
+    sl = min(old_sl, new_sl) if old_sl > 0 else new_sl
+    cnt = int(pos.get("avg_down_count", 0)) + 1
+    ref.update({
+        "buy_price": new_avg,
+        "quantity": new_q,
+        "target_sell_price": tp,
+        "stop_loss_price": sl,
+        "avg_down_count": cnt,
+        "avg_down_last_at": datetime.now(KST).isoformat(),
+    })
+
+
 def run_strategy_cycle_kr(uid: str, cfg: dict):
     state = get_bot_state(uid)
     if not state.get("bot_enabled", True): return
@@ -1366,22 +1558,119 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
             if current <= 0:
                 _add_log(uid, "WARNING", f"[KR][{code}] 현재가 0 — 목표/손절 건너뜀")
                 continue
-            target = pos.get("target_sell_price", 0)
+            buy_avg = float(pos["buy_price"])
+            qty = int(pos["quantity"])
+            target = float(pos.get("target_sell_price") or 0)
+            slp = float(pos.get("stop_loss_price") or 0)
+            sn = pos.get("stock_name", "")
+
+            # 분할 익절 (포지션당 1회): 평단 대비 +N% 도달 시 일부 매도 후 손절선을 본전 부근으로 상향
+            if cfg.get("partial_tp_enabled", True) and not pos.get("partial_tp_done") and qty > 1:
+                trig_pct = float(cfg.get("partial_tp_trigger_pct", 0.02))
+                if current >= buy_avg * (1 + trig_pct):
+                    sell_ratio = float(cfg.get("partial_tp_sell_ratio", 0.33))
+                    sell_qty = max(1, math.floor(qty * sell_ratio))
+                    if sell_qty >= qty:
+                        sell_qty = qty - 1
+                    if sell_qty >= 1:
+                        place_order_kr(uid, cfg, code, "sell", sell_qty, 0)
+                        pnl, _closed = register_partial_sell(
+                            uid, "KR", code, current, sell_qty,
+                            cfg.get("partial_tp_tighten_stop", True),
+                        )
+                        add_trade(uid, "KR", code, "sell", current, sell_qty, "분할익절", pnl, stock_name=sn)
+                        st = get_bot_state(uid)
+                        update_bot_state(uid, {"realized_pnl": st.get("realized_pnl", 0) + pnl})
+                        _add_log(uid, "INFO", f"[KR][{code}] 분할익절 | {sell_qty}주@{current:,} PnL≈{pnl:,.0f}원")
+                        _invalidate_balance_cache(uid)
+                        continue
+
             if target > 0 and current >= target:
-                qty = pos["quantity"]
                 place_order_kr(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "KR", code, current)
-                add_trade(uid, "KR", code, "sell", current, qty, "목표가_달성", pnl, stock_name=pos.get("stock_name", ""))
+                add_trade(uid, "KR", code, "sell", current, qty, "목표가_달성", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "INFO", f"[KR][{code}] 목표가 달성 매도 | 현재={current:,} 목표={target:,}")
                 continue
-            if current <= pos["stop_loss_price"]:
-                qty = pos["quantity"]
+            if current <= slp:
                 place_order_kr(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "KR", code, current)
-                add_trade(uid, "KR", code, "sell", current, qty, "손절", pnl, stock_name=pos.get("stock_name", ""))
+                add_trade(uid, "KR", code, "sell", current, qty, "손절", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "WARNING", f"[KR][{code}] 손절 | 현재={current:,}")
+                continue
+
+            # 물타기: 평단 대비 일정 하락 + 손절선 위 + 횟수/간격/총비중 + 추세 필터
+            if cfg.get("avg_down_enabled", True):
+                max_ad = int(cfg.get("avg_down_max_times", 2))
+                last_at = pos.get("avg_down_last_at")
+                min_h = float(cfg.get("avg_down_min_interval_hours", 20))
+                interval_ok = True
+                if last_at:
+                    try:
+                        raw = str(last_at).replace("Z", "+00:00")
+                        ld = datetime.fromisoformat(raw)
+                        if ld.tzinfo is None:
+                            ld = ld.replace(tzinfo=KST)
+                        else:
+                            ld = ld.astimezone(KST)
+                        if (datetime.now(KST) - ld).total_seconds() < min_h * 3600:
+                            interval_ok = False
+                    except Exception:
+                        interval_ok = True
+                dip_pct = float(cfg.get("avg_down_trigger_pct", 0.04))
+                ad_cnt = int(pos.get("avg_down_count", 0))
+                price_dipped = current <= buy_avg * (1 - dip_pct)
+                above_stop = current > slp * 1.002
+
+                # 추세 필터: RSI > 25 (극심한 과매도 탈출) + MA5 정배열
+                closes_kr = [float(str(r.get("stck_clpr", r.get("clos", 0))).replace(",", "") or 0) for r in ohlcv_pos]
+                rsi_kr = _calc_rsi(closes_kr[:30]) if len(closes_kr) >= 16 else 50.0
+                ma5_kr = sum(closes_kr[:5]) / 5 if len(closes_kr) >= 5 else current
+                ma20_kr = sum(closes_kr[:20]) / 20 if len(closes_kr) >= 20 else ma5_kr
+                trend_ok = rsi_kr >= 25 and (current >= ma5_kr * 0.97 or ma5_kr >= ma20_kr * 0.98)
+
+                skip_reason = None
+                if ad_cnt >= max_ad:
+                    skip_reason = f"횟수한도({ad_cnt}/{max_ad})"
+                elif not interval_ok:
+                    skip_reason = f"간격미달({min_h}h)"
+                elif not price_dipped:
+                    skip_reason = f"하락폭미달({(1 - current / buy_avg) * 100:.1f}%<{dip_pct * 100:.0f}%)"
+                elif not above_stop:
+                    skip_reason = "손절임박"
+                elif not trend_ok:
+                    skip_reason = f"추세불량(RSI={rsi_kr:.0f},MA5={ma5_kr:,.0f})"
+
+                if skip_reason is None:
+                    available = get_available_cash_kr(uid, cfg, code)
+                    equity = _get_total_equity_kr(uid, cfg) or available
+                    max_ratio = float(cfg.get("max_position_ratio", 0.1))
+                    pos_cap = equity * max_ratio * 1.02
+                    pos_val = float(current * qty)
+                    room = pos_cap - pos_val
+                    ad_ratio = float(cfg.get("avg_down_qty_ratio", 0.35))
+                    wish = max(1, math.floor(qty * ad_ratio))
+                    max_add_cash = math.floor(available / current) if current > 0 else 0
+                    max_add_room = math.floor(room / current) if room > 0 and current > 0 else 0
+                    add_qty = min(wish, max_add_cash, max_add_room)
+                    if add_qty < 1:
+                        skip_reason = f"수량부족(현금{max_add_cash},비중여유{max_add_room})"
+                    elif not _try_acquire_buy_lock(uid, "KR", code):
+                        skip_reason = "락획득실패"
+                    else:
+                        try:
+                            res = place_order_kr(uid, cfg, code, "buy", int(add_qty), 0)
+                            order_no = res.get("output", {}).get("ODNO", "N/A")
+                            merge_position_after_avg_down(uid, "KR", code, current, int(add_qty), ohlcv_pos, cfg)
+                            add_trade(uid, "KR", code, "buy", current, int(add_qty), "물타기", stock_name=sn)
+                            _add_log(uid, "INFO", f"[KR][{code}] 물타기 | +{add_qty}주@{current:,} 주문={order_no} RSI={rsi_kr:.0f}")
+                            _invalidate_balance_cache(uid)
+                        finally:
+                            _release_buy_lock(uid, "KR", code)
+                # 물타기 스킵 로그 (10분마다 verbose 또는 하락폭 충족 시)
+                if skip_reason and (verbose or price_dipped):
+                    _add_log(uid, "INFO", f"[KR][{code}] 물타기스킵 | {skip_reason} (현재={current:,} 평단={buy_avg:,})")
         except Exception as e:
             _add_log(uid, "ERROR", f"[KR][{code}] 포지션 체크 오류: {e}")
 
@@ -1452,8 +1741,11 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                         order_no = result.get("output", {}).get("ODNO", "N/A")
                         out = data.get("output") or {}
                         sname = _stock_name(out.get("hts_kor_isnm", "") if isinstance(out, dict) else "", code, "KR")
-                        register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
-                                     source="자동", stock_name=sname)
+                        tp = calculate_optimal_prices(current, ohlcv, cfg)["sell_price"]
+                        register_buy(
+                            uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
+                            float(tp), "자동", sname,
+                        )
                         add_trade(uid, "KR", code, "buy", current, qty, "자동매수", stock_name=sname)
                         _add_log(uid, "INFO", f"[KR][{code}] 자동매수 | {qty}주@{current:,} 주문={order_no}")
                         diag_parts.append(f"{code}=✅매수{qty}주")
@@ -1480,9 +1772,64 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
 # Gemini AI 추천
 # ══════════════════════════════════════════════════════════
 
-def _collect_kr_stock_data(uid: str, cfg: dict) -> list[dict]:
+# AI 세션: 속도 우선 (시간 단축)
+MAX_AI_UNIVERSE_STOCKS = 20   # 시세 수집 호출 수 ∝ 이 값
+GEMINI_MAX_CANDIDATES = 12    # Gemini 출력·스코어링·매수 후보 길이
+GEMINI_UNIVERSE_KR = [
+    "005930", "000660", "035420", "051910", "006400", "035720", "000270", "068270",
+    "207940", "005380", "012330", "066570", "105560", "055550", "086790", "003550",
+    "034730", "096770", "017670", "015760", "028260", "032830", "009150", "033780",
+    "018260", "011200", "024110", "316140", "042700", "086520", "247540", "352820",
+    "373220", "323410", "000810", "302440", "090430", "006260", "001040", "000100",
+    "034220", "009540", "010130", "000720", "005490", "267250", "036570", "052400",
+    "196170", "003670", "010950", "036460",
+]
+GEMINI_UNIVERSE_US = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "NFLX",
+    "COST", "PEP", "KO", "PG", "JPM", "V", "MA", "UNH", "JNJ", "HD",
+    "XOM", "CVX", "LLY", "ABBV", "MRK", "BAC", "DIS", "CSCO", "ADBE",
+    "CRM", "INTC", "QCOM", "TXN", "AMAT", "HON", "IBM", "GE", "CAT", "UPS",
+    "PM", "TMO", "SPGI", "COP", "BLK", "BKNG", "AXP", "NOW", "SBUX", "GILD",
+]
+
+
+def _merge_ai_universe_kr(cfg: dict) -> list[str]:
+    """감시목록 우선 + 대표 풀, 중복 제거, API 부담 상한까지."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in list(cfg.get("kr_watchlist", [])) + GEMINI_UNIVERSE_KR:
+        s = str(raw).strip()
+        if not s.isdigit():
+            continue
+        c = s.zfill(6)
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+        if len(out) >= MAX_AI_UNIVERSE_STOCKS:
+            break
+    return out
+
+
+def _merge_ai_universe_us(cfg: dict) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in list(cfg.get("us_watchlist", [])) + GEMINI_UNIVERSE_US:
+        s = str(raw).strip().upper()
+        if not s or not s.replace(".", "").isalnum():
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= MAX_AI_UNIVERSE_STOCKS:
+            break
+    return out
+
+
+def _collect_kr_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> list[dict]:
     result = []
-    for code in cfg.get("kr_watchlist", []):
+    for code in codes:
         try:
             price_data = get_current_price_kr(uid, cfg, code)
             out = price_data.get("output", {})
@@ -1505,10 +1852,18 @@ def _collect_kr_stock_data(uid: str, cfg: dict) -> list[dict]:
     return result
 
 
-def _collect_us_stock_data(uid: str, cfg: dict) -> list[dict]:
-    """미국 감시 종목 데이터 수집"""
+def _collect_kr_stock_data(uid: str, cfg: dict) -> list[dict]:
+    return _collect_kr_stock_data_for_codes(uid, cfg, cfg.get("kr_watchlist", []))
+
+
+def _collect_kr_stock_data_for_ai(uid: str, cfg: dict) -> list[dict]:
+    return _collect_kr_stock_data_for_codes(uid, cfg, _merge_ai_universe_kr(cfg))
+
+
+def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> list[dict]:
+    """미국 종목 데이터 수집 (코드 목록 지정)"""
     result = []
-    for code in cfg.get("us_watchlist", []):
+    for code in codes:
         try:
             price_data = get_current_price_us(uid, cfg, code)
             out        = price_data.get("output", {})
@@ -1529,6 +1884,14 @@ def _collect_us_stock_data(uid: str, cfg: dict) -> list[dict]:
         except Exception as e:
             _add_log(uid, "WARNING", f"[US][{code}] 데이터 수집 실패: {e}")
     return result
+
+
+def _collect_us_stock_data(uid: str, cfg: dict) -> list[dict]:
+    return _collect_us_stock_data_for_codes(uid, cfg, cfg.get("us_watchlist", []))
+
+
+def _collect_us_stock_data_for_ai(uid: str, cfg: dict) -> list[dict]:
+    return _collect_us_stock_data_for_codes(uid, cfg, _merge_ai_universe_us(cfg))
 
 
 def _research_date_key(market: str) -> str:
@@ -1724,6 +2087,22 @@ def _resolve_allowed_stock_code(raw: str, stock_data: list[dict], market: str) -
     return None
 
 
+def _gemini_reason_lookup(code: str, reasons_map: dict[str, str], market: str) -> str:
+    """reasons_map 키와 감시목록 code 표기(5930 vs 005930) 차이 보정."""
+    if not reasons_map:
+        return ""
+    if market == "US":
+        return (reasons_map.get(str(code).strip().upper()) or "").strip()
+    s = str(code).strip()
+    if s in reasons_map:
+        return (reasons_map.get(s) or "").strip()
+    if s.isdigit():
+        z = s.zfill(6)
+        if z in reasons_map:
+            return (reasons_map.get(z) or "").strip()
+    return ""
+
+
 def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, market: str = "KR") -> tuple[list[str], dict[str, str]]:
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
@@ -1739,6 +2118,24 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
         if d.get("code")
     ) or "(수집된 종목 없음)"
 
+    nu = len(stock_data)
+    gmax = GEMINI_MAX_CANDIDATES
+    if nu >= gmax:
+        us_cand_line = (
+            f"- If the universe has ≥{gmax} rows, output EXACTLY {gmax} distinct candidates ordered by conviction (best first); "
+            "tickers only from the JSON."
+        )
+        kr_cand_line = (
+            f"- 입력 종목이 {gmax}개 이상이면 후보는 반드시 {gmax}개를 채우세요(확신 순, 중복 없음, 위 JSON의 code만)."
+        )
+    else:
+        us_cand_line = (
+            f"- Prefer up to {gmax} candidates; fewer is OK if the universe has fewer rows. Order by conviction (best first)."
+        )
+        kr_cand_line = (
+            f"- 최대 {gmax}개까지 후보를 제시하세요(입력 종목 수가 적으면 그에 맞게 줄 수 있음). 확신 순으로 나열하세요."
+        )
+
     if market == "US":
         prompt = f"""[System Persona]
 You are a top-tier sell-side quant and short-term momentum specialist for US equities (NASDAQ/NYSE). Your task is to rank symbols from the PROVIDED DATA ONLY for the highest probability of favorable short-term (same session ~ 2 trading days) price action.
@@ -1751,7 +2148,7 @@ Session context: {session_label}
 
 [Strict rules]
 - You MUST ONLY output tickers that appear in the JSON "code" field above. Never invent or guess tickers. Uppercase tickers as in the data.
-- Prefer up to 20 candidates; fewer is OK if data is thin. Order by conviction (best first).
+{us_cand_line}
 - Output MUST be a single JSON object, no markdown, no code fences, no commentary before or after the JSON.
 
 [Selection criteria — apply in order of importance]
@@ -1782,7 +2179,7 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
 
 [절대 규칙]
 - 추천 종목의 code는 반드시 위 JSON에 존재하는 종목코드만 사용하세요. 목록에 없는 코드·임의 종목·비상장명을 넣지 마세요. 6자리 숫자 형식을 데이터와 동일하게 맞추세요.
-- 최대 20개까지 후보를 제시하세요(데이터가 적으면 그보다 적어도 됨). 확신 순으로 나열하세요.
+{kr_cand_line}
 - 응답은 JSON 하나만. 마크다운·코드블록·앞뒤 설명 금지.
 
 [선정 기준 — 아래 4가지를 엄격히 반영]
@@ -1806,7 +2203,7 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
     )
     clean = re.sub(r"```(?:json)?", "", raw_text).strip().rstrip("`").strip()
     parsed = json.loads(clean)
-    raw_candidates = parsed.get("candidates", [])[:20]
+    raw_candidates = parsed.get("candidates", [])[:GEMINI_MAX_CANDIDATES]
     candidate_codes: list[str] = []
     reasons_map: dict[str, str] = {}
     for item in raw_candidates:
@@ -1830,7 +2227,13 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
     return candidate_codes, reasons_map
 
 
-def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
+def run_ai_session(
+    uid: str,
+    cfg: dict,
+    session: str,
+    market: str = "KR",
+    add_buy_count: int | None = None,
+):
     state = get_bot_state(uid)
     if not state.get("bot_enabled", True):
         _add_log(uid, "INFO", f"[AI {session}] 봇 비활성 — 건너뜀")
@@ -1838,34 +2241,87 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
     if state.get("trading_halted", False):
         _add_log(uid, "INFO", f"[AI {session}] 매매 중단 — 건너뜀")
         return
+    if not _try_acquire_ai_session_lock(uid, market, session):
+        _add_log(
+            uid, "WARNING",
+            "[AI] 이미 AI 세션이 진행 중입니다 (정각 오후 AI와 '즉시'를 동시에 누르면 겹칩니다). "
+            "약 1~2분 후 다시 시도해 주세요.",
+        )
+        return
+    try:
+        _run_ai_session_impl(uid, cfg, session, market, add_buy_count=add_buy_count)
+    finally:
+        _release_ai_session_lock(uid, market)
 
+
+def _run_ai_session_impl(
+    uid: str,
+    cfg: dict,
+    session: str,
+    market: str = "KR",
+    add_buy_count: int | None = None,
+):
     _add_log(uid, "INFO", f"[AI {session}][{market}] 이중 필터링 시작")
 
-    # ── 시장별 데이터 수집 ─────────────────────────────────
+    # ── 시장별 데이터 수집 (Gemini 입력 유니버스: 감시목록 + 대표 풀, 최대 MAX_AI_UNIVERSE_STOCKS) ──
     try:
         if market == "US":
-            stock_data = _collect_us_stock_data(uid, cfg)
+            stock_data = _collect_us_stock_data_for_ai(uid, cfg)
         else:
-            stock_data = _collect_kr_stock_data(uid, cfg)
+            stock_data = _collect_kr_stock_data_for_ai(uid, cfg)
         if not stock_data:
             _add_log(uid, "ERROR", f"[AI][{market}] 데이터 없음"); return
     except Exception as e:
         _add_log(uid, "ERROR", f"[AI][{market}] 데이터 수집 오류: {e}"); return
+
+    _add_log(uid, "INFO", f"[AI][{market}] Gemini 입력 유니버스 {len(stock_data)}종목 수집")
 
     reasons_map: dict[str, str] = {}
     try:
         candidate_codes, reasons_map = query_gemini_candidates(uid, stock_data, session, market)
     except Exception as e:
         _add_log(uid, "ERROR", f"[AI] Gemini 오류: {e}")
-        candidate_codes = cfg.get("us_watchlist" if market == "US" else "kr_watchlist", [])
+        candidate_codes = []
 
-    if not candidate_codes:
-        _add_log(uid, "WARNING", "[AI] 후보 없음"); return
+    # 스코어링 대상: (1) Gemini가 준 후보(최대 20)만 — 알고리즘으로 재정렬 후 상위 N 노출
+    # (2) Gemini 실패 시: 입력 유니버스 전체를 스코어링(폴백)
+    codes_to_score: list[str] = []
+    seen_score: set[str] = set()
+    if candidate_codes:
+        for raw in candidate_codes:
+            c = str(raw).strip()
+            if not c:
+                continue
+            if market == "US":
+                c = c.upper()
+            elif c.isdigit() and len(c) <= 6:
+                c = c.zfill(6)
+            if c in seen_score:
+                continue
+            seen_score.add(c)
+            codes_to_score.append(c)
+    else:
+        _add_log(uid, "WARNING", "[AI] Gemini 유효 후보 없음 — 입력 유니버스 전체로 알고리즘 스코어링만 진행")
+        for row in stock_data:
+            c = str(row.get("code", "")).strip()
+            if not c:
+                continue
+            if market == "US":
+                c = c.upper()
+            elif c.isdigit() and len(c) <= 6:
+                c = c.zfill(6)
+            if c in seen_score:
+                continue
+            seen_score.add(c)
+            codes_to_score.append(c)
+
+    if not codes_to_score:
+        _add_log(uid, "ERROR", "[AI] 스코어링 대상 종목이 없음"); return
 
     # ── 시장별 스코어링 ────────────────────────────────────
     scored: list[tuple] = []
     stock_details: dict = {}
-    for code in candidate_codes:
+    for code in codes_to_score:
         try:
             if market == "US":
                 data    = get_current_price_us(uid, cfg, code)
@@ -1886,18 +2342,44 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
     if not scored:
         _add_log(uid, "ERROR", "[AI] 스코어링 결과 없음"); return
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+    if candidate_codes:
+        gem_order = {c: i for i, c in enumerate(codes_to_score)}
+    else:
+        gem_order = {}
+    scored.sort(key=lambda x: (-x[1], gem_order.get(x[0], 999)))
 
     # 스코어 요약 로그 (상위 5개) — 매수 미발생 원인 파악용
     score_summary = " | ".join(f"{c}={s}pt" for c, s, _ in scored[:5])
     _add_log(uid, "INFO", f"[AI][{market}] 스코어 상위: {score_summary}")
 
-    n = min(max(int(cfg.get("ai_stock_count", 3)), 3), 5)
-    top_stocks = scored[:n]
+    # ai_stock_count = 해당 시장 최대 보유 종목 수(상한 3~5). 추천 카드는 상한만큼 노출.
+    cap = min(max(int(cfg.get("ai_stock_count", 3)), 3), 5)
+    positions_early = get_positions(uid, market)
+    held = len(positions_early)
+    slots = max(0, cap - held)
 
-    # ── 추천 목록 생성 ─────────────────────────────────────
-    recommendations = []
-    for code, score, detail in top_stocks:
+    if add_buy_count is None:
+        # 스케줄·API에서 미지정: 상한까지 자동으로만 매수
+        n_buy = slots
+        buy_mode = "auto"
+    else:
+        # 사용자 지정: 0~5, 실제로는 잔여 슬롯·상한을 넘지 않음
+        n_buy = max(0, min(int(add_buy_count), 5, slots))
+        buy_mode = "user"
+
+    if len(scored) < cap:
+        _add_log(
+            uid, "INFO",
+            f"[AI] 스코어 산출 {len(scored)}개 — 상한 {cap}종 중 최대 {len(scored)}개만 추천 가능",
+        )
+    _add_log(
+        uid, "INFO",
+        f"[AI] 포트폴리오 상한 {cap}종 · 현재 보유 {held}종 · 잔여 슬롯 {slots} — "
+        f"이번 신규 매수 목표 {n_buy}건 ({'자동' if buy_mode == 'auto' else '사용자 지정'})",
+    )
+    top_stocks = scored[:cap]
+
+    def _ai_build_rec(code: str, score: float, detail: dict) -> dict:
         info    = stock_details.get(code, {})
         current = info.get("current", 0)
         ohlcv   = info.get("ohlcv", [])
@@ -1906,34 +2388,55 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
         else:
             prices = calculate_optimal_prices(current, ohlcv, cfg)
         sname = _stock_name("", code, market)
-        rec = {
+        gem_reason = _gemini_reason_lookup(code, reasons_map, market)
+        if not gem_reason:
+            gem_reason = "Gemini 후보 중 알고리즘 스코어 상위"
+        return {
             "code": code, "stock_name": sname, "score": score,
-            "reason": reasons_map.get(code, ""),
+            "reason": gem_reason,
             **prices, "detail": detail,
         }
-        recommendations.append(rec)
+
+    # ── 추천 목록 생성 (화면·이력용 상위 cap종목) ───────────────
+    recommendations = [_ai_build_rec(c, s, d) for c, s, d in top_stocks]
 
     session_id = datetime.now(KST).strftime("%Y%m%d_") + session + "_" + market
     _uref(uid).collection("recommendations").document(session_id).set({
         "session_id": session_id, "session": session, "market": market,
         "timestamp": datetime.now(KST), "candidates": candidate_codes,
         "recommendations": recommendations, "status": "executing",
+        "portfolio_cap": cap, "held_before": held, "slots_remaining": slots,
+        "target_new_buys": n_buy, "buy_mode": buy_mode,
     })
 
     # ── 시장별 매수 실행 ───────────────────────────────────
+    # 스코어 순 전체(scored)를 내려가며 실제 매수 n_buy건이 될 때까지 시도
     executed = []
-    positions = get_positions(uid, market)
-    # 미국 최소 점수: cfg에서 조절 가능 (기본 55점 / 125점 만점)
-    min_score_us     = int(cfg.get("min_score_us", 55))
+    positions = positions_early
+    # 미국: 자동매수(min_score_us)보다 낮게 — Gemini 후보는 이미 선별됨 (기본 40 / 125점)
+    min_score_us_ai = int(cfg.get("min_score_us_ai", 40))
     max_per_sector   = int(cfg.get("max_positions_per_sector", 2))
     sector_exposure  = _get_sector_exposure(uid, market)
+    skip_cnt: dict[str, int] = {}
 
-    for rec in recommendations:
+    def _skip(reason: str) -> None:
+        skip_cnt[reason] = skip_cnt.get(reason, 0) + 1
+
+    for code, score, detail in scored:
+        if len(executed) >= n_buy:
+            break
+        rec = _ai_build_rec(code, score, detail)
         code = rec["code"]
         if code in positions:
+            _add_log(uid, "INFO", f"[AI][{market}][{code}] 이미 보유 — 매수 건너뜀")
+            _skip("보유")
             continue
-        if market == "US" and rec["score"] < min_score_us:
-            _add_log(uid, "INFO", f"[AI][US][{code}] 점수 미달({rec['score']}/{min_score_us}) — 건너뜀")
+        if market == "US" and rec["score"] < min_score_us_ai:
+            _add_log(
+                uid, "INFO",
+                f"[AI][US][{code}] 점수 미달({rec['score']}/{min_score_us_ai}, AI전용 기준) — 건너뜀",
+            )
+            _skip("US점수")
             continue
         # 섹터 노출 한도 체크
         sec_ok, sector = _sector_ok(code, market, sector_exposure, max_per_sector)
@@ -1941,15 +2444,23 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
             _add_log(uid, "INFO",
                      f"[AI][{market}][{code}] 섹터 한도 | {sector} "
                      f"{sector_exposure.get(sector, 0)}/{max_per_sector}개 — 건너뜀")
+            _skip("섹터")
             continue
         if not _try_acquire_buy_lock(uid, market, code):
-            _add_log(uid, "INFO", f"[AI][{market}][{code}] 매수 락 선점 — 건너뜀(다른 인스턴스 매수 중)")
+            _add_log(
+                uid, "INFO",
+                f"[AI][{market}][{code}] 매수 락 선점 — 다른 AI/전략 스레드가 같은 종목 처리 중. "
+                f"1~2분 뒤 '즉시' 재실행 또는 스케줄과 시간을 어긋나게 해 보세요.",
+            )
+            _skip("락")
             continue
         try:
             if market == "US":
                 data    = get_current_price_us(uid, cfg, code)
                 current = float(data["output"].get("last", 0))
                 if current <= 0:
+                    _add_log(uid, "WARNING", f"[AI][US][{code}] 현재가 0 — 매수 건너뜀")
+                    _skip("시세0")
                     continue
                 # 미국: USD 잔고 기반 수량 계산 (실패 시 max_us_qty 폴백)
                 available_usd = _get_available_cash_us(uid, cfg)
@@ -1975,17 +2486,24 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
                 current   = _kr_price_from_api_data(data, ohlcv_ai)
                 if current <= 0:
                     _add_log(uid, "WARNING", f"[AI][KR][{code}] 현재가 0 — 매수 건너뜀")
+                    _skip("시세0")
                     continue
                 available = get_available_cash_kr(uid, cfg, code)
                 equity    = _get_total_equity_kr(uid, cfg) or available
-                invest    = min(available, equity * cfg.get("max_position_ratio", 0.1))
+                ratio     = float(cfg.get("max_position_ratio", 0.1))
+                pos_cap   = equity * ratio
+                # AI: 한 종목당 상한이 1주가보다 작으면 수량이 0이 되는 경우 방지 (주문가능 범위 내)
+                if cfg.get("ai_afford_one_share", True):
+                    pos_cap = max(pos_cap, float(current))
+                invest    = min(available, pos_cap)
                 qty       = math.floor(invest / current)
                 if qty <= 0:
                     qty = 1 if available >= current else 0
                 if qty <= 0:
                     _add_log(uid, "WARNING",
                              f"[AI][KR][{code}] 매수불가 | 현재가={current:,} 주문가능={available:,.0f} "
-                             f"투자한도={invest:,.0f}(자산{equity:,.0f}×{cfg.get('max_position_ratio',0.1):.0%})")
+                             f"투자한도={invest:,.0f}(자산{equity:,.0f}×{ratio:.0%})")
+                    _skip("잔고부족")
                     continue
                 result   = place_order_kr(uid, cfg, code, "buy", qty, 0)
                 order_no = result.get("output", {}).get("ODNO", "N/A")
@@ -2000,19 +2518,36 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
             sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
         except Exception as e:
             _add_log(uid, "ERROR", f"[AI][{code}] 매수 오류: {e}")
+            _skip("주문오류")
         finally:
             _release_buy_lock(uid, market, code)
+
+    if len(executed) < n_buy and skip_cnt:
+        _add_log(
+            uid, "INFO",
+            "[AI] 매수 건너뜀 요약 — " + ", ".join(f"{k}={v}" for k, v in sorted(skip_cnt.items())),
+        )
 
     _uref(uid).collection("recommendations").document(session_id).update({
         "status": "completed", "executed_codes": executed,
         "executed_count": len(executed), "completed_at": datetime.now(KST),
+        "target_new_buys": n_buy,
     })
 
     # ※ watchlist는 변경하지 않음.
     # AI 추천 결과는 recommendations 컬렉션에만 저장합니다.
     # 이전에 save_config(wl_key, rec_codes)를 호출했는데,
     # 이는 원래 25개 감시종목이 3~5개로 축소되는 부작용이 있었음.
-    _add_log(uid, "INFO", f"[AI {session}] 완료 — {len(executed)}/{len(recommendations)}종목 매수")
+    if len(executed) < n_buy:
+        _add_log(
+            uid, "INFO",
+            f"[AI] 신규 매수 목표 {n_buy}건 중 {len(executed)}건 체결 — "
+            f"섹터한도·점수·잔고 등으로 건너뛰었거나 후보가 부족할 수 있음",
+        )
+    _add_log(
+        uid, "INFO",
+        f"[AI {session}] 완료 — 신규 {len(executed)}/{n_buy}건 (추천 카드 {len(recommendations)}종목 · 상한 {cap}종 중 보유 {held})",
+    )
 
 
 def run_strategy_cycle_us(uid: str, cfg: dict):
@@ -2030,27 +2565,123 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
     positions = get_positions(uid, "US")
     for code, pos in list(positions.items()):
         try:
-            data    = get_current_price_us(uid, cfg, code)
-            current = float(data["output"].get("last", 0))
+            data        = get_current_price_us(uid, cfg, code)
+            ohlcv_pos_u = get_daily_ohlcv_us(uid, cfg, code)
+            current     = float(data["output"].get("last", 0))
             if current <= 0:
                 continue
+            buy_avg = float(pos["buy_price"])
+            qty     = int(pos["quantity"])
             target  = float(pos.get("target_sell_price", 0))
             slp     = float(pos.get("stop_loss_price", 0))
-            qty     = pos["quantity"]
+            sn      = pos.get("stock_name", "")
+
+            if cfg.get("partial_tp_enabled", True) and not pos.get("partial_tp_done") and qty > 1:
+                trig_pct = float(cfg.get("partial_tp_trigger_pct", 0.02))
+                if current >= buy_avg * (1 + trig_pct):
+                    sell_ratio = float(cfg.get("partial_tp_sell_ratio", 0.33))
+                    sell_qty = max(1, math.floor(qty * sell_ratio))
+                    if sell_qty >= qty:
+                        sell_qty = qty - 1
+                    if sell_qty >= 1:
+                        place_order_us(uid, cfg, code, "sell", sell_qty, 0)
+                        pnl, _ = register_partial_sell(
+                            uid, "US", code, current, sell_qty,
+                            cfg.get("partial_tp_tighten_stop", True),
+                        )
+                        add_trade(uid, "US", code, "sell", current, sell_qty, "분할익절", pnl, stock_name=sn)
+                        st = get_bot_state(uid)
+                        update_bot_state(uid, {"realized_pnl": st.get("realized_pnl", 0) + pnl})
+                        _add_log(uid, "INFO", f"[US][{code}] 분할익절 | {sell_qty}주@${current:.2f} PnL ${pnl:+.2f}")
+                        _invalidate_balance_cache(uid)
+                        continue
 
             if target > 0 and current >= target:
                 place_order_us(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "US", code, current)
-                add_trade(uid, "US", code, "sell", current, qty, "목표가_달성", pnl, stock_name=pos.get("stock_name", ""))
+                add_trade(uid, "US", code, "sell", current, qty, "목표가_달성", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "INFO", f"[US][{code}] 익절 | ${current:.2f} → 목표 ${target:.2f} | PnL ${pnl:+.2f}")
                 continue
             if slp > 0 and current <= slp:
                 place_order_us(uid, cfg, code, "sell", qty, 0)
                 pnl = register_sell(uid, "US", code, current)
-                add_trade(uid, "US", code, "sell", current, qty, "손절", pnl, stock_name=pos.get("stock_name", ""))
+                add_trade(uid, "US", code, "sell", current, qty, "손절", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
                 _add_log(uid, "WARNING", f"[US][{code}] 손절 | ${current:.2f} ≤ 손절 ${slp:.2f}")
+                continue
+
+            # 물타기: 평단 대비 일정 하락 + 손절선 위 + 횟수/간격/총비중 + 추세 필터
+            if cfg.get("avg_down_enabled", True):
+                max_ad = int(cfg.get("avg_down_max_times", 2))
+                last_at = pos.get("avg_down_last_at")
+                min_h = float(cfg.get("avg_down_min_interval_hours", 20))
+                interval_ok = True
+                if last_at:
+                    try:
+                        raw = str(last_at).replace("Z", "+00:00")
+                        ld = datetime.fromisoformat(raw)
+                        if ld.tzinfo is None:
+                            ld = ld.replace(tzinfo=KST)
+                        else:
+                            ld = ld.astimezone(KST)
+                        if (datetime.now(KST) - ld).total_seconds() < min_h * 3600:
+                            interval_ok = False
+                    except Exception:
+                        interval_ok = True
+                dip_pct = float(cfg.get("avg_down_trigger_pct", 0.04))
+                ad_cnt = int(pos.get("avg_down_count", 0))
+                price_dipped = current <= buy_avg * (1 - dip_pct)
+                above_stop = current > slp * 1.002
+
+                # 추세 필터: RSI > 25 (극심한 과매도 탈출) + MA5 정배열
+                closes_us = [float(r.get("clos", r.get("stck_clpr", 0)) or 0) for r in ohlcv_pos_u]
+                rsi_us = _calc_rsi(closes_us[:30]) if len(closes_us) >= 16 else 50.0
+                ma5_us = sum(closes_us[:5]) / 5 if len(closes_us) >= 5 else current
+                ma20_us = sum(closes_us[:20]) / 20 if len(closes_us) >= 20 else ma5_us
+                trend_ok = rsi_us >= 25 and (current >= ma5_us * 0.97 or ma5_us >= ma20_us * 0.98)
+
+                skip_reason = None
+                if ad_cnt >= max_ad:
+                    skip_reason = f"횟수한도({ad_cnt}/{max_ad})"
+                elif not interval_ok:
+                    skip_reason = f"간격미달({min_h}h)"
+                elif not price_dipped:
+                    skip_reason = f"하락폭미달({(1 - current / buy_avg) * 100:.1f}%<{dip_pct * 100:.0f}%)"
+                elif not above_stop:
+                    skip_reason = "손절임박"
+                elif not trend_ok:
+                    skip_reason = f"추세불량(RSI={rsi_us:.0f},MA5=${ma5_us:.2f})"
+
+                if skip_reason is None:
+                    available_usd = _get_available_cash_us(uid, cfg)
+                    mv = float(current * qty)
+                    est_pf_usd = available_usd + mv
+                    max_ratio = float(cfg.get("max_position_ratio", 0.1))
+                    pos_cap = est_pf_usd * max_ratio * 1.02
+                    room = pos_cap - mv
+                    ad_ratio = float(cfg.get("avg_down_qty_ratio", 0.35))
+                    wish = max(1, math.floor(qty * ad_ratio))
+                    max_add_cash = math.floor(available_usd / current) if current > 0 else 0
+                    max_add_room = math.floor(room / current) if room > 0 and current > 0 else 0
+                    add_qty = min(wish, max_add_cash, max_add_room)
+                    if add_qty < 1:
+                        skip_reason = f"수량부족(현금{max_add_cash},비중여유{max_add_room})"
+                    elif not _try_acquire_buy_lock(uid, "US", code):
+                        skip_reason = "락획득실패"
+                    else:
+                        try:
+                            res = place_order_us(uid, cfg, code, "buy", int(add_qty), 0)
+                            order_no = res.get("output", {}).get("ODNO", "N/A")
+                            merge_position_after_avg_down(uid, "US", code, current, int(add_qty), ohlcv_pos_u, cfg)
+                            add_trade(uid, "US", code, "buy", current, int(add_qty), "물타기", stock_name=sn)
+                            _add_log(uid, "INFO", f"[US][{code}] 물타기 | +{add_qty}@${current:.2f} 주문={order_no} RSI={rsi_us:.0f}")
+                            _invalidate_balance_cache(uid)
+                        finally:
+                            _release_buy_lock(uid, "US", code)
+                # 물타기 스킵 로그 (하락폭 충족 시에만 — 왜 안 샀는지 추적용)
+                if skip_reason and price_dipped:
+                    _add_log(uid, "INFO", f"[US][{code}] 물타기스킵 | {skip_reason} (${current:.2f} 평단${buy_avg:.2f})")
         except Exception as e:
             _add_log(uid, "ERROR", f"[US][{code}] 포지션 체크 오류: {e}")
 
@@ -2709,8 +3340,11 @@ def route_order():
                     return jsonify({"ok": False, "error": "수량 계산 실패"}), 400
                 result = place_order_kr(uid, cfg, stock_code, "buy", quantity, int(price))
                 order_no = result.get("output", {}).get("ODNO", "N/A")
-                register_buy(uid, "KR", stock_code, current, quantity,
-                             cfg.get("stop_loss_ratio", 0.02), stock_name=sname, source="수동")
+                tp_kr = calculate_optimal_prices(current, ohlcv_o, cfg)["sell_price"]
+                register_buy(
+                    uid, "KR", stock_code, current, quantity,
+                    cfg.get("stop_loss_ratio", 0.02), float(tp_kr), "수동", sname,
+                )
                 add_trade(uid, "KR", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][KR] {stock_code} {quantity}주@{current:,} 주문={order_no}")
                 _invalidate_balance_cache(uid)
@@ -2747,8 +3381,12 @@ def route_order():
                     return jsonify({"ok": False, "error": "미국 주식은 수량을 직접 입력해주세요"}), 400
                 result = place_order_us(uid, cfg, stock_code, "buy", quantity, price)
                 order_no = result.get("output", {}).get("ODNO", "N/A")
-                register_buy(uid, "US", stock_code, current, quantity,
-                             cfg.get("stop_loss_ratio", 0.02), stock_name=sname, source="수동")
+                ohlcv_us_m = get_daily_ohlcv_us(uid, cfg, stock_code)
+                tp_us = calculate_optimal_prices_us(current, ohlcv_us_m, cfg)["sell_price"]
+                register_buy(
+                    uid, "US", stock_code, current, quantity,
+                    cfg.get("stop_loss_ratio", 0.02), float(tp_us), "수동", sname,
+                )
                 add_trade(uid, "US", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][US] {stock_code} {quantity}주@${current:.2f}")
                 _invalidate_balance_cache(uid)
@@ -2809,7 +3447,12 @@ def route_config():
     body = request.get_json() or {}
     allowed = {"is_mock", "kr_watchlist", "us_watchlist", "k_factor", "ma_period",
                 "stop_loss_ratio", "max_position_ratio", "daily_profit_target",
-                "bot_enabled", "ai_stock_count", "min_score_us", "max_us_qty"}
+                "bot_enabled", "ai_stock_count", "min_score_us", "min_score_us_ai",
+                "ai_afford_one_share", "max_us_qty",
+                "partial_tp_enabled", "partial_tp_trigger_pct", "partial_tp_sell_ratio",
+                "partial_tp_tighten_stop",
+                "avg_down_enabled", "avg_down_trigger_pct", "avg_down_max_times",
+                "avg_down_qty_ratio", "avg_down_min_interval_hours"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400
@@ -2980,9 +3623,16 @@ def route_ai_run():
     market = str(body.get("market", "KR")).upper()
     if session not in ("morning", "afternoon", "late", "manual"):
         return jsonify({"ok": False, "error": "session: morning/afternoon/late/manual"}), 400
+    add_buy_count: int | None = None
+    raw_add = body.get("add_buy_count")
+    if raw_add is not None and raw_add != "":
+        try:
+            add_buy_count = max(0, min(int(raw_add), 5))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "add_buy_count: 0~5 정수"}), 400
     try:
         cfg = get_config(uid)
-        run_ai_session(uid, cfg, session, market)
+        run_ai_session(uid, cfg, session, market, add_buy_count=add_buy_count)
         return jsonify({"ok": True, "message": f"AI {session} 세션 완료"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3027,7 +3677,9 @@ def route_logs():
         cors_origins="*",
         cors_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     ),
-    memory=options.MemoryOption.MB_256,
+    # 기본 60s 초과 시 Cloud Run이 502 반환 — AI 유니버스 수집·Gemini·스코어링은 수 분 걸릴 수 있음
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=540,
 )
 def api(req: https_fn.Request) -> https_fn.Response:
     with flask_app.request_context(req.environ):

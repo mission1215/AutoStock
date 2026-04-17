@@ -7,18 +7,15 @@ function tradePriceStr(t: TradeRow) {
     ? `$${Number(t.price || 0).toFixed(2)}`
     : `${Number(t.price || 0).toLocaleString()}원`;
 }
-import { Sparkline } from "../components/Sparkline";
 import { EquityChart } from "../components/charts/EquityChart";
 import { PositionMixChart } from "../components/charts/PositionMixChart";
 import { ManualTradingPanel } from "../components/ManualTradingPanel";
 import { StrategySettings } from "../components/StrategySettings";
 import { AiSessionButtons } from "../components/AiSessionButtons";
 import { HoldingsPanel } from "../components/HoldingsPanel";
-import {
-  buildSparklineCloses,
-  pickRecord,
-  watchlistCodeKeys,
-} from "../utils/sparklineCloses";
+import { MarketFlowStrip } from "../components/MarketFlowStrip";
+import { pickRecord, watchlistCodeKeys } from "../utils/sparklineCloses";
+import { tvSymbol } from "../utils/tradingViewSymbol";
 import { formatKst } from "../utils/formatKst";
 
 const POLL_MS = 20000;
@@ -354,6 +351,8 @@ export function Dashboard({
         </div>
       </div>
 
+      <MarketFlowStrip market={currentMarket} watchlistCodes={wl} className="mt-5" />
+
       {tab === "auto" && (
         <section className="mt-5 space-y-5">
           <AiSessionButtons
@@ -379,7 +378,7 @@ export function Dashboard({
               감시 종목
             </h2>
             <p className="text-[10px] text-slate-600 -mt-2 mb-3">
-              {wl.length}종목 · 최근 20일 종가 스파크라인
+              {wl.length}종목 · 앱 시세·손익 · 자세한 차트는 링크로 TradingView(새 창)
             </p>
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 md:gap-4">
             {wl.map((code) => {
@@ -454,7 +453,7 @@ export function Dashboard({
                           {pos.pnl_ratio ?? 0}%)
                         </div>
                       )}
-                      <div className="text-[11px] text-slate-500 space-y-0.5 mb-2">
+                      <div className="text-[11px] text-slate-500 space-y-0.5">
                         <div>
                           매수{" "}
                           <span className="text-slate-400">
@@ -488,15 +487,17 @@ export function Dashboard({
                       </div>
                     </>
                   )}
-                  <div className="h-[60px] rounded-lg bg-[#060a12] ring-1 ring-white/5 overflow-hidden">
-                    <Sparkline
-                      closes={buildSparklineCloses(wd, pos)}
-                      changeRate={cr}
-                    />
-                  </div>
-                  <p className="text-[10px] text-slate-600 mt-1 text-center">
-                    최근 20일 종가 기반
-                  </p>
+                  <a
+                    href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSymbol(code, currentMarket))}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-3 flex items-center justify-center gap-1 rounded-lg border border-indigo-500/20 bg-indigo-950/40 py-2.5 text-[11px] font-medium text-indigo-200/90 hover:bg-indigo-500/15 transition-colors"
+                  >
+                    TradingView에서 차트 열기
+                    <span className="opacity-70" aria-hidden>
+                      ↗
+                    </span>
+                  </a>
                 </div>
               );
             })}

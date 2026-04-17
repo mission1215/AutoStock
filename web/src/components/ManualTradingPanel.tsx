@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "../api/client";
 import type { PositionKr, PositionUs } from "../types";
+import { TradingViewAdvancedChart } from "./TradingViewEmbed";
+import { tvSymbol } from "../utils/tradingViewSymbol";
 
 function inferMarket(code: string): "KR" | "US" {
   const c = code.trim().toUpperCase();
@@ -30,6 +32,7 @@ export function ManualTradingPanel({
   const [quoteErr, setQuoteErr] = useState("");
   const [orderBusy, setOrderBusy] = useState(false);
   const [orderMsg, setOrderMsg] = useState("");
+  const [showTvChart, setShowTvChart] = useState(false);
 
   const refreshQuote = useCallback(async () => {
     const c = code.trim().toUpperCase();
@@ -179,8 +182,12 @@ export function ManualTradingPanel({
     })),
   ];
 
+  const chartMarket: "KR" | "US" =
+    quote?.market ?? (code.trim() ? inferMarket(code.trim()) : "KR");
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-4">
+    <div className="mt-4 space-y-6">
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="space-y-3">
         <h3 className="text-sm font-semibold text-slate-300">
           직접 주문
@@ -193,7 +200,17 @@ export function ManualTradingPanel({
           사용합니다.
         </p>
         <div>
-          <label className="text-xs text-slate-500 block mb-1">종목코드 / 티커</label>
+          <div className="flex items-center justify-between mb-1">
+            <label className="text-xs text-slate-500">종목코드 / 티커</label>
+            <button
+              type="button"
+              disabled={!code.trim()}
+              onClick={() => setShowTvChart((v) => !v)}
+              className="text-[11px] font-medium text-cyan-400/90 hover:text-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {showTvChart ? "차트 닫기" : "TradingView 차트"}
+            </button>
+          </div>
           <input
             className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-white uppercase"
             value={code}
@@ -296,18 +313,35 @@ export function ManualTradingPanel({
                     {(p.quantity ?? 0).toLocaleString()}주
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => quickSell(sym, mkt)}
-                  className="shrink-0 rounded-lg border border-red-500/30 px-2 py-1 text-red-300 hover:bg-red-500/10"
-                >
-                  전량 매도
-                </button>
+                <div className="flex flex-col gap-1 items-end shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCode(sym);
+                      setShowTvChart(true);
+                    }}
+                    className="rounded-lg border border-cyan-500/25 px-2 py-1 text-[10px] text-cyan-300/90 hover:bg-cyan-500/10"
+                  >
+                    차트
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => quickSell(sym, mkt)}
+                    className="rounded-lg border border-red-500/30 px-2 py-1 text-red-300 hover:bg-red-500/10"
+                  >
+                    전량 매도
+                  </button>
+                </div>
               </div>
             ))
           )}
         </div>
       </div>
+    </div>
+
+    {showTvChart && code.trim() ? (
+      <TradingViewAdvancedChart symbol={tvSymbol(code.trim(), chartMarket)} />
+    ) : null}
     </div>
   );
 }
