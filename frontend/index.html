@@ -426,7 +426,8 @@
           <span id="botStatusText" class="text-xs text-slate-400 hidden sm:block"></span>
         </div>
         <span class="text-xs text-slate-600 hidden sm:block" id="updatedAt"></span>
-        <button onclick="loadAll()" class="w-8 h-8 rounded-lg glass glass-hover flex items-center justify-center">
+        <span class="text-[10px] text-slate-700 hidden sm:block font-mono" id="refreshCountdown" title="다음 자동 갱신까지"></span>
+        <button onclick="manualRefresh()" class="w-8 h-8 rounded-lg glass glass-hover flex items-center justify-center">
           <svg id="refreshIcon" class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
           </svg>
@@ -507,6 +508,15 @@
       <div class="glass rounded-2xl p-4">
         <p class="text-xs text-slate-500 mb-1.5">총자산</p>
         <p id="totalEquity" class="text-xl font-bold text-white">-</p>
+        <div id="drawdownInfo" class="hidden mt-2">
+          <div class="flex items-center justify-between text-xs mb-1">
+            <span class="text-slate-600">드로우다운</span>
+            <span id="drawdownPct" class="font-semibold text-green-400">0%</span>
+          </div>
+          <div class="h-1 rounded-full overflow-hidden" style="background:rgba(255,255,255,.08)">
+            <div id="drawdownBar" class="h-full rounded-full transition-all duration-500" style="width:0%;background:#ef4444"></div>
+          </div>
+        </div>
       </div>
       <div class="glass rounded-2xl p-4">
         <p class="text-xs text-slate-500 mb-1.5">주문가능</p>
@@ -781,7 +791,7 @@
 // ════════════════════════════════════════════════════════
 let currentTab='auto', currentMarket='KR', tradesLoaded=false, logsLoaded=false, currentStockCount=3;
 let _orderQuoteTimer=null, _lastOrderQuote=null;
-let _refreshTimer = null;
+let _refreshTimer = null, _countdownTimer = null, _countdownSec = 30;
 /** 리서치 패널에 이미 채운 마켓 (불필요한 재요청 방지) */
 let _researchLoadedMarket = null;
 window._nameCache = {};
@@ -1273,11 +1283,19 @@ function _mountApp(user, data) {
   if(data){ window._lastStatusData=data; renderWithData(data); }
   else { loadAll(); }
   if(_refreshTimer) clearInterval(_refreshTimer);
+  if(_countdownTimer) clearInterval(_countdownTimer);
+  _countdownSec = 30;
   _refreshTimer = setInterval(()=>{
-    loadAll(); // 내부 renderWithData에서 자동 탭이면 loadRecommendations 호출
+    _countdownSec = 30;
+    loadAll();
     if(!document.getElementById('logsBody').classList.contains('hidden')) loadLogs();
     if(!document.getElementById('tradesBody').classList.contains('hidden')) loadTrades();
   }, 30000); // 30초마다 갱신 (KIS API 부하 감소)
+  _countdownTimer = setInterval(()=>{
+    if(_countdownSec > 0) _countdownSec--;
+    const el = document.getElementById('refreshCountdown');
+    if(el) el.textContent = '↻' + _countdownSec + 's';
+  }, 1000);
 }
 
 // 하위 호환 래퍼
@@ -1499,8 +1517,14 @@ async function saveApiSettings() {
   }
 }
 
+function manualRefresh() {
+  _countdownSec = 30;
+  loadAll();
+}
+
 // ── 전체 상태 로드 ──────────────────────────────────────
 async function loadAll() {
+  _countdownSec = 30;
   const icon=document.getElementById('refreshIcon');
   const grid=document.getElementById('watchlistGrid');
   if(grid) grid.innerHTML=watchlistSkeletonHtml(10);
@@ -1566,7 +1590,20 @@ function renderHeader(data) {
   const enabled=state.bot_enabled!==false, halted=state.trading_halted, open=state.is_market_open;
   let dc,st,bt,bc;
   if(!enabled){dc='bg-slate-500';st='봇 비활성';bt='비활성';bc='bg-slate-700 text-slate-400';}
-  else if(halted){dc='bg-yellow-400';st='목표달성';bt='목표달성 중단';bc='bg-yellow-500/20 text-yellow-400';}
+  else if(halted){
+    dc='bg-yellow-400';
+    const hr=(state.halt_reason||'').toLowerCase();
+    let haltTxt;
+    if(hr.includes('drawdown')){
+      // halt_reason 형식: "drawdown_5.2" 또는 "drawdown"
+      const pct=hr.replace(/drawdown_?/,'');
+      haltTxt = pct ? ('DD ' + parseFloat(pct).toFixed(1) + '% 초과') : '드로우다운 중단';
+    } else {
+      haltTxt = '목표 달성';
+    }
+    st=haltTxt; bt=haltTxt+' · 중단';
+    bc='bg-yellow-500/20 text-yellow-400';
+  }
   else if(open){dc='bg-green-400 pulse-green';st='매매 중';bt='🟢 실행 중';bc='bg-green-500/20 text-green-400';}
   else{dc='bg-slate-400';st='대기 중';bt='대기';bc='bg-slate-700 text-slate-400';}
   document.getElementById('botDot').className='w-2 h-2 rounded-full '+dc;
@@ -1593,6 +1630,23 @@ function renderStats(data) {
   const krCount=Object.keys(data.positions_kr||{}).length;
   const usCount=Object.keys(data.positions_us||{}).length;
   document.getElementById('positionSummary').textContent=(krCount+usCount)+'종목'+(krCount&&usCount?` (KR${krCount}+US${usCount})`:'');
+  // 드로우다운 미터
+  const peakEquity=parseFloat(state.peak_equity)||0;
+  const totalEquity=parseFloat(bal.total_equity)||0;
+  const ddInfo=document.getElementById('drawdownInfo');
+  if(ddInfo&&peakEquity>0&&totalEquity>0){
+    const ddPct=Math.max(0,(peakEquity-totalEquity)/peakEquity*100);
+    const ddEl=document.getElementById('drawdownPct');
+    const ddBar=document.getElementById('drawdownBar');
+    if(ddEl){
+      ddEl.textContent=ddPct.toFixed(1)+'%';
+      ddEl.className='font-semibold '+(ddPct>=3?'text-red-400':ddPct>=1?'text-yellow-400':'text-green-400');
+    }
+    if(ddBar) ddBar.style.width=Math.min(100,ddPct*10)+'%'; // 10% DD → 100% bar
+    ddInfo.classList.remove('hidden');
+  } else if(ddInfo){
+    ddInfo.classList.add('hidden');
+  }
 }
 
 // ── 추천 종목 티커 ──────────────────────────────────────
@@ -1679,6 +1733,9 @@ function renderPositions(positions) {
     const stockName=p.stock_name||window._nameCache[code]||'';
     const pnlStr=isUS?'$'+(Math.abs(pnl)).toFixed(2):(Math.abs(pnl)).toLocaleString()+'원';
     const sellMkt=(p.market||'KR')==='US'?'US':'KR';
+    // 보유일 계산
+    let daysHeld='-';
+    if(p.entry_time){try{const d=Math.floor((Date.now()-new Date(p.entry_time).getTime())/(86400000));daysHeld=d===0?'오늘':d+'일';}catch(_){}}
     return `
       <div class="rounded-2xl p-3.5 transition-all" style="background:${bg};border:1px solid ${border}">
         <div class="flex items-center justify-between mb-1.5">
@@ -1694,10 +1751,11 @@ function renderPositions(positions) {
           </div>
           <span class="${pc} font-bold text-sm">${pnl>=0?'+':'-'}${pnlStr}</span>
         </div>
-        <div class="grid grid-cols-3 gap-1 text-xs mb-2.5">
-          <div class="text-center"><div class="text-slate-500 mb-0.5" title="주문 시점 기준 기록가">평균 매수가</div><div class="text-white font-medium">${isUS?'$'+(p.buy_price||0).toFixed(2):(p.buy_price||0).toLocaleString()}</div></div>
+        <div class="grid grid-cols-4 gap-1 text-xs mb-2.5">
+          <div class="text-center"><div class="text-slate-500 mb-0.5" title="주문 시점 기준 기록가">평균가</div><div class="text-white font-medium">${isUS?'$'+(p.buy_price||0).toFixed(2):(p.buy_price||0).toLocaleString()}</div></div>
           <div class="text-center"><div class="text-slate-500 mb-0.5">현재가</div><div class="font-bold ${pc}">${p.current_price?(isUS?'$'+parseFloat(p.current_price).toFixed(2):p.current_price.toLocaleString()):'-'}</div></div>
           <div class="text-center"><div class="text-slate-500 mb-0.5">수익률</div><div class="font-bold ${pc}">${(pr>=0?'+':'')+pr}%</div></div>
+          <div class="text-center"><div class="text-slate-500 mb-0.5">보유</div><div class="text-slate-300 font-medium">${daysHeld}</div></div>
         </div>
         ${target>0?`
         <div class="mb-2">
@@ -1998,12 +2056,16 @@ async function loadLogs() {
   const data=await apiFetch('/api/logs');
   if(!data.ok||!data.logs.length){el.innerHTML='<p class="text-slate-600">로그 없음</p>';return;}
   const c={INFO:'text-slate-300',WARNING:'text-yellow-400',ERROR:'text-red-400',DEBUG:'text-slate-600'};
-  el.innerHTML=data.logs.map(l=>`
-    <div class="py-0.5">
+  const bg={ERROR:'rgba(239,68,68,.08)',WARNING:'rgba(234,179,8,.06)',INFO:'',DEBUG:''};
+  el.innerHTML=data.logs.map(l=>{
+    const lvl=l.level||'INFO';
+    const rowBg=bg[lvl]||'';
+    return `<div class="py-0.5 px-1 rounded" style="${rowBg?'background:'+rowBg:''}">
       <span class="text-slate-600">${fmtTime(l.timestamp)}</span>
-      <span class="${c[l.level]||'text-slate-400'} font-semibold"> [${escapeHtml(l.level||'')}]</span>
-      <span class="${c[l.level]||'text-slate-400'}"> ${escapeHtml(l.message||'')}</span>
-    </div>`).join('');
+      <span class="${c[lvl]||'text-slate-400'} font-semibold"> [${escapeHtml(lvl)}]</span>
+      <span class="${c[lvl]||'text-slate-400'}"> ${escapeHtml(l.message||'')}</span>
+    </div>`;
+  }).join('');
 }
 
 (function initDelegatedClicks(){

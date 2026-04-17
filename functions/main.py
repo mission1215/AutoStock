@@ -23,7 +23,7 @@ import os
 import math
 import logging
 import time as time_module
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -270,6 +270,78 @@ def _parse_num_kr(raw: Any) -> int:
         return int(float(s))
     except Exception:
         return 0
+
+
+def _kr_closes_from_ohlcv(ohlcv: list) -> list[int]:
+    """KIS inquire-daily-price output2 일자별 종가. 오래된 날→최근 순 (스파크라인용)."""
+    newest_first: list[int] = []
+    for r in ohlcv[:20]:
+        if not isinstance(r, dict):
+            continue
+        raw = r.get("stck_clpr", r.get("clos", 0))
+        v = _parse_num_kr(raw)
+        if v > 0:
+            newest_first.append(v)
+    return list(reversed(newest_first))
+
+
+def _us_closes_from_ohlcv(ohlcv: list) -> list[float]:
+    """미국 일봉 종가. 오래된 날→최근 순."""
+    newest_first: list[float] = []
+    for r in ohlcv[:20]:
+        if not isinstance(r, dict):
+            continue
+        raw = r.get("clos", r.get("stck_clpr", 0))
+        try:
+            v = float(str(raw).replace(",", "").strip() or 0)
+        except Exception:
+            continue
+        if v > 0:
+            newest_first.append(v)
+    return list(reversed(newest_first))
+
+
+def _ensure_sparkline_closes_kr(
+    closes: list[int], current: int, buy: int | None = None
+) -> list[int]:
+    """스파크라인은 최소 2포인트 필요. 일봉 실패 시 현재가·매수가로 대체."""
+    if len(closes) >= 2:
+        return closes
+    if len(closes) == 1:
+        c = closes[0]
+        return [c, c]
+    cur = int(current) if current and current > 0 else 0
+    bp = int(buy) if buy and buy > 0 else 0
+    if cur > 0 and bp > 0:
+        return [bp, cur]
+    if cur > 0:
+        return [cur, cur]
+    return []
+
+
+def _ensure_sparkline_closes_us(
+    closes: list[float], current: float, buy: float | None = None
+) -> list[float]:
+    if len(closes) >= 2:
+        return closes
+    if len(closes) == 1:
+        c = closes[0]
+        return [c, c]
+    cur = float(current) if current and current > 0 else 0.0
+    bp = float(buy) if buy and buy > 0 else 0.0
+    if cur > 0 and bp > 0:
+        return [bp, cur]
+    if cur > 0:
+        return [cur, cur]
+    return []
+
+
+def _normalize_kr_stock_code(code: Any) -> str:
+    """감시·API 키 통일 — 숫자만 6자리 (5930 → 005930, Firestore 타입 혼용 대응)."""
+    s = str(code).strip()
+    if s.isdigit() and len(s) <= 6:
+        return s.zfill(6)
+    return s
 
 
 def _kr_price_from_output(out: dict | Any, ohlcv: list | None = None) -> int:
@@ -928,6 +1000,48 @@ def _get_sector_exposure(uid: str, market: str) -> dict[str, int]:
     return exposure
 
 
+def _try_acquire_buy_lock(uid: str, market: str, code: str) -> bool:
+    """Firestore 트랜잭션으로 매수 락을 획득합니다.
+
+    두 개의 Functions 인스턴스가 동시에 같은 종목을 매수하는 것을 방지합니다.
+    락은 3분 후 자동 만료됩니다.
+
+    Returns
+    -------
+    bool
+        True  → 락 획득 성공, 매수 진행 가능
+        False → 이미 다른 인스턴스가 매수 중 (또는 트랜잭션 실패)
+    """
+    lock_ref = _uref(uid).collection("locks").document(f"{market}_{code}")
+
+    def _in_txn(transaction) -> bool:
+        snap = lock_ref.get(transaction=transaction)
+        if snap.exists:
+            data       = snap.to_dict()
+            locked_at  = data.get("locked_at")
+            if locked_at:
+                age = (datetime.now(KST) - locked_at.astimezone(KST)).total_seconds()
+                if age < 180:   # 3분 이내: 유효한 락
+                    return False
+        # 락 설정 (기존 락이 없거나 만료됨)
+        transaction.set(lock_ref, {"locked_at": datetime.now(KST), "market": market, "code": code})
+        return True
+
+    try:
+        return get_db().run_in_transaction(_in_txn)
+    except Exception as e:
+        _add_log(uid, "WARNING", f"[락] {market}/{code} 락 획득 실패: {e}")
+        return False   # 실패 시 안전하게 매수 건너뜀
+
+
+def _release_buy_lock(uid: str, market: str, code: str) -> None:
+    """매수 완료 또는 실패 후 락을 해제합니다."""
+    try:
+        _uref(uid).collection("locks").document(f"{market}_{code}").delete()
+    except Exception:
+        pass  # 락 해제 실패는 무시 (3분 후 자동 만료)
+
+
 def _sector_ok(code: str, market: str, exposure: dict[str, int], max_per_sector: int) -> tuple[bool, str]:
     """섹터 한도 초과 여부 판정.
 
@@ -942,15 +1056,37 @@ def _sector_ok(code: str, market: str, exposure: dict[str, int], max_per_sector:
 
 
 def _calc_rsi(closes: list[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
+    """Wilder EMA 방식 RSI.
+
+    Parameters
+    ----------
+    closes : list[float]
+        종가 배열 — [최신→과거] 순서. 정확한 결과를 위해 30개 이상 권장.
+    period : int
+        RSI 기간 (기본 14).
+
+    Notes
+    -----
+    Wilder 스무딩: avg = (prev_avg × (n-1) + current) / n
+    단순 평균 방식보다 최근 데이터에 더 적절한 가중치를 부여합니다.
+    """
+    if len(closes) < period + 2:
         return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    # [최신→과거] → [과거→최신] 변환
+    c = list(reversed(closes))
+    diffs  = [c[i] - c[i - 1] for i in range(1, len(c))]
+    gains  = [max(d, 0.0) for d in diffs]
+    losses = [abs(min(d, 0.0)) for d in diffs]
+
+    # 초기 단순 평균 (Wilder 초기값)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    # Wilder EMA 스무딩 (나머지 기간 적용)
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -1078,7 +1214,7 @@ def score_us_stock_algorithm(current_price: float, ohlcv: list[dict], cfg: dict)
                 detail["ema9"] = round(ema9, 2)
 
         # ── 5. RSI (미국 최적 범위: 45~70) ───────────────────
-        rsi = _calc_rsi(closes[:20])
+        rsi = _calc_rsi(closes[:30])   # Wilder RSI: 30개 이상 권장
         if   45 <= rsi <= 70: score += 15
         elif 40 <= rsi <= 75: score += 8
         detail["rsi"] = rsi
@@ -1174,7 +1310,7 @@ def score_stock_algorithm(current_price: float, ohlcv: list[dict], cfg: dict) ->
                 detail["ema5"]  = round(ema5, 0)
                 detail["ema20"] = round(ema20, 0)
 
-        rsi = _calc_rsi(closes[:20])
+        rsi = _calc_rsi(closes[:30])   # Wilder RSI: 30개 이상 권장
         if 45 <= rsi <= 65: score += 15
         elif 40 <= rsi <= 70: score += 8
         detail["rsi"] = rsi
@@ -1280,10 +1416,22 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                 float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv[:5]
             ) / min(5, len(ohlcv))
 
-            above_target = current > target
-            above_ma5 = current > ma5
+            # K팩터 진입 슬리피지 필터:
+            # 목표가를 이미 max_entry_slip(기본 2%) 이상 지나쳤으면 추격 매수 금지.
+            # 돌파 직후 시장가로 들어가야 기대값이 있음.
+            max_slip    = cfg.get("max_entry_slip_pct", 0.02)
+            above_target = target <= current <= target * (1 + max_slip)
+            above_ma5    = current > ma5
 
             if above_target and above_ma5:
+                # 최소 스코어 체크 (KR 기본 40점 / 100점 만점)
+                score_result = score_stock_algorithm(current, ohlcv, cfg)
+                min_score_kr = int(cfg.get("min_score_kr", 40))
+                if score_result["score"] < min_score_kr:
+                    diag_parts.append(
+                        f"{code}=점수미달({score_result['score']}/{min_score_kr})"
+                    )
+                    continue
                 # 섹터 한도 체크
                 sec_ok, sector = _sector_ok(code, "KR", sector_exposure, max_per_sector)
                 if not sec_ok:
@@ -1296,16 +1444,22 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                 if qty <= 0:
                     qty = 1 if available >= current else 0
                 if qty > 0:
-                    result = place_order_kr(uid, cfg, code, "buy", qty, 0)
-                    order_no = result.get("output", {}).get("ODNO", "N/A")
-                    out = data.get("output") or {}
-                    sname = _stock_name(out.get("hts_kor_isnm", "") if isinstance(out, dict) else "", code, "KR")
-                    register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
-                                 source="자동", stock_name=sname)
-                    add_trade(uid, "KR", code, "buy", current, qty, "자동매수", stock_name=sname)
-                    _add_log(uid, "INFO", f"[KR][{code}] 자동매수 | {qty}주@{current:,} 주문={order_no}")
-                    diag_parts.append(f"{code}=✅매수{qty}주")
-                    sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
+                    if not _try_acquire_buy_lock(uid, "KR", code):
+                        diag_parts.append(f"{code}=매수중복방지(락)")
+                        continue
+                    try:
+                        result = place_order_kr(uid, cfg, code, "buy", qty, 0)
+                        order_no = result.get("output", {}).get("ODNO", "N/A")
+                        out = data.get("output") or {}
+                        sname = _stock_name(out.get("hts_kor_isnm", "") if isinstance(out, dict) else "", code, "KR")
+                        register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.02),
+                                     source="자동", stock_name=sname)
+                        add_trade(uid, "KR", code, "buy", current, qty, "자동매수", stock_name=sname)
+                        _add_log(uid, "INFO", f"[KR][{code}] 자동매수 | {qty}주@{current:,} 주문={order_no}")
+                        diag_parts.append(f"{code}=✅매수{qty}주")
+                        sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
+                    finally:
+                        _release_buy_lock(uid, "KR", code)
                 else:
                     diag_parts.append(f"{code}=돌파했으나잔액부족(가격{current:,}/잔액{available:,.0f})")
             else:
@@ -1745,6 +1899,9 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
                      f"[AI][{market}][{code}] 섹터 한도 | {sector} "
                      f"{sector_exposure.get(sector, 0)}/{max_per_sector}개 — 건너뜀")
             continue
+        if not _try_acquire_buy_lock(uid, market, code):
+            _add_log(uid, "INFO", f"[AI][{market}][{code}] 매수 락 선점 — 건너뜀(다른 인스턴스 매수 중)")
+            continue
         try:
             if market == "US":
                 data    = get_current_price_us(uid, cfg, code)
@@ -1800,17 +1957,18 @@ def run_ai_session(uid: str, cfg: dict, session: str, market: str = "KR"):
             sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
         except Exception as e:
             _add_log(uid, "ERROR", f"[AI][{code}] 매수 오류: {e}")
+        finally:
+            _release_buy_lock(uid, market, code)
 
     _uref(uid).collection("recommendations").document(session_id).update({
         "status": "completed", "executed_codes": executed,
         "executed_count": len(executed), "completed_at": datetime.now(KST),
     })
 
-    rec_codes = [r["code"] for r in recommendations]
-    wl_key = "us_watchlist" if market == "US" else "kr_watchlist"
-    if rec_codes:
-        save_config(uid, {wl_key: rec_codes})
-
+    # ※ watchlist는 변경하지 않음.
+    # AI 추천 결과는 recommendations 컬렉션에만 저장합니다.
+    # 이전에 save_config(wl_key, rec_codes)를 호출했는데,
+    # 이는 원래 25개 감시종목이 3~5개로 축소되는 부작용이 있었음.
     _add_log(uid, "INFO", f"[AI {session}] 완료 — {len(executed)}/{len(recommendations)}종목 매수")
 
 
@@ -1874,6 +2032,22 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                          f"[US][{code}] 스코어 미달 {score}pt/{min_score}pt "
                          f"| detail={score_result['detail']}")
                 continue
+
+            # K팩터 진입 슬리피지 필터 (US)
+            if len(ohlcv) >= 2:
+                opens_us   = [float(r.get("open", r.get("stck_oprc", 0))) for r in ohlcv]
+                highs_us   = [float(r.get("high", r.get("stck_hgpr", 0))) for r in ohlcv]
+                lows_us    = [float(r.get("low",  r.get("stck_lwpr", 0))) for r in ohlcv]
+                today_open = opens_us[0] if opens_us else current
+                k_us       = cfg.get("k_factor", 0.3)
+                target_us  = today_open + k_us * (highs_us[1] - lows_us[1])
+                max_slip   = cfg.get("max_entry_slip_pct", 0.02)
+                if target_us > 0 and current > target_us * (1 + max_slip):
+                    _add_log(uid, "INFO",
+                             f"[US][{code}] 돌파 후 추격 금지 | "
+                             f"현재=${current:.2f} 목표=${target_us:.2f} "
+                             f"(+{(current/target_us-1)*100:.1f}% 초과)")
+                    continue
 
             prices = calculate_optimal_prices_us(current, ohlcv, cfg)
             available_usd = _get_available_cash_us(uid, cfg)
@@ -2172,10 +2346,25 @@ def scheduled_us_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
 # ══════════════════════════════════════════════════════════
 
 def _ts_to_str(ts) -> str:
-    if ts is None: return ""
-    if isinstance(ts, datetime): return ts.isoformat()
-    if hasattr(ts, "seconds"): return datetime.fromtimestamp(ts.seconds, KST).isoformat()
-    return str(ts)
+    """Firestore·datetime → 한국 시간 문자열 (API·JSON 응답용)."""
+    if ts is None:
+        return ""
+    dt: datetime | None = None
+    if isinstance(ts, datetime):
+        dt = ts
+    elif hasattr(ts, "seconds") and not isinstance(ts, datetime):
+        try:
+            nanos = int(getattr(ts, "nanoseconds", 0) or 0)
+            sec = float(ts.seconds) + nanos / 1e9
+            dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+        except Exception:
+            return str(ts)
+    if dt is None:
+        return str(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    # +09:00 포함 — JSON·JS Date 파싱이 브라우저마다 일관되도록
+    return dt.astimezone(KST).isoformat(timespec="seconds")
 
 
 def _require_auth():
@@ -2305,14 +2494,40 @@ def route_status():
 
         # 감시 종목 데이터 (KR)
         watchlist_data: dict[str, Any] = {}
-        for code in cfg.get("kr_watchlist", []):
+        for raw_code in cfg.get("kr_watchlist", []):
+            code = _normalize_kr_stock_code(raw_code)
             if code in positions_kr_detail:
                 p = positions_kr_detail[code]
-                watchlist_data[code] = {
+                wl_entry: dict[str, Any] = {
                     "current_price": p.get("current_price", 0),
                     "stock_name": p.get("stock_name", code),
                     "change_rate": p.get("change_rate", "0"),
                 }
+                try:
+                    ohlcv_p = _cached_ohlcv(uid, cfg, code, "KR")
+                    if len(ohlcv_p) >= 2:
+                        today_open = float(str(ohlcv_p[0].get("stck_oprc", 0)).replace(",", "") or 0)
+                        prev_h = float(str(ohlcv_p[1].get("stck_hgpr", 0)).replace(",", "") or 0)
+                        prev_l = float(str(ohlcv_p[1].get("stck_lwpr", 0)).replace(",", "") or 0)
+                        wl_entry["target_breakout"] = int(
+                            today_open + cfg.get("k_factor", 0.5) * (prev_h - prev_l)
+                        )
+                    if len(ohlcv_p) >= 5:
+                        wl_entry["ma5"] = int(
+                            sum(float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv_p[:5]) / 5
+                        )
+                    wl_entry["closes"] = _ensure_sparkline_closes_kr(
+                        _kr_closes_from_ohlcv(ohlcv_p),
+                        int(p.get("current_price") or 0),
+                        int(p.get("buy_price") or 0) or None,
+                    )
+                except Exception:
+                    wl_entry["closes"] = _ensure_sparkline_closes_kr(
+                        [],
+                        int(p.get("current_price") or 0),
+                        int(p.get("buy_price") or 0) or None,
+                    )
+                watchlist_data[code] = wl_entry
             else:
                 try:
                     data = _cached_price(uid, cfg, code, "KR")
@@ -2337,33 +2552,64 @@ def route_status():
                         entry["ma5"] = int(
                             sum(float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv[:5]) / 5
                         )
-                    closes_wl = [float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv[:20]]
-                    entry["closes"] = [int(c) for c in reversed(closes_wl) if c > 0]
+                    entry["closes"] = _ensure_sparkline_closes_kr(
+                        _kr_closes_from_ohlcv(ohlcv),
+                        int(cur_wl),
+                        None,
+                    )
                     watchlist_data[code] = entry
                 except Exception:
                     watchlist_data[code] = {"current_price": 0, "stock_name": _stock_name("", code, "KR"), "change_rate": "0"}
 
         # 미국 감시 종목 데이터
         us_watchlist_data: dict[str, Any] = {}
-        for code in cfg.get("us_watchlist", []):
+        for raw_us in cfg.get("us_watchlist", []):
+            code = str(raw_us).strip().upper()
             if code in positions_us_detail:
                 p = positions_us_detail[code]
-                us_watchlist_data[code] = {
+                us_wl: dict[str, Any] = {
                     "current_price": p.get("current_price", 0),
                     "stock_name": p.get("stock_name", code),
                     "change_rate": p.get("change_rate", "0"),
                 }
+                try:
+                    ohlcv_u = _cached_ohlcv(uid, cfg, code, "US")
+                    us_wl["closes"] = [
+                        round(c, 2)
+                        for c in _ensure_sparkline_closes_us(
+                            _us_closes_from_ohlcv(ohlcv_u),
+                            float(p.get("current_price") or 0),
+                            float(p.get("buy_price") or 0) or None,
+                        )
+                    ]
+                except Exception:
+                    us_wl["closes"] = [
+                        round(c, 2)
+                        for c in _ensure_sparkline_closes_us(
+                            [],
+                            float(p.get("current_price") or 0),
+                            float(p.get("buy_price") or 0) or None,
+                        )
+                    ]
+                us_watchlist_data[code] = us_wl
             else:
                 try:
                     data = _cached_price(uid, cfg, code, "US")
                     out = data["output"]
                     ohlcv_us = _cached_ohlcv(uid, cfg, code, "US")
-                    us_closes = [float(r.get("clos", 0)) for r in ohlcv_us[:20]]
+                    cur_us = _us_price_from_output(out, ohlcv_us)
                     us_watchlist_data[code] = {
-                        "current_price": _us_price_from_output(out, ohlcv_us),
+                        "current_price": cur_us,
                         "stock_name": _stock_name(out.get("rsym", ""), code, "US"),
                         "change_rate": out.get("diff", "0"),
-                        "closes": [round(c, 2) for c in reversed(us_closes) if c > 0],
+                        "closes": [
+                            round(c, 2)
+                            for c in _ensure_sparkline_closes_us(
+                                _us_closes_from_ohlcv(ohlcv_us),
+                                float(cur_us),
+                                None,
+                            )
+                        ],
                     }
                 except Exception:
                     us_watchlist_data[code] = {"current_price": 0, "stock_name": _stock_name("", code, "US"), "change_rate": "0"}
