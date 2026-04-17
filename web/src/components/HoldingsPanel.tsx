@@ -114,23 +114,27 @@ export function HoldingsPanel({
                 <div className="pl-3.5 pr-2 py-2 sm:py-2.5">
                   <div className="flex items-start gap-2">
                     <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                        <span className="font-mono text-sm font-semibold text-white tabular-nums">
-                          {code}
-                        </span>
-                        {p.stock_name && (
-                          <span className="text-[11px] text-slate-500 truncate max-w-[min(200px,42vw)]">
-                            {p.stock_name}
-                          </span>
-                        )}
-                        <span className="text-[9px] font-medium uppercase tracking-wide text-slate-500 border border-white/10 rounded px-1 py-px">
-                          {mkt}
-                        </span>
-                        {isAI && (
-                          <span className="text-[9px] font-semibold text-violet-300/90 bg-violet-500/15 border border-violet-500/25 rounded px-1 py-px">
-                            AI
-                          </span>
-                        )}
+                      <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm sm:text-[15px] font-semibold text-white leading-snug truncate">
+                            {p.stock_name || code}
+                          </div>
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5">
+                            {(p.stock_name || "").trim() ? (
+                              <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                                {code}
+                              </span>
+                            ) : null}
+                            <span className="text-[9px] font-medium uppercase tracking-wide text-slate-500 border border-white/10 rounded px-1 py-px">
+                              {mkt}
+                            </span>
+                            {isAI && (
+                              <span className="text-[9px] font-semibold text-violet-300/90 bg-violet-500/15 border border-violet-500/25 rounded px-1 py-px">
+                                AI
+                              </span>
+                            )}
+                          </div>
+                        </div>
                       </div>
 
                       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[11px]">

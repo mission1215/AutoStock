@@ -407,19 +407,23 @@ export function Dashboard({
                   key={code}
                   className={`glass rounded-xl p-3 ${owned ? "ring-1 ring-blue-500/30" : ""}`}
                 >
-                  <div className="flex justify-between items-start mb-1">
-                    <span className="font-bold text-white text-sm">{code}</span>
+                  <div className="flex justify-between items-start gap-2 mb-1">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-semibold text-white text-sm sm:text-[15px] leading-snug truncate">
+                        {wd.stock_name || code}
+                      </div>
+                      {(wd.stock_name || "").trim() ? (
+                        <div className="font-mono text-[11px] text-slate-500 tabular-nums mt-0.5">
+                          {code}
+                        </div>
+                      ) : null}
+                    </div>
                     {owned && (
-                      <span className="text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full">
+                      <span className="shrink-0 text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full">
                         보유
                       </span>
                     )}
                   </div>
-                  {wd.stock_name && (
-                    <div className="text-xs text-slate-400 truncate mb-2">
-                      {wd.stock_name}
-                    </div>
-                  )}
                   <div className="flex items-baseline gap-2 mb-1">
                     <span className="text-sm font-bold text-slate-200">
                       {priceStr}
