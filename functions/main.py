@@ -982,6 +982,24 @@ def _add_log(uid: str, level: str, message: str):
     logger.info("[%s][%s] %s", uid[:8], level, message)
 
 
+def _send_telegram(text: str) -> bool:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        logger.warning("[Telegram] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 미설정")
+        return False
+    try:
+        resp = http_requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error("[Telegram] 전송 실패: %s", e)
+        return False
+
+
 # ══════════════════════════════════════════════════════════
 # 전략 로직
 # ══════════════════════════════════════════════════════════
@@ -3043,6 +3061,66 @@ def scheduled_us_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
                 _add_log(uid, "INFO", f"[US][{code}] 마감 청산 | ${current:.2f} | PnL ${pnl:+.2f}")
             except Exception as e:
                 _add_log(uid, "ERROR", f"[US][{code}] 마감 청산 오류: {e}")
+
+
+# ══════════════════════════════════════════════════════════
+# 텔레그램 모니터링 리포트 (매 시 정각)
+# ══════════════════════════════════════════════════════════
+
+@scheduler_fn.on_schedule(
+    schedule="0 * * * *", timezone=scheduler_fn.Timezone("Asia/Seoul"),
+    memory=options.MemoryOption.MB_256,
+)
+def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
+    """매 시 정각 — 시스템 상태 요약을 Telegram으로 발송."""
+    now_kst = datetime.now(KST)
+    now_et  = now_kst.astimezone(ET)
+    is_weekend = now_kst.weekday() >= 5
+
+    kr_open = _is_kr_market_open()
+    us_open = _is_us_market_open()
+
+    if is_weekend:
+        market_line = "📅 주말 — KR·US 휴장"
+    else:
+        parts = []
+        if kr_open:
+            parts.append("🟢 KR 장중")
+        else:
+            parts.append("⚪ KR 장외")
+        if us_open:
+            parts.append("🟢 US 장중")
+        else:
+            parts.append("⚪ US 장외")
+        market_line = " | ".join(parts)
+
+    user_lines = []
+    for uid, cfg in _get_all_users():
+        try:
+            state = get_bot_state(uid)
+            bot_on = "ON" if state.get("bot_enabled", True) else "OFF"
+            halted = " ⚠️정지" if state.get("trading_halted") else ""
+            mock   = " [모의]" if cfg.get("is_mock", True) else " [실전]"
+            pnl    = state.get("realized_pnl", 0)
+            pnl_str = f"{pnl:+,.0f}원" if pnl else "0원"
+            user_lines.append(f"  • {uid[:8]}… 봇:{bot_on}{halted}{mock} | 실현손익:{pnl_str}")
+        except Exception:
+            user_lines.append(f"  • {uid[:8]}… 상태조회 실패")
+
+    users_block = "\n".join(user_lines) if user_lines else "  (등록 유저 없음)"
+
+    text = (
+        f"<b>[AutoStock 모니터링]</b> "
+        f"{now_kst.strftime('%H:%M')} KST / {now_et.strftime('%H:%M')} ET\n"
+        f"\n"
+        f"🖥 Firebase API: 정상 (Cloud Functions 내부 실행)\n"
+        f"{market_line}\n"
+        f"\n"
+        f"<b>유저 상태</b>\n{users_block}\n"
+        f"\n"
+        f"⏰ 다음 체크: 1시간 후"
+    )
+    _send_telegram(text)
 
 
 # ══════════════════════════════════════════════════════════
