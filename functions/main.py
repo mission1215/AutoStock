@@ -1,22 +1,74 @@
 """
 AutoStock Firebase Functions — 멀티유저 KIS 자동매매 시스템 (한국 + 미국주식)
 
-인증: Firebase Auth (Google 로그인) — Bearer 토큰으로 uid 추출
-데이터: Firestore users/{uid}/... 경로로 유저별 격리
+▣ 기본 구조
+  - 인증: Firebase Auth (Google 로그인) → Bearer 토큰으로 uid 추출
+  - 데이터: Firestore users/{uid}/...  (config / state / positions_KR / positions_US /
+            trades / logs / recommendations 컬렉션) — 유저 단위로 격리
+  - 외부 API: 한국투자증권 KIS OpenAPI (실서버/모의서버), Google Gemini
 
-HTTP API (/api/*):
+▣ HTTP API (/api/*):
   POST /api/setup           — 최초 설정 (KIS 키 저장)
   GET  /api/status          — 대시보드 전체 상태
   POST /api/order           — 수동 매수/매도 (KR/US)
   POST /api/bot             — 봇 시작/중지
   GET  /api/config          — 설정 조회
-  POST /api/config          — 설정 변경
+  POST /api/config          — 설정 변경 (allowed 키 화이트리스트)
   GET  /api/trades          — 매매 이력
   GET  /api/logs            — 최근 로그
   GET  /api/recommendations — AI 추천 이력
   GET  /api/research        — 오늘의 시장 리서치 (Gemini, 일 1회 캐시)
   GET  /api/quote           — 종목 현재가·이름 (주문 전 참고용)
   POST /api/ai/run          — AI 추천 수동 실행
+
+▣ 자동매매 사이클 (스케줄 함수)
+  - scheduled_strategy_cycle (KR, * * * * *):
+      run_strategy_cycle_kr 호출. 보유 포지션 점검 → 신규 매수 스캔.
+  - scheduled_strategy_cycle_us (US, */5 9-15 * * 1-5 ET):
+      run_strategy_cycle_us 호출. 5분 간격(잔고/지수 API 비용 절약).
+  - scheduled_close_positions (KR 15:20 KST):
+      장 마감 직전 전 포지션 청산.
+  - scheduled_close_positions_us (US 15:50 ET): 동일.
+  - scheduled_reconcile_kr / _us (30분 간격, 장중):
+      Firestore 포지션 ↔ KIS 실재 잔고 비교. 외부 청산·부분 매도 자동 보정.
+  - 그 외 09:00, 13:00, 15:30 등 시점에 AI 추천·요약 함수.
+
+▣ 리스크 관리 레이어 (전부 cfg 키로 켜고 끌 수 있음)
+  ① 사이징     : ATR 기반 리스크-패리티 (`_risk_based_qty`)
+                 → 1회 진입 손실 = equity × risk_per_trade_pct(기본 1%)
+  ② 단일 포지션:
+       - ATR 기반 손절가 보존 (register_buy stop_loss_price 인자)
+       - 분할익절 + 손절선 본전 위로 타이트닝 (partial_tp_*)
+       - 본전 스탑 (breakeven_*)
+       - 트레일링 스탑 (trailing_stop_*)
+       - 시간 기반 청산 (time_stop_*)
+       - 물타기 후 평단/손절/고점 리셋 (avg_down_*)
+  ③ 진입 시간대:
+       - 개장·마감 블랙아웃 (kr_skip_buy_first_min / kr_skip_buy_last_min, US 동일)
+       - 월요일 오전 N분 차단 옵션 (monday_morning_skip_*)
+  ④ 포트폴리오:
+       - 일간 수익 잠금 / 손실 한도 (`_daily_pnl_buy_gate`,
+                                    daily_profit_target / daily_loss_limit)
+       - 피크 대비 드로다운 서킷 브레이커 (`_check_drawdown`, max_drawdown_pct)
+  ⑤ 시장 레짐:
+       - KOSPI 급락 신규매수 게이트 (`_kr_index_buy_gate`,
+                                     kr_index_drop_limit_pct)
+       - SPY 급락 신규매수 게이트 (`_us_index_buy_gate`,
+                                  us_index_drop_limit_pct)
+
+▣ 운영 안전망
+  - 포지션 reconcile (`reconcile_positions`):
+      Firestore와 KIS 잔고 차이를 자동 보정 (외부 청산 시 포지션 삭제,
+      부분 매도 시 quantity down-update). 30분 주기 자동 실행.
+  - 체결가 사후 조회 (`_log_sell_fill` + inquire_order_fill_kr/us):
+      매도 직후 실제 평균 체결가를 조회하여 시그널가 대비 슬리피지를 로그로 남김
+      (옵저버블리티 전용 — register_sell PnL 계산은 시그널가 그대로 사용).
+
+▣ 게이트 적용 순서 (run_strategy_cycle_kr / _us의 신규매수 진입부)
+  ① 시간대 블랙아웃 (개장/마감/월요일)
+  ② 일간 P&L 게이트 (수익 잠금 / 손실 한도)
+  ③ 시장 레짐 게이트 (KOSPI / SPY)
+  → 모두 통과해야 신규 매수 스캔 진행. 매도/포지션 관리는 위 게이트와 무관하게 항상 동작.
 """
 
 import os
@@ -153,6 +205,10 @@ def _cached_ohlcv(uid: str, cfg: dict, code: str, market: str) -> list:
 
 
 # ── 주요 한국 종목명 맵 ──────────────────────────────────────
+# REST API에서 획득한 KR 종목명 인메모리 캐시
+# Cloud Function 인스턴스가 재사용될 때 유지되므로 WebSocket 폴백 시 활용
+_kr_name_cache: dict[str, str] = {}
+
 KR_STOCK_NAMES: dict[str, str] = {
     "005930": "삼성전자", "000660": "SK하이닉스", "035420": "NAVER",
     "035720": "카카오", "005380": "현대차", "000270": "기아",
@@ -257,8 +313,15 @@ US_SECTOR_MAP: dict[str, str] = {
 def _stock_name(api_name: str, code: str, market: str = "KR") -> str:
     name = (api_name or "").strip()
     if name:
+        # KR은 REST API에서 얻은 이름을 인스턴스 캐시에 저장 (WebSocket 폴백용)
+        if market == "KR":
+            _kr_name_cache[code] = name
         return name
-    return (US_STOCK_NAMES if market == "US" else KR_STOCK_NAMES).get(code, code)
+    if market == "KR":
+        # 인스턴스 캐시 → 정적 dict → 티커 순으로 폴백
+        return _kr_name_cache.get(code) or KR_STOCK_NAMES.get(code, code)
+    # US: US_STOCK_NAMES에 없으면 티커 그대로 반환 (rsym 같은 Reuters 코드는 사용 안 함)
+    return US_STOCK_NAMES.get(code, code)
 
 
 def _us_price_from_output(out: dict, ohlcv: list | None = None) -> float:
@@ -712,20 +775,25 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
 
 def get_balance_kr(uid: str, cfg: dict) -> dict:
     tr_id = _tr_id(cfg, "TTTC8434R", "VTTC8434R")
-    resp = http_requests.get(
-        _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/trading/inquire-balance",
-        headers=_headers(uid, cfg, tr_id),
-        params={
-            "CANO": _account_prefix(cfg["account_no"]),
-            "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
-            "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02",
-            "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01",
-            "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
-        },
-        timeout=10,
-    )
-    return _parse(resp, uid, cfg)
+
+    def _call():
+        _kis_pace()
+        resp = http_requests.get(
+            _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/trading/inquire-balance",
+            headers=_headers(uid, cfg, tr_id),
+            params={
+                "CANO": _account_prefix(cfg["account_no"]),
+                "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
+                "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02",
+                "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01",
+                "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+            },
+            timeout=10,
+        )
+        return _parse(resp, uid, cfg)
+
+    return _with_retry(_call, retries=4)
 
 
 def get_available_cash_kr(uid: str, cfg: dict, stock_code: str = "005930") -> int:
@@ -751,9 +819,25 @@ def get_available_cash_kr(uid: str, cfg: dict, stock_code: str = "005930") -> in
 
 
 def place_order_kr(uid: str, cfg: dict, stock_code: str, side: str, quantity: int, price: int = 0) -> dict:
+    """국내 주식 주문.
+
+    ORD_DVSN 선정:
+      - price > 0 → 00(지정가)
+      - price == 0 (시장 성격 주문):
+          · 매수 → 01(시장가)
+          · 매도 → cfg["kr_sell_ord_dvsn"] (기본 03=최유리지정가). 시장가(01)보다 슬리피지 완화.
+            허용값: "01"(시장가), "03"(최유리), "04"(최우선). 잘못된 값이면 01로 폴백.
+    """
     tr_id = _tr_id(cfg, "TTTC0802U" if side == "buy" else "TTTC0801U",
                         "VTTC0802U" if side == "buy" else "VTTC0801U")
-    ord_dvsn = "01" if price == 0 else "00"
+    if price > 0:
+        ord_dvsn = "00"
+    else:
+        if side == "buy":
+            ord_dvsn = "01"
+        else:
+            cand = str(cfg.get("kr_sell_ord_dvsn", "03"))
+            ord_dvsn = cand if cand in ("01", "03", "04") else "01"
     # KIS 문서·커뮤니티: 매도 시 SLL_TYPE 등 누락 시 order-cash 가 HTTP 500 반환하는 사례 있음
     body: dict[str, str] = {
         "CANO": _account_prefix(cfg["account_no"]),
@@ -843,18 +927,22 @@ def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
 
 def get_balance_us(uid: str, cfg: dict) -> dict:
     """미국 주식 잔고 조회 — 항상 실서버 (VTS 미지원)"""
-    resp = http_requests.get(
-        _base_url(False) + "/uapi/overseas-stock/v1/trading/inquire-balance",
-        headers=_headers_us(uid, cfg, "JTTT3012R"),
-        params={
-            "CANO": _account_prefix(cfg["account_no"]),
-            "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
-            "OVRS_EXCG_CD": "NASD", "TR_CRCY_CD": "USD",
-            "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
-        },
-        timeout=10,
-    )
-    return _parse(resp, uid, cfg)
+    def _call():
+        _kis_pace()
+        resp = http_requests.get(
+            _base_url(False) + "/uapi/overseas-stock/v1/trading/inquire-balance",
+            headers=_headers_us(uid, cfg, "JTTT3012R"),
+            params={
+                "CANO": _account_prefix(cfg["account_no"]),
+                "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
+                "OVRS_EXCG_CD": "NASD", "TR_CRCY_CD": "USD",
+                "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
+            },
+            timeout=10,
+        )
+        return _parse(resp, uid, cfg)
+
+    return _with_retry(_call, retries=4)
 
 
 def place_order_us(uid: str, cfg: dict, stock_code: str, side: str, quantity: int, price: float = 0) -> dict:
@@ -914,8 +1002,36 @@ def get_positions(uid: str, market: str = "KR") -> dict:
 def register_buy(uid: str, market: str, stock_code: str, buy_price: float,
                  quantity: int, stop_loss_ratio: float,
                  target_sell_price: float = 0.0, source: str = "수동",
-                 stock_name: str = ""):
-    stop_loss_price = buy_price * (1 - stop_loss_ratio)
+                 stock_name: str = "",
+                 stop_loss_price: float | None = None):
+    """Firestore positions_{market}/{stock_code} 에 신규 포지션 등록.
+
+    저장되는 필드 (포지션 문서 스키마):
+      - stock_code        : 종목코드 (Document ID와 동일)
+      - stock_name        : 종목명 (한글/영문)
+      - market            : "KR" | "US"
+      - buy_price         : 평균 매수가 (원/USD). 물타기 시 갱신됨.
+      - quantity          : 보유 수량.
+      - stop_loss_price   : 손절가. 인자로 받으면 그대로, 아니면 buy*(1-ratio).
+      - target_sell_price : 목표 매도가 (ATR 기반 또는 AI 추천).
+      - source            : 매수 출처 ("수동" / "자동" / "자동_US" / "AI_..." 등)
+      - entry_time        : 매수 일시 (datetime, KST). 시간 청산·age 계산에 사용.
+      - partial_tp_done   : 분할익절 1회 실행 여부 — 평단 변경(물타기) 시 False로 reset.
+      - avg_down_count    : 물타기 누적 횟수 (`avg_down_max_times` 에 캡됨).
+      - highest_price     : 트레일링 스탑 기준 최고가 — 신규 진입 시 buy_price 로 시작.
+
+    인자 stop_loss_price 처리:
+      - None 또는 0 이하  → buy_price * (1 - stop_loss_ratio) 으로 계산 (폴백).
+      - >0 (ATR 손절가)   → 그대로 저장. ATR 기반 손절선을 우선시할 때 사용.
+        호출 측이 calculate_optimal_prices/_us 의 stop_loss 를 넘겨 활용한다.
+
+    사이드 이펙트:
+      - 호출 직후 add_trade 로 매매 기록을 별도로 저장하는 것은 호출 측 책임.
+      - `merge_position_after_avg_down` 도 동일한 문서를 update 하므로
+        추가 필드(avg_down_last_at 등)가 후행으로 들어올 수 있음.
+    """
+    if stop_loss_price is None or stop_loss_price <= 0:
+        stop_loss_price = buy_price * (1 - stop_loss_ratio)
     _uref(uid).collection(f"positions_{market}").document(stock_code).set({
         "stock_code": stock_code, "stock_name": stock_name, "market": market,
         "buy_price": buy_price, "quantity": quantity,
@@ -923,14 +1039,34 @@ def register_buy(uid: str, market: str, stock_code: str, buy_price: float,
         "source": source, "entry_time": datetime.now(KST),
         "partial_tp_done": False,
         "avg_down_count": 0,
+        "highest_price": buy_price,
     })
 
 
 def register_partial_sell(
     uid: str, market: str, stock_code: str, sell_price: float, sell_qty: int,
     tighten_stop_to_breakeven: bool = True,
+    tighten_buffer_pct: float = 0.0,
 ) -> tuple[float, bool]:
-    """일부 매도 후 잔여 수량·손절 갱신. 반환: (해당 구간 실현손익, 포지션 전량 청산 여부)."""
+    """일부 매도 후 잔여 수량·손절선 갱신.
+
+    호출 시점:
+      - 분할익절 (KR/US 사이클의 partial_tp 분기)
+      - 수동 매도 시 quantity < 보유수량 인 경우 (`/api/order` 라우트에서 분기 처리)
+
+    동작:
+      1) sell_qty 를 보유수량에 상한 클램프.
+      2) PnL = (sell_price - buy_price) × sell_qty 계산.
+      3) 잔여 수량 = 0 이면 포지션 문서 삭제 → (pnl, True) 반환.
+      4) 잔여 > 0 이면:
+         - quantity 차감, partial_tp_done = True
+         - tighten_stop_to_breakeven=True 면 손절선을
+           max(기존 손절, buy_price*(1+tighten_buffer_pct)) 으로 상향.
+           buffer_pct 는 수수료/세금/슬리피지 흡수용 ("본전+α" 락인).
+
+    반환:
+      (pnl, all_closed) — all_closed=True면 포지션이 완전히 청산됐다는 뜻.
+    """
     ref = _uref(uid).collection(f"positions_{market}").document(stock_code)
     doc_snap = ref.get()
     if not doc_snap.exists:
@@ -949,12 +1085,20 @@ def register_partial_sell(
     upd: dict = {"quantity": new_q, "partial_tp_done": True}
     if tighten_stop_to_breakeven:
         old_sl = float(pos.get("stop_loss_price") or 0)
-        upd["stop_loss_price"] = max(old_sl, bp)
+        new_floor = bp * (1 + max(0.0, float(tighten_buffer_pct)))
+        upd["stop_loss_price"] = max(old_sl, new_floor)
     ref.update(upd)
     return pnl, False
 
 
 def register_sell(uid: str, market: str, stock_code: str, sell_price: float) -> float:
+    """포지션 전량 청산: 문서를 삭제하고 PnL = (sell - buy) × qty 반환.
+
+    주의:
+      - 호출자는 반드시 별도로 add_trade 와 update_bot_state(realized_pnl 누적)도 처리해야 한다.
+      - 외부 청산 reconcile 의 경우 pnl 을 0 으로 기록하기 위해 이 함수 대신
+        직접 문서 삭제 + add_trade(pnl=0) 패턴을 사용한다 (`reconcile_positions` 참조).
+    """
     pos_doc = _uref(uid).collection(f"positions_{market}").document(stock_code).get()
     pnl = 0.0
     if pos_doc.exists:
@@ -1034,6 +1178,407 @@ def _get_available_cash_us(uid: str, cfg: dict) -> float:
     return 0.0
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 운영 안전망 #1 — 포지션 Reconcile
+# --------------------------------------------------------------------------
+# 목적:
+#   봇 외부에서 발생한 매매(HTS 수동매매·취소·체결 누락 등)와 Firestore
+#   포지션 상태 사이의 드리프트를 자동 감지/보정한다.
+#
+# 흐름:
+#   1) `_get_kis_holdings_kr/us` 가 KIS 잔고 API에서 실제 보유 dict를 만든다.
+#   2) `reconcile_positions` 가 Firestore 포지션과 dict를 비교해 케이스별로 처리.
+#   3) `scheduled_reconcile_kr/_us` (30분 주기)가 이를 호출한다.
+#
+# 안전 원칙:
+#   - 자동 삭제/수량 down-update 만 수행. 외부 매수로 보이는 케이스는
+#     평단·손절 정보가 없어 자동 등록하지 않고 INFO 로그만 남긴다.
+#   - Reconcile로 만들어지는 trades 레코드의 PnL은 0 — 실제 체결가가 미상이라
+#     장부의 일관성을 깨지 않기 위함.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _get_kis_holdings_kr(uid: str, cfg: dict) -> dict[str, int]:
+    """국내 KIS 잔고 → {종목코드(6자리): 보유수량}. 실패 시 빈 dict.
+
+    `get_balance_kr` 의 `output1[*]` 배열에서 `pdno` (종목코드) /
+    `hldg_qty` (보유수량) 추출. 6자리 미만은 zero-pad.
+    """
+    try:
+        bal = get_balance_kr(uid, cfg)
+    except Exception as e:
+        _add_log(uid, "WARNING", f"[reconcile][KR] 잔고 조회 실패: {e}")
+        return {}
+    holdings: dict[str, int] = {}
+    for row in bal.get("output1") or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("pdno", "")).strip()
+        if not code:
+            continue
+        if code.isdigit() and len(code) <= 6:
+            code = code.zfill(6)
+        try:
+            qty = int(str(row.get("hldg_qty", "0")).replace(",", "") or 0)
+        except Exception:
+            qty = 0
+        if qty > 0:
+            holdings[code] = qty
+    return holdings
+
+
+def _get_kis_holdings_us(uid: str, cfg: dict) -> dict[str, int]:
+    """미국 KIS 잔고 → {종목코드: 보유수량}. 실패 시 빈 dict.
+
+    `get_balance_us` 의 `output1[*]` 배열에서 `ovrs_pdno` /
+    `ovrs_cblc_qty` 사용. 종목코드는 대문자 정규화.
+    """
+    try:
+        bal = get_balance_us(uid, cfg)
+    except Exception as e:
+        _add_log(uid, "WARNING", f"[reconcile][US] 잔고 조회 실패: {e}")
+        return {}
+    holdings: dict[str, int] = {}
+    for row in bal.get("output1") or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("ovrs_pdno", "")).strip().upper()
+        if not code:
+            continue
+        try:
+            qty = int(str(row.get("ovrs_cblc_qty", "0")).replace(",", "") or 0)
+        except Exception:
+            qty = 0
+        if qty > 0:
+            holdings[code] = qty
+    return holdings
+
+
+def reconcile_positions(uid: str, cfg: dict, market: str) -> dict:
+    """Firestore 포지션 ↔ KIS 실재 보유 비교 후 자동 보정.
+
+    호출 경로:
+      `scheduled_reconcile_kr/_us` (30분 주기) — cfg["reconcile_enabled"]=True 인 유저만.
+
+    케이스별 처리:
+      - Firestore(qty>0) ∧ KIS(0)
+          → 외부 청산 추정.
+            Firestore 포지션 삭제 + 거래기록(reason="외부청산_보정", pnl=0) + WARNING 로그.
+      - Firestore(qty=N) ∧ KIS(qty=M) ∧ M<N
+          → 외부 부분 매도 추정.
+            quantity = M 으로 update + 거래기록(reason="외부부분매도_보정", pnl=0) + WARNING.
+      - Firestore(qty=N) ∧ KIS(qty=M) ∧ M>N
+          → 외부 추가 매수 추정.
+            평단/손절 정보가 없으므로 Firestore 자동 갱신하지 않음 — INFO 로그만.
+      - KIS만 보유 (Firestore 미등록)
+          → 자동 등록하지 않음 — INFO 로그만.
+
+    PnL을 0으로 기록하는 이유:
+      외부 청산의 실제 체결가를 알 수 없어 임의의 손익을 잡으면 realized_pnl /
+      drawdown 계산이 왜곡됨. 추후 reconcile 결과 분석 시 reason 키로 식별 가능.
+
+    반환:
+      {"deleted": [코드, ...],
+       "down_updated": [(코드, 이전 qty, 보정 qty), ...],
+       "external_extra": [(코드, FS qty, KIS qty), ...],
+       "external_only": [(코드, KIS qty), ...]}
+      — 호출 측은 보통 무시해도 되며, 디버깅·테스트에서 검증용으로 사용.
+    """
+    if market == "KR":
+        kis_hold = _get_kis_holdings_kr(uid, cfg)
+    elif market == "US":
+        kis_hold = _get_kis_holdings_us(uid, cfg)
+    else:
+        return {}
+    fs_pos = get_positions(uid, market)
+
+    summary = {"deleted": [], "down_updated": [], "external_extra": [], "external_only": []}
+
+    for code, pos in list(fs_pos.items()):
+        try:
+            fs_qty = int(pos.get("quantity", 0) or 0)
+        except Exception:
+            fs_qty = 0
+        kis_qty = int(kis_hold.get(code, 0))
+        if fs_qty <= 0:
+            continue
+        if kis_qty == 0:
+            # 외부 청산
+            _uref(uid).collection(f"positions_{market}").document(code).delete()
+            add_trade(
+                uid, market, code, "sell",
+                float(pos.get("buy_price", 0) or 0), fs_qty,
+                "외부청산_보정", 0.0, stock_name=pos.get("stock_name", ""),
+            )
+            _add_log(
+                uid, "WARNING",
+                f"[reconcile][{market}][{code}] Firestore {fs_qty}주↔KIS 0주 — 외부 청산 추정. 포지션 삭제",
+            )
+            summary["deleted"].append(code)
+            _invalidate_balance_cache(uid)
+        elif kis_qty < fs_qty:
+            # 외부 부분 매도
+            _uref(uid).collection(f"positions_{market}").document(code).update({
+                "quantity": kis_qty,
+            })
+            add_trade(
+                uid, market, code, "sell",
+                float(pos.get("buy_price", 0) or 0), fs_qty - kis_qty,
+                "외부부분매도_보정", 0.0, stock_name=pos.get("stock_name", ""),
+            )
+            _add_log(
+                uid, "WARNING",
+                f"[reconcile][{market}][{code}] Firestore {fs_qty}주↔KIS {kis_qty}주 — 외부 부분 매도 추정. 수량 보정",
+            )
+            summary["down_updated"].append((code, fs_qty, kis_qty))
+            _invalidate_balance_cache(uid)
+        elif kis_qty > fs_qty:
+            _add_log(
+                uid, "INFO",
+                f"[reconcile][{market}][{code}] Firestore {fs_qty}주↔KIS {kis_qty}주 — "
+                f"외부 추가 매수로 추정 (Firestore 자동 갱신 안 함)",
+            )
+            summary["external_extra"].append((code, fs_qty, kis_qty))
+
+    for code, kis_qty in kis_hold.items():
+        if code in fs_pos:
+            continue
+        _add_log(
+            uid, "INFO",
+            f"[reconcile][{market}][{code}] KIS {kis_qty}주 보유, Firestore 미등록 — 외부 매수 추정 (전략 미관리)",
+        )
+        summary["external_only"].append((code, kis_qty))
+
+    return summary
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 운영 안전망 #2 — 체결가 사후 조회 (옵저버블리티)
+# --------------------------------------------------------------------------
+# 목적:
+#   - 주문 직후의 시그널가(`current`)와 실제 평균 체결가(`avg_prvs`)의 차이를
+#     로그로 남겨 슬리피지 분포를 가시화한다.
+#   - 자동매매 중 KIS가 부분 체결하거나 다른 호가에 체결되는 케이스를 검증.
+#
+# 설계 원칙:
+#   - 옵저버블리티 전용. register_sell PnL/수량 등에는 영향 없음
+#     (이 단계에서 PnL을 재계산하면 로직 복잡도가 크게 증가하고 회귀 위험).
+#   - 추후 `[fill]` 로그 분석으로 슬리피지 패턴이 일관되면 다음 단계에서
+#     실제 체결가 기반 PnL 보정 / 주문 방식 튜닝의 근거 데이터로 사용.
+#
+# 사용 API:
+#   - KR: /uapi/domestic-stock/v1/trading/inquire-daily-ccld (TR_ID TTTC8001R/VTTC8001R)
+#   - US: /uapi/overseas-stock/v1/trading/inquire-ccnl       (TR_ID JTTT3001R)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _today_kst_yyyymmdd() -> str:
+    """주문체결조회 API의 INQR_*_DT 파라미터에 사용할 오늘 YYYYMMDD (KST)."""
+    return datetime.now(KST).strftime("%Y%m%d")
+
+
+def inquire_order_fill_kr(uid: str, cfg: dict, order_no: str) -> dict | None:
+    """국내 주문체결조회 — order_no 와 일치하는 항목 반환 (없으면 None).
+
+    KIS API: /uapi/domestic-stock/v1/trading/inquire-daily-ccld
+       TR_ID: TTTC8001R(실서버) / VTTC8001R(모의)
+    당일 체결 내역을 조회한다 (INQR_STRT_DT == INQR_END_DT == 오늘).
+
+    파라미터 노트:
+      - "ODNO": 서버측 검색이 보장되지 않는 환경이 있어, 응답 rows 를 클라이언트에서
+        다시 일치시킨다 (lstrip("0") 후 문자열 비교).
+      - 호출 실패 / 일치 row 없음 시 None 반환 (호출 측에서 안전하게 무시).
+
+    반환 dict (정상 시):
+      - "order_no"    : 주문번호 (입력 그대로)
+      - "ord_qty"     : 주문 수량
+      - "tot_ccld_qty": 총 체결 수량
+      - "avg_prvs"    : 평균 체결가 (float, 원단위)
+    """
+    if not order_no or order_no in ("N/A", "0"):
+        return None
+    tr_id = _tr_id(cfg, "TTTC8001R", "VTTC8001R")
+    today = _today_kst_yyyymmdd()
+
+    def _call():
+        _kis_pace()
+        resp = http_requests.get(
+            _base_url(cfg.get("is_mock", True))
+            + "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            headers=_headers(uid, cfg, tr_id),
+            params={
+                "CANO": _account_prefix(cfg["account_no"]),
+                "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
+                "INQR_STRT_DT": today, "INQR_END_DT": today,
+                "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "01",
+                "PDNO": "", "CCLD_DVSN": "01", "ORD_GNO_BRNO": "",
+                "ODNO": str(order_no), "INQR_DVSN_3": "00", "INQR_DVSN_1": "",
+                "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+            },
+            timeout=10,
+        )
+        return _parse(resp, uid, cfg)
+
+    try:
+        data = _with_retry(_call, retries=2)
+    except Exception:
+        return None
+    rows = data.get("output1") or data.get("output") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    target = str(order_no).lstrip("0") or "0"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rod = str(row.get("odno", "")).lstrip("0") or "0"
+        if rod != target:
+            continue
+        try:
+            tot_ccld = int(str(row.get("tot_ccld_qty", "0")).replace(",", "") or 0)
+            ord_qty = int(str(row.get("ord_qty", "0")).replace(",", "") or 0)
+            avg_raw = row.get("avg_prvs") or row.get("ccld_avg_pric") or "0"
+            avg = float(str(avg_raw).replace(",", "") or 0)
+        except Exception:
+            continue
+        return {
+            "order_no": str(order_no),
+            "ord_qty": ord_qty,
+            "tot_ccld_qty": tot_ccld,
+            "avg_prvs": avg,
+        }
+    return None
+
+
+def inquire_order_fill_us(uid: str, cfg: dict, order_no: str) -> dict | None:
+    """미국 주문체결조회 — order_no 와 일치하는 항목 반환 (없으면 None).
+
+    KIS API: /uapi/overseas-stock/v1/trading/inquire-ccnl
+       TR_ID: JTTT3001R (US는 모의서버 미지원이라 실서버 고정)
+    평균 체결가 필드 우선순위: ft_ccld_unpr3 → avg_prvs → ovrs_ord_unpr.
+
+    반환 dict 키:
+      - "order_no", "ord_qty", "tot_ccld_qty", "avg_prvs" (USD 단위)
+    """
+    if not order_no or order_no in ("N/A", "0"):
+        return None
+    today = _today_kst_yyyymmdd()
+    tr_id = "JTTT3001R"
+
+    def _call():
+        _kis_pace()
+        resp = http_requests.get(
+            _base_url(False)
+            + "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+            headers=_headers_us(uid, cfg, tr_id),
+            params={
+                "CANO": _account_prefix(cfg["account_no"]),
+                "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
+                "PDNO": "%", "ORD_STRT_DT": today, "ORD_END_DT": today,
+                "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00",
+                "OVRS_EXCG_CD": "%", "SORT_SQN": "DS", "ORD_DT": "",
+                "ORD_GNO_BRNO": "", "ODNO": str(order_no),
+                "CTX_AREA_NK200": "", "CTX_AREA_FK200": "",
+            },
+            timeout=10,
+        )
+        return _parse(resp, uid, cfg)
+
+    try:
+        data = _with_retry(_call, retries=2)
+    except Exception:
+        return None
+    rows = data.get("output") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    target = str(order_no).lstrip("0") or "0"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rod = str(row.get("odno", "")).lstrip("0") or "0"
+        if rod != target:
+            continue
+        try:
+            tot_ccld = int(str(row.get("tot_ccld_qty", "0")).replace(",", "") or 0)
+            ord_qty = int(str(row.get("ft_ord_qty") or row.get("ord_qty", "0")).replace(",", "") or 0)
+            avg_raw = (
+                row.get("ft_ccld_unpr3")
+                or row.get("avg_prvs")
+                or row.get("ovrs_ord_unpr")
+                or "0"
+            )
+            avg = float(str(avg_raw).replace(",", "") or 0)
+        except Exception:
+            continue
+        return {
+            "order_no": str(order_no),
+            "ord_qty": ord_qty,
+            "tot_ccld_qty": tot_ccld,
+            "avg_prvs": avg,
+        }
+    return None
+
+
+def _log_sell_fill(
+    uid: str, market: str, code: str, side: str, order_no: str,
+    signal_price: float, qty: int, cfg: dict,
+) -> dict | None:
+    """매도(또는 매수) 후 실제 체결가를 조회하고 슬리피지를 로그로 남긴다.
+
+    호출 시점:
+      각 매도 경로(분할익절·트레일링·목표가·손절·시간청산·장마감)에서
+      `add_trade(...)` + `_add_log(... PnL ...)` 직후. side 인자는 현재 "sell"이지만
+      향후 매수 슬리피지 추적으로 확장하기 쉽도록 노출.
+
+    슬리피지 정의:
+      slip_pct = (avg_prvs - signal_price) / signal_price × 100
+      - sell: avg ≥ signal 이면 "유리" (더 비싸게 팔림)
+      - buy : avg ≤ signal 이면 "유리" (더 싸게 사짐)
+
+    옵트아웃:
+      cfg["fill_check_enabled"] 가 False 면 즉시 None 반환 (API 호출도 생략).
+
+    반환:
+      체결 정보 dict (디버그용) 또는 None. 호출 측은 일반적으로 무시.
+    """
+    if not cfg.get("fill_check_enabled", True):
+        return None
+    if not order_no or order_no == "N/A":
+        return None
+    try:
+        if market == "KR":
+            info = inquire_order_fill_kr(uid, cfg, order_no)
+        else:
+            info = inquire_order_fill_us(uid, cfg, order_no)
+    except Exception as e:
+        _add_log(uid, "DEBUG", f"[fill][{market}][{code}] 체결조회 실패: {e}")
+        return None
+    if not info:
+        return None
+    avg = float(info.get("avg_prvs") or 0)
+    tot = int(info.get("tot_ccld_qty") or 0)
+    if avg <= 0 or tot <= 0:
+        return info
+    # 슬리피지: (체결가 - 시그널가) / 시그널가
+    slip_pct = ((avg - signal_price) / signal_price * 100) if signal_price > 0 else 0
+    sign_label = "유리" if (
+        (side == "sell" and avg >= signal_price)
+        or (side == "buy" and avg <= signal_price)
+    ) else "불리"
+    if market == "KR":
+        _add_log(
+            uid, "INFO",
+            f"[fill][KR][{code}] {side} 체결 {tot}/{info.get('ord_qty', '?')}주 "
+            f"평균체결={avg:,.0f}원 vs 시그널={signal_price:,.0f}원 "
+            f"슬리피지 {slip_pct:+.2f}%({sign_label}) 주문={order_no}",
+        )
+    else:
+        _add_log(
+            uid, "INFO",
+            f"[fill][US][{code}] {side} 체결 {tot}/{info.get('ord_qty', '?')}주 "
+            f"평균체결=${avg:.2f} vs 시그널=${signal_price:.2f} "
+            f"슬리피지 {slip_pct:+.2f}%({sign_label}) 주문={order_no}",
+        )
+    return info
+
+
 def _is_kr_market_open() -> bool:
     """한국 정규장 오픈 여부 (09:00~15:30 KST, 평일)"""
     now_kst = datetime.now(KST)
@@ -1052,6 +1597,276 @@ def _is_us_market_open() -> bool:
     market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
     market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
     return market_open <= now_et <= market_close
+
+
+def _kr_buy_window_ok(cfg: dict) -> tuple[bool, str]:
+    """신규 매수 허용 시간대인지 판정 (KR).
+
+    설계 의도:
+      - 개장 직후 N분(기본 5분): 갭/슬리피지가 크고 호가가 불안정 → 신규 진입 회피
+      - 마감 전 N분(기본 30분): 유동성 저하 + 마감 청산 영향 → 신규 진입 회피
+      - (옵션) 월요일 오전 N분: 주말 갭/리스크 이벤트 다음날 변동성 회피
+    매도/손절/트레일링 등 포지션 관리 로직에는 영향 없음 (신규 매수만 차단).
+
+    cfg 키:
+      - kr_skip_buy_first_min       : 기본 5
+      - kr_skip_buy_last_min        : 기본 30
+      - monday_morning_skip_enabled : 기본 False (옵션)
+      - monday_morning_skip_min     : 기본 60 (분)
+    """
+    now = datetime.now(KST)
+    open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    skip_first = int(cfg.get("kr_skip_buy_first_min", 5))
+    skip_last = int(cfg.get("kr_skip_buy_last_min", 30))
+    if now < open_t + timedelta(minutes=skip_first):
+        return False, f"개장후{skip_first}분"
+    if now > close_t - timedelta(minutes=skip_last):
+        return False, f"마감전{skip_last}분"
+    if cfg.get("monday_morning_skip_enabled", False) and now.weekday() == 0:
+        mon_skip = int(cfg.get("monday_morning_skip_min", 60))
+        if now < open_t + timedelta(minutes=mon_skip):
+            return False, f"월요일오전{mon_skip}분"
+    return True, ""
+
+
+def _us_buy_window_ok(cfg: dict) -> tuple[bool, str]:
+    """신규 매수 허용 시간대인지 판정 (US, ET 기준).
+
+    cfg 키:
+      - us_skip_buy_first_min       : 기본 10  (개장 09:30 ET 직후 차단 분)
+      - us_skip_buy_last_min        : 기본 20  (마감 16:00 ET 직전 차단 분)
+      - monday_morning_skip_enabled : 기본 False
+      - monday_morning_skip_min     : 기본 60
+    """
+    now = datetime.now(ET)
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    skip_first = int(cfg.get("us_skip_buy_first_min", 10))
+    skip_last = int(cfg.get("us_skip_buy_last_min", 20))
+    if now < open_t + timedelta(minutes=skip_first):
+        return False, f"개장후{skip_first}분"
+    if now > close_t - timedelta(minutes=skip_last):
+        return False, f"마감전{skip_last}분"
+    if cfg.get("monday_morning_skip_enabled", False) and now.weekday() == 0:
+        mon_skip = int(cfg.get("monday_morning_skip_min", 60))
+        if now < open_t + timedelta(minutes=mon_skip):
+            return False, f"월요일오전{mon_skip}분"
+    return True, ""
+
+
+def _daily_pnl_buy_gate(state: dict, cfg: dict) -> tuple[bool, str]:
+    """일간 실현손익 기반 신규매수 게이트 (포트폴리오 레벨 서킷 브레이커).
+
+    설계 의도:
+      - **수익 잠금**: 당일 일정 수익 도달 후 추가 진입을 막아 이익을 보호한다
+        (=과도한 회전매매로 수익을 토해내는 패턴 방지).
+      - **손실 한도**: 당일 누적 손실이 한계를 넘으면 신규 진입을 멈춰
+        "오늘은 더 들어가지 않는다"는 규율을 강제한다.
+      - 단, 포지션 관리(트레일링/손절/시간청산 등)는 그대로 동작 →
+        이미 잡힌 리스크는 끝까지 관리.
+
+    기준:
+      - 분자: state["realized_pnl"]  (오늘 자정 또는 시작 시점 reset)
+      - 분모: state["start_equity"]  (장 시작 직전의 총자산 스냅샷)
+
+    cfg 키:
+      - daily_profit_target : 기본 0.03 (3%)  — 수익률 ≥ 이면 신규매수 중단
+      - daily_loss_limit   : 기본 0.02 (2%)  — 수익률 ≤ -이면 신규매수 중단
+        (둘 다 0 또는 음수로 두면 해당 게이트 비활성)
+
+    반환:
+      (ok: bool, reason: str)  — ok=False면 reason은 로그용 사유 문자열.
+    """
+    start_eq = float(state.get("start_equity", 0) or 0)
+    if start_eq <= 0:
+        return True, ""
+    pnl = float(state.get("realized_pnl", 0) or 0)
+    ratio = pnl / start_eq
+    tgt = float(cfg.get("daily_profit_target", 0.03))
+    if tgt > 0 and ratio >= tgt:
+        return False, f"수익목표달성({ratio * 100:+.2f}%≥+{tgt * 100:.1f}%)"
+    loss_lim = abs(float(cfg.get("daily_loss_limit", 0.02)))
+    if loss_lim > 0 and ratio <= -loss_lim:
+        return False, f"손실한도({ratio * 100:+.2f}%≤-{loss_lim * 100:.1f}%)"
+    return True, ""
+
+
+# KOSPI 지수 등락률 간단 캐시 (같은 사이클 내 여러 번 호출 방지)
+_KOSPI_CHG_CACHE: dict[str, tuple[float, float]] = {}
+_KOSPI_CHG_TTL_SEC = 60
+
+
+def _get_kr_index_change_pct(uid: str, cfg: dict, index_code: str = "0001") -> float:
+    """국내 지수 당일 등락률(%) — KIS `inquire-index-price` 호출.
+
+    파라미터:
+      - index_code: "0001"=코스피, "1001"=코스닥
+    응답 필드: output.bstp_nmix_prdy_ctrt (전일 대비 등락률 %), 부재 시 prdy_ctrt.
+    실패 시 0.0 반환 → 호출 측 게이트가 자동 무효화 (안전: API 장애로 매수 막히지 않게).
+    `_KOSPI_CHG_CACHE` 메모리 캐시(60초)로 동일 사이클 내 반복 호출 억제.
+    """
+    cache_key = f"{uid}:{index_code}"
+    now_ts = time_module.time()
+    hit = _KOSPI_CHG_CACHE.get(cache_key)
+    if hit and now_ts - hit[1] < _KOSPI_CHG_TTL_SEC:
+        return hit[0]
+
+    def _call():
+        _kis_pace()
+        resp = http_requests.get(
+            _base_url(cfg.get("is_mock", True))
+            + "/uapi/domestic-stock/v1/quotations/inquire-index-price",
+            headers=_headers(uid, cfg, "FHPUP02100000"),
+            params={"FID_COND_MRKT_DIV_CODE": "U", "FID_INPUT_ISCD": index_code},
+            timeout=10,
+        )
+        return _parse(resp, uid, cfg)
+
+    try:
+        data = _with_retry(_call, retries=2)
+        out = data.get("output") or {}
+        raw = out.get("bstp_nmix_prdy_ctrt") or out.get("prdy_ctrt") or "0"
+        chg = float(str(raw).replace(",", "") or 0)
+    except Exception:
+        chg = 0.0
+    _KOSPI_CHG_CACHE[cache_key] = (chg, now_ts)
+    return chg
+
+
+def _kr_index_buy_gate(uid: str, cfg: dict) -> tuple[bool, str]:
+    """코스피 급락 시 KR 신규매수 차단 (시장 레짐 필터).
+
+    설계 의도:
+      개별 종목이 강해 보여도 지수가 급락 중이면 베타 손실 확률이 높음.
+      "지수가 -1.5% 떨어진 날엔 새로 들어가지 말자"는 규율을 자동으로 강제.
+    cfg 키:
+      - kr_index_drop_limit_pct : 기본 1.5 (절대값 %로 해석). 0 이하 시 비활성.
+    매도/포지션 관리 로직은 영향 없음 (신규 매수만 차단).
+    """
+    limit = abs(float(cfg.get("kr_index_drop_limit_pct", 1.5)))
+    if limit <= 0:
+        return True, ""
+    chg = _get_kr_index_change_pct(uid, cfg, "0001")
+    if chg <= -limit:
+        return False, f"KOSPI급락({chg:+.2f}%≤-{limit:.1f}%)"
+    return True, ""
+
+
+# US 지수(SPY) 당일 등락률 캐시
+_US_INDEX_CACHE: dict[str, tuple[float, float]] = {}
+_US_INDEX_TTL_SEC = 60
+
+
+def _get_us_index_change_pct(uid: str, cfg: dict, symbol: str = "SPY") -> float:
+    """미국 지수 프록시(기본 SPY) 당일 등락률(%) — `get_current_price_us` 재사용.
+
+    국내 지수 API와 달리 KIS US 지수 TR이 별도라, ETF 시세를 프록시로 사용.
+    우선순위:
+      1) output.rate (KIS가 제공하는 등락률 %)
+      2) (last - base) / base * 100  — base는 전일 종가 추정
+    실패 시 0.0 반환 → 호출 측 게이트 자동 무효화. 60초 메모리 캐시.
+    cfg["us_index_proxy"]로 SPY 외 다른 ETF (예: QQQ) 사용 가능.
+    """
+    cache_key = f"{uid}:{symbol}"
+    now_ts = time_module.time()
+    hit = _US_INDEX_CACHE.get(cache_key)
+    if hit and now_ts - hit[1] < _US_INDEX_TTL_SEC:
+        return hit[0]
+    try:
+        data = get_current_price_us(uid, cfg, symbol)
+        out = data.get("output") or {}
+        # 우선순위: rate(%), 그다음 (last-base)/base
+        raw = out.get("rate")
+        if raw is None:
+            last = float(out.get("last", 0) or 0)
+            base = float(out.get("base", 0) or 0)
+            chg = ((last - base) / base * 100) if base > 0 else 0.0
+        else:
+            chg = float(str(raw).replace(",", "") or 0)
+    except Exception:
+        chg = 0.0
+    _US_INDEX_CACHE[cache_key] = (chg, now_ts)
+    return chg
+
+
+def _us_index_buy_gate(uid: str, cfg: dict) -> tuple[bool, str]:
+    """SPY(또는 cfg["us_index_proxy"]) 급락 시 US 신규매수 차단.
+
+    cfg 키:
+      - us_index_drop_limit_pct : 기본 1.5 (절대값 %). 0 이하 시 비활성.
+      - us_index_proxy           : 기본 "SPY". QQQ 등 다른 ETF 가능.
+    매도/포지션 관리는 영향 없음.
+    """
+    limit = abs(float(cfg.get("us_index_drop_limit_pct", 1.5)))
+    if limit <= 0:
+        return True, ""
+    chg = _get_us_index_change_pct(uid, cfg, cfg.get("us_index_proxy", "SPY"))
+    if chg <= -limit:
+        return False, f"SPY급락({chg:+.2f}%≤-{limit:.1f}%)"
+    return True, ""
+
+
+def _risk_based_qty(
+    equity: float,
+    available: float,
+    current_price: float,
+    stop_loss_price: float,
+    cfg: dict,
+) -> tuple[int, str]:
+    """ATR 기반 리스크-패리티 포지션 사이징.
+
+    설계 의도:
+      "한 종목 1회 진입에서 잃어도 되는 금액"을 자기자본의 고정 비율로 정규화한다.
+      변동성이 큰 종목(=1R 폭이 넓음)은 자동으로 수량이 줄고,
+      손절폭이 좁은 종목은 수량이 커져 종목별 리스크가 균등화된다.
+
+    수식:
+        1R       = 매수가 - 손절가                          (한 주당 위험 = ATR 기반)
+        qty_risk = (equity × risk_per_trade_pct) / 1R       (위험 정규화 결과)
+        qty_cap  = (equity × max_position_ratio) / 매수가   (단일 포지션 비중 캡)
+        qty_cash = available / 매수가                       (실제 가용 잔고 한도)
+        qty      = min(qty_risk, qty_cap, qty_cash) (모두 floor)
+
+    cfg 키:
+      - risk_per_trade_pct : 기본 0.01 (1%). 0 이하면 위험 정규화 OFF.
+      - max_position_ratio : 기본 0.10 (10%). 단일 종목 비중 상한.
+
+    폴백 (위험 정규화 비활성/손절 정보 부실 시):
+      qty = min(qty_cap, qty_cash) — 기존 max_position_ratio 방식과 동일.
+
+    반환:
+      (qty, reason) — reason은 로그용 사이징 근거 문자열 (예: "risk=1.00%·1R=2,350·qtyR=12/cap=27/cash=120").
+      호출 측에서 0주가 나오면 cfg/잔고에 따라 1주 안전 보정 처리한다.
+    """
+    if current_price <= 0:
+        return 0, "현재가0"
+    max_ratio = float(cfg.get("max_position_ratio", 0.10))
+    cap_by_ratio = math.floor((equity * max_ratio) / current_price) if equity > 0 else 0
+    cap_by_cash = math.floor(available / current_price) if available > 0 else 0
+
+    risk_pct = float(cfg.get("risk_per_trade_pct", 0.01))
+    use_risk = (
+        risk_pct > 0
+        and equity > 0
+        and stop_loss_price > 0
+        and stop_loss_price < current_price
+    )
+    if not use_risk:
+        qty = max(0, min(cap_by_ratio, cap_by_cash))
+        reason = f"폴백(ratio≤{max_ratio:.0%})"
+        return qty, reason
+
+    risk_amount = equity * risk_pct
+    stop_dist = current_price - stop_loss_price
+    qty_risk = math.floor(risk_amount / stop_dist) if stop_dist > 0 else 0
+
+    qty = max(0, min(qty_risk, cap_by_ratio, cap_by_cash))
+    reason = (
+        f"risk={risk_pct * 100:.2f}%·1R={stop_dist:,.2f}·"
+        f"qtyR={qty_risk}/cap={cap_by_ratio}/cash={cap_by_cash}"
+    )
+    return qty, reason
 
 
 def _check_drawdown(uid: str, cfg: dict) -> bool:
@@ -1172,9 +1987,23 @@ def _firestore_dt_age_seconds(ts) -> float:
             if t.tzinfo is None:
                 t = t.replace(tzinfo=KST)
             return (datetime.now(KST) - t.astimezone(KST)).total_seconds()
+        if isinstance(ts, str):
+            raw = ts.replace("Z", "+00:00")
+            t = datetime.fromisoformat(raw)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=KST)
+            return (datetime.now(KST) - t.astimezone(KST)).total_seconds()
     except Exception:
         pass
     return float("inf")
+
+
+def _position_age_days(entry_time) -> int:
+    """포지션 보유 일수. 파싱 실패/미기록 시 0."""
+    age_sec = _firestore_dt_age_seconds(entry_time)
+    if age_sec == float("inf"):
+        return 0
+    return int(age_sec // 86400)
 
 
 AI_SESSION_LOCK_SEC = 600  # 동시에 두 AI 세션(스케줄+즉시) 방지
@@ -1531,10 +2360,20 @@ def merge_position_after_avg_down(
     uid: str, market: str, stock_code: str, add_price: float, add_qty: int,
     ohlcv: list, cfg: dict,
 ) -> None:
-    """물타기 체결 후 평단·목표·손절 재계산.
-    
-    손절선은 보수적으로: min(기존 손절, ATR 기반 새 손절) — 평단은 낮아졌으므로
-    손절선이 오히려 올라가는 것을 방지.
+    """물타기 체결 후 포지션 필드 재계산 + 트래킹 상태 reset.
+
+    재계산 항목:
+      - buy_price       : 가중평균 ((old_bp×old_q + add_price×add_qty) / 신수량)
+      - quantity        : old_q + add_qty
+      - target_sell_price : 새 평단 기준 ATR로 다시 산출
+      - stop_loss_price : min(기존 손절, ATR 기반 새 손절) — 보수적.
+                           평단이 낮아졌다고 손절선을 위로 올리면 도리어 작은
+                           반등에 손절될 수 있어 더 낮은 쪽 유지.
+      - avg_down_count  : +1
+      - avg_down_last_at: 현재 시각 (ISO8601, KST) — 다음 물타기 간격 체크용
+      - partial_tp_done : False reset → 새 평단 기준 분할익절 다시 가능
+      - highest_price   : new_avg reset → 트레일링 스탑 기준 재시작
+                           (조기 트레일링 발동으로 추가 손실 회피)
     """
     ref = _uref(uid).collection(f"positions_{market}").document(stock_code)
     doc_snap = ref.get()
@@ -1564,6 +2403,8 @@ def merge_position_after_avg_down(
         "avg_down_last_at": datetime.now(KST).isoformat(),
         # 물타기 후 평단이 바뀌므로 분할익절 기준도 새 평단 기준으로 재활성화
         "partial_tp_done": False,
+        # 트레일링 스탑 기준 전고점도 새 평단 기준으로 리셋 (조기 이탈 방지)
+        "highest_price": new_avg,
     })
 
 
@@ -1572,9 +2413,11 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
     if not state.get("bot_enabled", True): return
     if not state.get("is_market_open", False) and not _is_kr_market_open(): return
     if state.get("trading_halted", False): return
-    if _check_drawdown(uid, cfg): return
-
+    # 드로우다운 체크는 밸런스 API 호출 비용이 커 5분마다로 제한 (이미 halt면 위에서 return)
     now_min = datetime.now(KST).minute
+    if now_min % 5 == 0 and _check_drawdown(uid, cfg):
+        return
+
     verbose = (now_min % 10 == 0)
 
     positions = get_positions(uid, "KR")
@@ -1591,6 +2434,50 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
             target = float(pos.get("target_sell_price") or 0)
             slp = float(pos.get("stop_loss_price") or 0)
             sn = pos.get("stock_name", "")
+            pnl_pct = (current - buy_avg) / buy_avg * 100 if buy_avg > 0 else 0
+
+            # 레거시 포지션 백필: highest_price / entry_time 초기값 보정
+            backfill: dict = {}
+            prev_high = float(pos.get("highest_price") or 0)
+            if prev_high <= 0:
+                prev_high = max(buy_avg, current)
+                backfill["highest_price"] = prev_high
+            new_high = max(prev_high, current)
+            if new_high > prev_high:
+                backfill["highest_price"] = new_high
+            if not pos.get("entry_time"):
+                backfill["entry_time"] = datetime.now(KST)
+            if backfill:
+                try:
+                    _uref(uid).collection("positions_KR").document(code).update(backfill)
+                except Exception:
+                    pass
+
+            # 손절선 본전 이동 (Break-even stop): +breakeven_trigger_pct 도달 시 slp를 매수가로 상향, 1회 적용
+            if cfg.get("breakeven_stop_enabled", True) and not pos.get("breakeven_applied"):
+                be_pct = float(cfg.get("breakeven_trigger_pct", 0.02))
+                if current >= buy_avg * (1 + be_pct):
+                    new_slp = max(slp, buy_avg)
+                    if new_slp > slp:
+                        try:
+                            _uref(uid).collection("positions_KR").document(code).update({
+                                "stop_loss_price": new_slp,
+                                "breakeven_applied": True,
+                            })
+                            _add_log(uid, "INFO",
+                                     f"[KR][{code}] 손절 본전이동 | {slp:,.0f}→{new_slp:,.0f} "
+                                     f"(수익 +{pnl_pct:.2f}%)")
+                            slp = new_slp
+
+                        except Exception:
+                            pass
+
+            # 10분마다 포지션 현황 로그 (자동매도 동작 확인용)
+            if verbose:
+                _add_log(uid, "INFO",
+                         f"[KR][{code}] 포지션체크 | 현재={current:,} 평단={buy_avg:,} "
+                         f"수익={pnl_pct:+.2f}% | 목표={target:,} 손절={slp:,} "
+                         f"고점={new_high:,}")
 
             # 분할 익절 (포지션당 1회): 평단 대비 +N% 도달 시 일부 매도 후 손절선을 본전 부근으로 상향
             if cfg.get("partial_tp_enabled", True) and not pos.get("partial_tp_done") and qty > 1:
@@ -1601,32 +2488,84 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                     if sell_qty >= qty:
                         sell_qty = qty - 1
                     if sell_qty >= 1:
-                        place_order_kr(uid, cfg, code, "sell", sell_qty, 0)
+                        res = place_order_kr(uid, cfg, code, "sell", sell_qty, 0)
+                        order_no = (res.get("output") or {}).get("ODNO", "N/A")
                         pnl, _closed = register_partial_sell(
                             uid, "KR", code, current, sell_qty,
                             cfg.get("partial_tp_tighten_stop", True),
+                            float(cfg.get("partial_tp_tighten_buffer_pct", 0.005)),
                         )
                         add_trade(uid, "KR", code, "sell", current, sell_qty, "분할익절", pnl, stock_name=sn)
                         st = get_bot_state(uid)
                         update_bot_state(uid, {"realized_pnl": st.get("realized_pnl", 0) + pnl})
-                        _add_log(uid, "INFO", f"[KR][{code}] 분할익절 | {sell_qty}주@{current:,} PnL≈{pnl:,.0f}원")
+                        _add_log(uid, "INFO",
+                                 f"[KR][{code}] 분할익절 | {sell_qty}주@{current:,} "
+                                 f"PnL≈{pnl:,.0f}원 주문={order_no}")
+                        _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), sell_qty, cfg)
+                        _invalidate_balance_cache(uid)
+                        continue
+
+            # 트레일링 스탑: 평단 대비 +activate_pct 이상 상승한 이후, 전고점 대비 trail_pct 이상 되돌림 시 청산
+            if cfg.get("trailing_stop_enabled", True) and buy_avg > 0:
+                activate_pct = float(cfg.get("trailing_stop_activate_pct", 0.03))
+                trail_pct = float(cfg.get("trailing_stop_pct", 0.04))
+                if new_high >= buy_avg * (1 + activate_pct):
+                    trail_line = new_high * (1 - trail_pct)
+                    if current <= trail_line and current > slp:
+                        res = place_order_kr(uid, cfg, code, "sell", qty, 0)
+                        order_no = (res.get("output") or {}).get("ODNO", "N/A")
+                        pnl = register_sell(uid, "KR", code, current)
+                        add_trade(uid, "KR", code, "sell", current, qty, "트레일링스탑", pnl, stock_name=sn)
+                        update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
+                        _add_log(uid, "INFO",
+                                 f"[KR][{code}] 트레일링 스탑 | 현재={current:,} 고점={new_high:,} "
+                                 f"트레일선={trail_line:,.0f} PnL≈{pnl:,.0f}원 주문={order_no}")
+                        _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), qty, cfg)
                         _invalidate_balance_cache(uid)
                         continue
 
             if target > 0 and current >= target:
-                place_order_kr(uid, cfg, code, "sell", qty, 0)
+                res = place_order_kr(uid, cfg, code, "sell", qty, 0)
+                order_no = (res.get("output") or {}).get("ODNO", "N/A")
                 pnl = register_sell(uid, "KR", code, current)
                 add_trade(uid, "KR", code, "sell", current, qty, "목표가_달성", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
-                _add_log(uid, "INFO", f"[KR][{code}] 목표가 달성 매도 | 현재={current:,} 목표={target:,}")
+                _add_log(uid, "INFO",
+                         f"[KR][{code}] 목표가 달성 매도 | 현재={current:,} 목표={target:,} "
+                         f"PnL≈{pnl:,.0f}원 주문={order_no}")
+                _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), qty, cfg)
+                _invalidate_balance_cache(uid)
                 continue
-            if current <= slp:
-                place_order_kr(uid, cfg, code, "sell", qty, 0)
+            if slp > 0 and current <= slp:
+                res = place_order_kr(uid, cfg, code, "sell", qty, 0)
+                order_no = (res.get("output") or {}).get("ODNO", "N/A")
                 pnl = register_sell(uid, "KR", code, current)
                 add_trade(uid, "KR", code, "sell", current, qty, "손절", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
-                _add_log(uid, "WARNING", f"[KR][{code}] 손절 | 현재={current:,}")
+                _add_log(uid, "WARNING",
+                         f"[KR][{code}] 손절 | 현재={current:,} 손절가={slp:,} "
+                         f"PnL≈{pnl:,.0f}원 주문={order_no}")
+                _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), qty, cfg)
+                _invalidate_balance_cache(uid)
                 continue
+
+            # 시간 기반 청산 (Time stop): 보유 N일 경과 + 수익률 ±flat_pct 이내면 자본 회수
+            if cfg.get("time_stop_enabled", True):
+                hold_days = int(cfg.get("time_stop_days", 5))
+                flat_pct = float(cfg.get("time_stop_flat_pct", 0.02))
+                age_days = _position_age_days(pos.get("entry_time"))
+                if age_days >= hold_days and abs(pnl_pct) < flat_pct * 100:
+                    res = place_order_kr(uid, cfg, code, "sell", qty, 0)
+                    order_no = (res.get("output") or {}).get("ODNO", "N/A")
+                    pnl = register_sell(uid, "KR", code, current)
+                    add_trade(uid, "KR", code, "sell", current, qty, "시간청산", pnl, stock_name=sn)
+                    update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
+                    _add_log(uid, "INFO",
+                             f"[KR][{code}] 시간청산 | 보유 {age_days}일 수익 {pnl_pct:+.2f}% "
+                             f"< ±{flat_pct*100:.1f}% | 주문={order_no}")
+                    _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), qty, cfg)
+                    _invalidate_balance_cache(uid)
+                    continue
 
             # 물타기: 평단 대비 일정 하락 + 손절선 위 + 횟수/간격/총비중 + 추세 필터
             if cfg.get("avg_down_enabled", True):
@@ -1708,6 +2647,23 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
     max_per_sector  = int(cfg.get("max_positions_per_sector", 2))
     sector_exposure = _get_sector_exposure(uid, "KR")
 
+    buy_ok, buy_block_reason = _kr_buy_window_ok(cfg)
+    if not buy_ok:
+        if verbose:
+            _add_log(uid, "INFO", f"[KR] 신규매수 블랙아웃 | {buy_block_reason}")
+        # 포지션 관리는 이미 위에서 끝났으므로 여기서 return
+        return
+
+    pnl_ok, pnl_reason = _daily_pnl_buy_gate(state, cfg)
+    if not pnl_ok:
+        _add_log(uid, "INFO", f"[KR] 신규매수 중단 | {pnl_reason}")
+        return
+
+    regime_ok, regime_reason = _kr_index_buy_gate(uid, cfg)
+    if not regime_ok:
+        _add_log(uid, "INFO", f"[KR] 신규매수 보류 | {regime_reason}")
+        return
+
     for code in watchlist:
         if code in positions:
             diag_parts.append(f"{code}=보유중")
@@ -1756,10 +2712,15 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                     continue
                 available = get_available_cash_kr(uid, cfg, code)
                 equity = _get_total_equity_kr(uid, cfg) or available
-                invest = min(available, equity * cfg.get("max_position_ratio", 0.1))
-                qty = math.floor(invest / current)
-                if qty <= 0:
-                    qty = 1 if available >= current else 0
+                prices_kr = calculate_optimal_prices(current, ohlcv, cfg)
+                qty, qty_reason = _risk_based_qty(
+                    equity, available, current,
+                    float(prices_kr.get("stop_loss") or 0), cfg,
+                )
+                if qty <= 0 and available >= current and equity > 0:
+                    # 안전망: 폴백 모드에서도 1주 가능하면 1주
+                    qty = 1
+                    qty_reason = "최소1주"
                 if qty > 0:
                     if not _try_acquire_buy_lock(uid, "KR", code):
                         diag_parts.append(f"{code}=매수중복방지(락)")
@@ -1769,13 +2730,16 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                         order_no = result.get("output", {}).get("ODNO", "N/A")
                         out = data.get("output") or {}
                         sname = _stock_name(out.get("hts_kor_isnm", "") if isinstance(out, dict) else "", code, "KR")
-                        tp = calculate_optimal_prices(current, ohlcv, cfg)["sell_price"]
                         register_buy(
                             uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.03),
-                            float(tp), "자동", sname,
+                            float(prices_kr["sell_price"]), "자동", sname,
+                            stop_loss_price=float(prices_kr["stop_loss"]),
                         )
                         add_trade(uid, "KR", code, "buy", current, qty, "자동매수", stock_name=sname)
-                        _add_log(uid, "INFO", f"[KR][{code}] 자동매수 | {qty}주@{current:,} 주문={order_no}")
+                        _add_log(uid, "INFO",
+                                 f"[KR][{code}] 자동매수 | {qty}주@{current:,} 주문={order_no} "
+                                 f"목표={float(prices_kr['sell_price']):,.0f} 손절={float(prices_kr['stop_loss']):,.0f} "
+                                 f"사이징({qty_reason})")
                         diag_parts.append(f"{code}=✅매수{qty}주")
                         sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
                     finally:
@@ -2510,14 +3474,18 @@ def _run_ai_session_impl(
                     _add_log(uid, "WARNING", f"[AI][US][{code}] 현재가 0 — 매수 건너뜀")
                     _skip("시세0")
                     continue
-                # 미국: USD 잔고 기반 수량 계산 (실패 시 max_us_qty 폴백)
+                # 미국: USD 잔고 기반 수량 계산 (리스크-패리티, 실패 시 폴백)
                 available_usd = _get_available_cash_us(uid, cfg)
+                max_us_qty = int(cfg.get("max_us_qty", 5))
                 if available_usd > 0:
-                    invest_usd = available_usd * cfg.get("max_position_ratio", 0.1)
-                    qty = max(1, min(math.floor(invest_usd / current),
-                                    int(cfg.get("max_us_qty", 5))))
+                    qty_raw, qty_reason = _risk_based_qty(
+                        available_usd, available_usd, current,
+                        float(rec.get("stop_loss") or 0), cfg,
+                    )
+                    qty = max(1, min(qty_raw, max_us_qty)) if qty_raw > 0 else 1
                 else:
                     qty = max(1, int(cfg.get("max_us_qty", 1)))
+                    qty_reason = "잔고조회실패→폴백"
                 result   = place_order_us(uid, cfg, code, "buy", qty, 0)
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 sname    = _stock_name("", code, "US")
@@ -2525,9 +3493,11 @@ def _run_ai_session_impl(
                              cfg.get("stop_loss_ratio", 0.03),
                              target_sell_price=float(rec["sell_price"]),
                              source=f"AI_{session}(점수{rec['score']})",
-                             stock_name=sname)
+                             stock_name=sname,
+                             stop_loss_price=float(rec.get("stop_loss") or 0))
                 add_trade(uid, "US", code, "buy", current, qty, f"AI_{session}_US", 0.0, stock_name=sname)
-                _add_log(uid, "INFO", f"[AI][US][{code}] 매수 | {qty}주@${current:.2f} 주문={order_no}")
+                _add_log(uid, "INFO",
+                         f"[AI][US][{code}] 매수 | {qty}주@${current:.2f} 주문={order_no} 사이징({qty_reason})")
             else:
                 data      = get_current_price_kr(uid, cfg, code)
                 ohlcv_ai  = get_daily_ohlcv_kr(uid, cfg, code)
@@ -2538,19 +3508,18 @@ def _run_ai_session_impl(
                     continue
                 available = get_available_cash_kr(uid, cfg, code)
                 equity    = _get_total_equity_kr(uid, cfg) or available
-                ratio     = float(cfg.get("max_position_ratio", 0.1))
-                pos_cap   = equity * ratio
+                qty, qty_reason = _risk_based_qty(
+                    equity, available, current,
+                    float(rec.get("stop_loss") or 0), cfg,
+                )
                 # AI: 한 종목당 상한이 1주가보다 작으면 수량이 0이 되는 경우 방지 (주문가능 범위 내)
-                if cfg.get("ai_afford_one_share", True):
-                    pos_cap = max(pos_cap, float(current))
-                invest    = min(available, pos_cap)
-                qty       = math.floor(invest / current)
-                if qty <= 0:
-                    qty = 1 if available >= current else 0
+                if qty <= 0 and cfg.get("ai_afford_one_share", True) and available >= current:
+                    qty = 1
+                    qty_reason = "최소1주(AI)"
                 if qty <= 0:
                     _add_log(uid, "WARNING",
                              f"[AI][KR][{code}] 매수불가 | 현재가={current:,} 주문가능={available:,.0f} "
-                             f"투자한도={invest:,.0f}(자산{equity:,.0f}×{ratio:.0%})")
+                             f"자산={equity:,.0f} 사이징({qty_reason})")
                     _skip("잔고부족")
                     continue
                 result   = place_order_kr(uid, cfg, code, "buy", qty, 0)
@@ -2558,9 +3527,11 @@ def _run_ai_session_impl(
                 register_buy(uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.03),
                              target_sell_price=float(rec["sell_price"]),
                              source=f"AI_{session}(점수{rec['score']})",
-                             stock_name=rec.get("stock_name", ""))
+                             stock_name=rec.get("stock_name", ""),
+                             stop_loss_price=float(rec.get("stop_loss") or 0))
                 add_trade(uid, "KR", code, "buy", current, qty, f"AI_{session}", 0.0, stock_name=rec.get("stock_name", ""))
-                _add_log(uid, "INFO", f"[AI][{code}] 매수 | {qty}주@{current:,} 주문={order_no}")
+                _add_log(uid, "INFO",
+                         f"[AI][{code}] 매수 | {qty}주@{current:,} 주문={order_no} 사이징({qty_reason})")
             executed.append(code)
             # 섹터 노출 카운트 업데이트 (루프 내 중복 매수 방지)
             sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
@@ -2607,6 +3578,7 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
     state = get_bot_state(uid)
     if not state.get("bot_enabled", True): return
     if state.get("trading_halted", False): return
+    # US 사이클은 5분 간격이라 드로우다운은 매번 체크
     if _check_drawdown(uid, cfg): return
 
     # ── 보유 포지션 관리 ────────────────────────────────────
@@ -2623,6 +3595,50 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
             target  = float(pos.get("target_sell_price", 0))
             slp     = float(pos.get("stop_loss_price", 0))
             sn      = pos.get("stock_name", "")
+            pnl_pct_us = (current - buy_avg) / buy_avg * 100 if buy_avg > 0 else 0
+
+            # 레거시 포지션 백필
+            backfill_us: dict = {}
+            prev_high_us = float(pos.get("highest_price") or 0)
+            if prev_high_us <= 0:
+                prev_high_us = max(buy_avg, current)
+                backfill_us["highest_price"] = prev_high_us
+            new_high_us = max(prev_high_us, current)
+            if new_high_us > prev_high_us:
+                backfill_us["highest_price"] = new_high_us
+            if not pos.get("entry_time"):
+                backfill_us["entry_time"] = datetime.now(KST)
+            if backfill_us:
+                try:
+                    _uref(uid).collection("positions_US").document(code).update(backfill_us)
+                except Exception:
+                    pass
+
+            # 손절선 본전 이동 (Break-even stop)
+            if cfg.get("breakeven_stop_enabled", True) and not pos.get("breakeven_applied"):
+                be_pct_us = float(cfg.get("breakeven_trigger_pct", 0.02))
+                if current >= buy_avg * (1 + be_pct_us):
+                    new_slp_us = max(slp, buy_avg)
+                    if new_slp_us > slp:
+                        try:
+                            _uref(uid).collection("positions_US").document(code).update({
+                                "stop_loss_price": new_slp_us,
+                                "breakeven_applied": True,
+                            })
+                            _add_log(uid, "INFO",
+                                     f"[US][{code}] 손절 본전이동 | ${slp:.2f}→${new_slp_us:.2f} "
+                                     f"(수익 +{pnl_pct_us:.2f}%)")
+                            slp = new_slp_us
+                        except Exception:
+                            pass
+
+            # 5분마다 포지션 현황 로그 (자동매도 동작 확인용)
+            now_us = datetime.now(KST)
+            if now_us.minute % 5 == 0:
+                _add_log(uid, "INFO",
+                         f"[US][{code}] 포지션체크 | 현재=${current:.2f} 평단=${buy_avg:.2f} "
+                         f"수익={pnl_pct_us:+.2f}% | 목표=${target:.2f} 손절=${slp:.2f} "
+                         f"고점=${new_high_us:.2f}")
 
             if cfg.get("partial_tp_enabled", True) and not pos.get("partial_tp_done") and qty > 1:
                 trig_pct = float(cfg.get("partial_tp_trigger_pct", 0.05))
@@ -2632,32 +3648,84 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                     if sell_qty >= qty:
                         sell_qty = qty - 1
                     if sell_qty >= 1:
-                        place_order_us(uid, cfg, code, "sell", sell_qty, 0)
+                        res = place_order_us(uid, cfg, code, "sell", sell_qty, 0)
+                        order_no = (res.get("output") or {}).get("ODNO", "N/A")
                         pnl, _ = register_partial_sell(
                             uid, "US", code, current, sell_qty,
                             cfg.get("partial_tp_tighten_stop", True),
+                            float(cfg.get("partial_tp_tighten_buffer_pct", 0.005)),
                         )
                         add_trade(uid, "US", code, "sell", current, sell_qty, "분할익절", pnl, stock_name=sn)
+                        _log_sell_fill(uid, "US", code, "sell", order_no, float(current), sell_qty, cfg)
                         st = get_bot_state(uid)
                         update_bot_state(uid, {"realized_pnl": st.get("realized_pnl", 0) + pnl})
-                        _add_log(uid, "INFO", f"[US][{code}] 분할익절 | {sell_qty}주@${current:.2f} PnL ${pnl:+.2f}")
+                        _add_log(uid, "INFO",
+                                 f"[US][{code}] 분할익절 | {sell_qty}주@${current:.2f} "
+                                 f"PnL ${pnl:+.2f} 주문={order_no}")
+                        _invalidate_balance_cache(uid)
+                        continue
+
+            # 트레일링 스탑: 평단 대비 +activate_pct 이상 상승 후, 전고점 대비 trail_pct 이상 되돌림 시 청산
+            if cfg.get("trailing_stop_enabled", True) and buy_avg > 0:
+                activate_pct = float(cfg.get("trailing_stop_activate_pct", 0.03))
+                trail_pct = float(cfg.get("trailing_stop_pct", 0.04))
+                if new_high_us >= buy_avg * (1 + activate_pct):
+                    trail_line = new_high_us * (1 - trail_pct)
+                    if current <= trail_line and current > slp:
+                        res = place_order_us(uid, cfg, code, "sell", qty, 0)
+                        order_no = (res.get("output") or {}).get("ODNO", "N/A")
+                        pnl = register_sell(uid, "US", code, current)
+                        add_trade(uid, "US", code, "sell", current, qty, "트레일링스탑", pnl, stock_name=sn)
+                        update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
+                        _add_log(uid, "INFO",
+                                 f"[US][{code}] 트레일링 스탑 | ${current:.2f} ≤ 트레일 ${trail_line:.2f} "
+                                 f"(고점 ${new_high_us:.2f}) PnL ${pnl:+.2f} 주문={order_no}")
+                        _log_sell_fill(uid, "US", code, "sell", order_no, float(current), qty, cfg)
                         _invalidate_balance_cache(uid)
                         continue
 
             if target > 0 and current >= target:
-                place_order_us(uid, cfg, code, "sell", qty, 0)
+                res = place_order_us(uid, cfg, code, "sell", qty, 0)
+                order_no = (res.get("output") or {}).get("ODNO", "N/A")
                 pnl = register_sell(uid, "US", code, current)
                 add_trade(uid, "US", code, "sell", current, qty, "목표가_달성", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
-                _add_log(uid, "INFO", f"[US][{code}] 익절 | ${current:.2f} → 목표 ${target:.2f} | PnL ${pnl:+.2f}")
+                _add_log(uid, "INFO",
+                         f"[US][{code}] 익절 | ${current:.2f} → 목표 ${target:.2f} "
+                         f"| PnL ${pnl:+.2f} 주문={order_no}")
+                _log_sell_fill(uid, "US", code, "sell", order_no, float(current), qty, cfg)
+                _invalidate_balance_cache(uid)
                 continue
             if slp > 0 and current <= slp:
-                place_order_us(uid, cfg, code, "sell", qty, 0)
+                res = place_order_us(uid, cfg, code, "sell", qty, 0)
+                order_no = (res.get("output") or {}).get("ODNO", "N/A")
                 pnl = register_sell(uid, "US", code, current)
                 add_trade(uid, "US", code, "sell", current, qty, "손절", pnl, stock_name=sn)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
-                _add_log(uid, "WARNING", f"[US][{code}] 손절 | ${current:.2f} ≤ 손절 ${slp:.2f}")
+                _add_log(uid, "WARNING",
+                         f"[US][{code}] 손절 | ${current:.2f} ≤ 손절 ${slp:.2f} "
+                         f"PnL ${pnl:+.2f} 주문={order_no}")
+                _log_sell_fill(uid, "US", code, "sell", order_no, float(current), qty, cfg)
+                _invalidate_balance_cache(uid)
                 continue
+
+            # 시간 기반 청산 (Time stop)
+            if cfg.get("time_stop_enabled", True):
+                hold_days_us = int(cfg.get("time_stop_days", 5))
+                flat_pct_us = float(cfg.get("time_stop_flat_pct", 0.02))
+                age_days_us = _position_age_days(pos.get("entry_time"))
+                if age_days_us >= hold_days_us and abs(pnl_pct_us) < flat_pct_us * 100:
+                    res = place_order_us(uid, cfg, code, "sell", qty, 0)
+                    order_no = (res.get("output") or {}).get("ODNO", "N/A")
+                    pnl = register_sell(uid, "US", code, current)
+                    add_trade(uid, "US", code, "sell", current, qty, "시간청산", pnl, stock_name=sn)
+                    update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
+                    _add_log(uid, "INFO",
+                             f"[US][{code}] 시간청산 | 보유 {age_days_us}일 수익 {pnl_pct_us:+.2f}% "
+                             f"< ±{flat_pct_us*100:.1f}% | 주문={order_no}")
+                    _log_sell_fill(uid, "US", code, "sell", order_no, float(current), qty, cfg)
+                    _invalidate_balance_cache(uid)
+                    continue
 
             # 물타기: 평단 대비 일정 하락 + 손절선 위 + 횟수/간격/총비중 + 추세 필터
             if cfg.get("avg_down_enabled", True):
@@ -2734,6 +3802,21 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
             _add_log(uid, "ERROR", f"[US][{code}] 포지션 체크 오류: {e}")
 
     # ── 신규 매수 검토 ──────────────────────────────────────
+    buy_ok_us, buy_block_reason_us = _us_buy_window_ok(cfg)
+    if not buy_ok_us:
+        _add_log(uid, "INFO", f"[US] 신규매수 블랙아웃 | {buy_block_reason_us}")
+        return
+
+    pnl_ok_us, pnl_reason_us = _daily_pnl_buy_gate(state, cfg)
+    if not pnl_ok_us:
+        _add_log(uid, "INFO", f"[US] 신규매수 중단 | {pnl_reason_us}")
+        return
+
+    regime_ok_us, regime_reason_us = _us_index_buy_gate(uid, cfg)
+    if not regime_ok_us:
+        _add_log(uid, "INFO", f"[US] 신규매수 보류 | {regime_reason_us}")
+        return
+
     positions = get_positions(uid, "US")
     for code in cfg.get("us_watchlist", []):
         if code in positions:
@@ -2773,24 +3856,30 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
 
             prices = calculate_optimal_prices_us(current, ohlcv, cfg)
             available_usd = _get_available_cash_us(uid, cfg)
-            if available_usd > 0:
-                invest_usd = available_usd * cfg.get("max_position_ratio", 0.1)
-                qty = max(1, min(math.floor(invest_usd / current),
-                                int(cfg.get("max_us_qty", 5))))
-            else:
+            equity_usd = available_usd  # USD 자기자본 추정값(가용 잔고로 근사)
+            qty_raw, qty_reason = _risk_based_qty(
+                equity_usd, available_usd, current,
+                float(prices.get("stop_loss") or 0), cfg,
+            )
+            max_us_qty = int(cfg.get("max_us_qty", 5))
+            if available_usd <= 0:
                 qty = max(1, int(cfg.get("max_us_qty", 1)))
+                qty_reason = "잔고조회실패→폴백"
+            else:
+                qty = max(1, min(qty_raw, max_us_qty)) if qty_raw > 0 else 1
             result   = place_order_us(uid, cfg, code, "buy", qty, 0)
             order_no = result.get("output", {}).get("ODNO", "N/A")
-            sname    = _stock_name(out.get("rsym", ""), code, "US")
+            sname    = _stock_name("", code, "US")
             register_buy(uid, "US", code, current, qty,
                          cfg.get("stop_loss_ratio", 0.03),
                          target_sell_price=prices["sell_price"],
-                         source="자동_US", stock_name=sname)
+                         source="자동_US", stock_name=sname,
+                         stop_loss_price=float(prices.get("stop_loss") or 0))
             add_trade(uid, "US", code, "buy", current, qty, "자동매수_US", stock_name=sname)
             _add_log(uid, "INFO",
                      f"[US][{code}] 매수 | {qty}주@${current:.2f} "
                      f"목표=${prices['sell_price']:.2f} 손절=${prices['stop_loss']:.2f} "
-                     f"점수={score_result['score']} 주문={order_no}")
+                     f"점수={score_result['score']} 주문={order_no} 사이징({qty_reason})")
         except Exception as e:
             _add_log(uid, "ERROR", f"[US][{code}] 매수 체크 오류: {e}")
 
@@ -2897,6 +3986,13 @@ def scheduled_market_open(event: scheduler_fn.ScheduledEvent) -> None:
     memory=options.MemoryOption.MB_256,
 )
 def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
+    """KR 전략 메인 사이클 — 1분 간격, 평일 09:00~15:20 KST.
+
+    `run_strategy_cycle_kr` 만 호출. 한 사이클 안에서:
+      1) 보유 포지션 점검 (백필/본전스탑/분할익절/트레일링/목표·손절/시간청산/물타기)
+      2) 진입 게이트 (블랙아웃 → 일간 P&L → KOSPI 레짐) 통과 시 신규 매수 스캔
+    예외는 유저 단위로 격리 (한 유저 오류가 다른 유저를 막지 않음).
+    """
     now = datetime.now(KST)
     if now.weekday() >= 5: return
     market_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
@@ -2916,6 +4012,12 @@ def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
     memory=options.MemoryOption.MB_256,
 )
 def scheduled_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
+    """KR 장 마감 직전(15:20 KST) 보유 포지션 전량 청산.
+
+    당일 결제 vs 익일 결제 리스크와 익일 갭 리스크를 회피하기 위해 전량 시장가 매도.
+    스윙 모드 운영을 원할 경우 이 함수의 스케줄을 끄거나 건너뛰는 분기 추가가 필요.
+    각 매도는 _log_sell_fill 로 슬리피지 기록.
+    """
     for uid, cfg in _get_all_users():
         positions = get_positions(uid, "KR")
         for code, pos in list(positions.items()):
@@ -2927,11 +4029,17 @@ def scheduled_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
                     _add_log(uid, "WARNING", f"[{code}] 장마감 청산: 현재가 0 — 건너뜀")
                     continue
                 qty = pos["quantity"]
-                place_order_kr(uid, cfg, code, "sell", qty, 0)
+                res = place_order_kr(uid, cfg, code, "sell", qty, 0)
+                order_no = (res.get("output") or {}).get("ODNO", "N/A")
                 pnl = register_sell(uid, "KR", code, current)
                 add_trade(uid, "KR", code, "sell", current, qty, "장마감_청산", pnl, stock_name=pos.get("stock_name", ""))
                 state = get_bot_state(uid)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
+                _add_log(uid, "INFO",
+                         f"[KR][{code}] 장마감 청산 | {qty}주@{current:,} "
+                         f"PnL≈{pnl:,.0f}원 주문={order_no}")
+                _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), qty, cfg)
+                _invalidate_balance_cache(uid)
             except Exception as e:
                 _add_log(uid, "ERROR", f"[{code}] 청산 오류: {e}")
 
@@ -2944,6 +4052,63 @@ def scheduled_market_close(event: scheduler_fn.ScheduledEvent) -> None:
     for uid, _ in _get_all_users():
         update_bot_state(uid, {"is_market_open": False})
         _add_log(uid, "INFO", "[15:31] 장 마감")
+
+
+@scheduler_fn.on_schedule(
+    schedule="*/30 9-15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
+    memory=options.MemoryOption.MB_256,
+)
+def scheduled_reconcile_kr(event: scheduler_fn.ScheduledEvent) -> None:
+    """KR 포지션 reconcile — 평일 KST 09:15~15:15, 30분 간격.
+
+    `reconcile_positions(uid, cfg, "KR")` 호출.
+    개장 직후 09:00은 잔고 갱신이 안정화되지 않을 수 있어 09:15부터,
+    마감 청산 함수(15:20)와의 충돌을 피해 15:15까지로 제한.
+
+    cfg["reconcile_enabled"]=False 인 유저는 스킵.
+    상세 동작은 `reconcile_positions` 의 docstring 참조.
+    """
+    now = datetime.now(KST)
+    if now.weekday() >= 5:
+        return
+    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_end = now.replace(hour=15, minute=15, second=0, microsecond=0)
+    if not (market_start <= now <= market_end):
+        return
+    for uid, cfg in _get_all_users():
+        if not cfg.get("reconcile_enabled", True):
+            continue
+        try:
+            reconcile_positions(uid, cfg, "KR")
+        except Exception as e:
+            _add_log(uid, "ERROR", f"[reconcile][KR] 사이클 오류: {e}")
+
+
+@scheduler_fn.on_schedule(
+    schedule="*/30 9-16 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
+    memory=options.MemoryOption.MB_256,
+)
+def scheduled_reconcile_us(event: scheduler_fn.ScheduledEvent) -> None:
+    """US 포지션 reconcile — 평일 ET 09:45~15:45, 30분 간격.
+
+    개장 09:30 직후는 KIS 잔고 동기화 지연 가능성을 고려해 09:45부터,
+    마감 청산(15:50)과의 충돌을 피해 15:45까지.
+    상세는 `reconcile_positions` docstring 참조.
+    """
+    now = datetime.now(ET)
+    if now.weekday() >= 5:
+        return
+    market_start = now.replace(hour=9, minute=45, second=0, microsecond=0)
+    market_end = now.replace(hour=15, minute=45, second=0, microsecond=0)
+    if not (market_start <= now <= market_end):
+        return
+    for uid, cfg in _get_all_users():
+        if not cfg.get("reconcile_enabled", True):
+            continue
+        try:
+            reconcile_positions(uid, cfg, "US")
+        except Exception as e:
+            _add_log(uid, "ERROR", f"[reconcile][US] 사이클 오류: {e}")
 
 
 @scheduler_fn.on_schedule(
@@ -3053,12 +4218,16 @@ def scheduled_us_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
                 data    = get_current_price_us(uid, cfg, code)
                 current = float(data["output"].get("last", 0))
                 qty     = pos["quantity"]
-                place_order_us(uid, cfg, code, "sell", qty, 0)
+                res = place_order_us(uid, cfg, code, "sell", qty, 0)
+                order_no = (res.get("output") or {}).get("ODNO", "N/A")
                 pnl = register_sell(uid, "US", code, current)
                 add_trade(uid, "US", code, "sell", current, qty, "US장마감_청산", pnl, stock_name=pos.get("stock_name", ""))
                 state = get_bot_state(uid)
                 update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
-                _add_log(uid, "INFO", f"[US][{code}] 마감 청산 | ${current:.2f} | PnL ${pnl:+.2f}")
+                _add_log(uid, "INFO",
+                         f"[US][{code}] 마감 청산 | ${current:.2f} | PnL ${pnl:+.2f} 주문={order_no}")
+                _log_sell_fill(uid, "US", code, "sell", order_no, float(current), qty, cfg)
+                _invalidate_balance_cache(uid)
             except Exception as e:
                 _add_log(uid, "ERROR", f"[US][{code}] 마감 청산 오류: {e}")
 
@@ -3252,7 +4421,7 @@ def route_status():
                         data = _cached_price(uid, cfg, code, "US")
                         out = data["output"]
                         current = _us_price_from_output(out)
-                        sname = _stock_name(out.get("rsym", ""), code, "US")
+                        sname = _stock_name("", code, "US")
                         change_rate = out.get("diff", "0")
                     bp = float(pos.get("buy_price") or 0)
                     qty = int(pos.get("quantity") or 0)
@@ -3382,7 +4551,7 @@ def route_status():
                     cur_us = _us_price_from_output(out, ohlcv_us)
                     us_watchlist_data[code] = {
                         "current_price": cur_us,
-                        "stock_name": _stock_name(out.get("rsym", ""), code, "US"),
+                        "stock_name": _stock_name("", code, "US"),
                         "change_rate": out.get("diff", "0"),
                         "closes": [
                             round(c, 2)
@@ -3448,10 +4617,12 @@ def route_order():
                     return jsonify({"ok": False, "error": "수량 계산 실패"}), 400
                 result = place_order_kr(uid, cfg, stock_code, "buy", quantity, int(price))
                 order_no = result.get("output", {}).get("ODNO", "N/A")
-                tp_kr = calculate_optimal_prices(current, ohlcv_o, cfg)["sell_price"]
+                prices_manual_kr = calculate_optimal_prices(current, ohlcv_o, cfg)
                 register_buy(
                     uid, "KR", stock_code, current, quantity,
-                    cfg.get("stop_loss_ratio", 0.03), float(tp_kr), "수동", sname,
+                    cfg.get("stop_loss_ratio", 0.03), float(prices_manual_kr["sell_price"]),
+                    "수동", sname,
+                    stop_loss_price=float(prices_manual_kr.get("stop_loss") or 0),
                 )
                 add_trade(uid, "KR", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][KR] {stock_code} {quantity}주@{current:,} 주문={order_no}")
@@ -3466,10 +4637,18 @@ def route_order():
                 if quantity <= 0:
                     if not pos: return jsonify({"ok": False, "error": "보유 포지션 없음"}), 400
                     quantity = pos["quantity"]
+                elif pos and quantity > int(pos["quantity"]):
+                    return jsonify({"ok": False, "error": "매도 수량이 보유 수량을 초과합니다"}), 400
                 result = place_order_kr(uid, cfg, stock_code, "sell", quantity, int(price))
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 if pos:
-                    pnl = register_sell(uid, "KR", stock_code, current)
+                    pos_qty = int(pos["quantity"])
+                    if quantity < pos_qty:
+                        pnl, _ = register_partial_sell(
+                            uid, "KR", stock_code, current, quantity, False,
+                        )
+                    else:
+                        pnl = register_sell(uid, "KR", stock_code, current)
                     add_trade(uid, "KR", stock_code, "sell", current, quantity, "수동매도", pnl, stock_name=pos.get("stock_name", sname))
                     state = get_bot_state(uid)
                     update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
@@ -3483,17 +4662,19 @@ def route_order():
             data = get_current_price_us(uid, cfg, stock_code)
             out = data["output"]
             current = float(out.get("last", out.get("stck_prpr", 0)))
-            sname = _stock_name(out.get("rsym", ""), stock_code, "US")
+            sname = _stock_name("", stock_code, "US")
             if side == "buy":
                 if quantity <= 0:
                     return jsonify({"ok": False, "error": "미국 주식은 수량을 직접 입력해주세요"}), 400
                 result = place_order_us(uid, cfg, stock_code, "buy", quantity, price)
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 ohlcv_us_m = get_daily_ohlcv_us(uid, cfg, stock_code)
-                tp_us = calculate_optimal_prices_us(current, ohlcv_us_m, cfg)["sell_price"]
+                prices_manual_us = calculate_optimal_prices_us(current, ohlcv_us_m, cfg)
                 register_buy(
                     uid, "US", stock_code, current, quantity,
-                    cfg.get("stop_loss_ratio", 0.03), float(tp_us), "수동", sname,
+                    cfg.get("stop_loss_ratio", 0.03),
+                    float(prices_manual_us["sell_price"]), "수동", sname,
+                    stop_loss_price=float(prices_manual_us.get("stop_loss") or 0),
                 )
                 add_trade(uid, "US", stock_code, "buy", current, quantity, "수동매수", stock_name=sname)
                 _add_log(uid, "INFO", f"[수동매수][US] {stock_code} {quantity}주@${current:.2f}")
@@ -3508,10 +4689,18 @@ def route_order():
                 if quantity <= 0:
                     if not pos: return jsonify({"ok": False, "error": "보유 포지션 없음"}), 400
                     quantity = pos["quantity"]
+                elif pos and quantity > int(pos["quantity"]):
+                    return jsonify({"ok": False, "error": "매도 수량이 보유 수량을 초과합니다"}), 400
                 result = place_order_us(uid, cfg, stock_code, "sell", quantity, price)
                 order_no = result.get("output", {}).get("ODNO", "N/A")
                 if pos:
-                    pnl = register_sell(uid, "US", stock_code, current)
+                    pos_qty = int(pos["quantity"])
+                    if quantity < pos_qty:
+                        pnl, _ = register_partial_sell(
+                            uid, "US", stock_code, current, quantity, False,
+                        )
+                    else:
+                        pnl = register_sell(uid, "US", stock_code, current)
                     add_trade(uid, "US", stock_code, "sell", current, quantity, "수동매도", pnl, stock_name=pos.get("stock_name", sname))
                     state = get_bot_state(uid)
                     update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
@@ -3560,7 +4749,19 @@ def route_config():
                 "partial_tp_enabled", "partial_tp_trigger_pct", "partial_tp_sell_ratio",
                 "partial_tp_tighten_stop",
                 "avg_down_enabled", "avg_down_trigger_pct", "avg_down_max_times",
-                "avg_down_qty_ratio", "avg_down_min_interval_hours"}
+                "avg_down_qty_ratio", "avg_down_min_interval_hours",
+                "trailing_stop_enabled", "trailing_stop_pct", "trailing_stop_activate_pct",
+                "breakeven_stop_enabled", "breakeven_trigger_pct",
+                "time_stop_enabled", "time_stop_days", "time_stop_flat_pct",
+                "partial_tp_tighten_buffer_pct",
+                "kr_sell_ord_dvsn",
+                "kr_skip_buy_first_min", "kr_skip_buy_last_min",
+                "us_skip_buy_first_min", "us_skip_buy_last_min",
+                "daily_loss_limit", "kr_index_drop_limit_pct",
+                "us_index_drop_limit_pct", "us_index_proxy",
+                "risk_per_trade_pct",
+                "reconcile_enabled", "fill_check_enabled",
+                "monday_morning_skip_enabled", "monday_morning_skip_min"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400
@@ -3653,7 +4854,7 @@ def route_quote():
             data = get_current_price_us(uid, cfg, code)
             out = data["output"]
             price = float(out.get("last", out.get("stck_prpr", 0)) or 0)
-            name = _stock_name(out.get("rsym", ""), code, "US")
+            name = _stock_name("", code, "US")
         return jsonify({
             "ok": True,
             "stock_code": code,

@@ -1851,7 +1851,7 @@ function renderWatchlist(positions, cfg, watchlistData, market) {
           <span class="text-sm font-bold text-slate-200">${priceStr}</span>
           <span class="text-xs font-semibold ${upDown}">${arrow}${changeRate!==0?Math.abs(changeRate).toFixed(2)+'%':''}</span>
         </div>
-        <div class="shrink-0 space-y-0.5 min-h-[3.25rem]">
+        <div class="shrink-0 space-y-0.5" style="min-height:3.25rem">
         ${isOwned
           ? `<div class="text-xs text-slate-600">매수 ${buyLineDisplay}</div>${hasPnl?`<div class="text-xs ${pnl>=0?'text-green-400':'text-red-400'} font-semibold">${pnl>=0?'+':''}${market==='US'?'$'+Math.abs(pnl).toFixed(2):pnl.toLocaleString()+'원'} (${pr>=0?'+':''}${pr}%)</div>`:''}
              <div class="text-xs text-slate-600 mt-0.5">목표 ${(pos.target_sell_price||0).toLocaleString()||'-'} / 손절 ${(pos.stop_loss_price||0).toLocaleString()||'-'}</div>`
@@ -1863,8 +1863,14 @@ function renderWatchlist(positions, cfg, watchlistData, market) {
             : ''
         }
         </div>
-        <div class="flex-1 min-h-2 shrink-0"></div>
         <div class="spark-slot mt-auto pt-2 shrink-0" style="height:60px">${_sparklineSvg(wd.closes||[], changeRate)}</div>
+        <a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSym)}"
+           target="_blank" rel="noopener noreferrer"
+           onclick="event.stopPropagation()"
+           class="shrink-0 mt-1.5 block text-center text-[11px] py-1.5 rounded-lg transition-colors"
+           style="color:#818cf8;background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.18)">
+          TradingView에서 차트 열기 ↗
+        </a>
       </div>`;
   }).filter(Boolean).join('');
   if(!grid.innerHTML.trim()){grid.innerHTML='<p class="text-slate-600 text-xs">유효한 티커가 없습니다 (형식: 한국 6자리, 미국 티커)</p>';}
@@ -1951,8 +1957,8 @@ function renderConfig(cfg) {
   set('cfgUsWatchlist',Array.isArray(cfg.us_watchlist)?cfg.us_watchlist.join(','):cfg.us_watchlist);
   set('cfgMock',(cfg.is_mock===true||cfg.is_mock==='true')?'true':'false');
   const pe=document.getElementById('cfgPartialTpEn');if(pe)pe.checked=cfg.partial_tp_enabled!==false;
-  set('cfgPartialTpTrig',cfg.partial_tp_trigger_pct!=null?(cfg.partial_tp_trigger_pct*100).toFixed(1):'2');
-  set('cfgPartialTpSell',cfg.partial_tp_sell_ratio!=null?(cfg.partial_tp_sell_ratio*100).toFixed(0):'33');
+  set('cfgPartialTpTrig',cfg.partial_tp_trigger_pct!=null?(cfg.partial_tp_trigger_pct*100).toFixed(1):'5');
+  set('cfgPartialTpSell',cfg.partial_tp_sell_ratio!=null?(cfg.partial_tp_sell_ratio*100).toFixed(0):'30');
   const pt=document.getElementById('cfgPartialTpTight');if(pt)pt.checked=cfg.partial_tp_tighten_stop!==false;
   const ae=document.getElementById('cfgAvgDownEn');if(ae)ae.checked=cfg.avg_down_enabled!==false;
   set('cfgAvgDownTrig',cfg.avg_down_trigger_pct!=null?(cfg.avg_down_trigger_pct*100).toFixed(1):'4');
