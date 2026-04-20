@@ -2784,9 +2784,9 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
 def _get_all_users() -> list[tuple[str, dict]]:
     """설정 완료된 유저 목록 반환 [(uid, cfg), ...]"""
     result = []
-    for user_doc in get_db().collection("users").stream():
-        uid = user_doc.id
-        cfg_doc = _uref(uid).collection("config").document("settings").get()
+    for user_ref in get_db().collection("users").list_documents():
+        uid = user_ref.id
+        cfg_doc = user_ref.collection("config").document("settings").get()
         if cfg_doc.exists:
             cfg = cfg_doc.to_dict()
             if cfg.get("app_key") and cfg.get("app_secret") and cfg.get("account_no"):
