@@ -20,6 +20,12 @@ export function StrategySettings({
   const [usWl, setUsWl] = useState("");
   const [isMock, setIsMock] = useState(true);
   const [aiCount, setAiCount] = useState(3);
+  const [partialTpEn, setPartialTpEn] = useState(true);
+  const [partialTpTrig, setPartialTpTrig] = useState("5");
+  const [partialTpSell, setPartialTpSell] = useState("30");
+  const [partialTpTight, setPartialTpTight] = useState(true);
+  const [slipMockPct, setSlipMockPct] = useState("5");
+  const [slipLivePct, setSlipLivePct] = useState("3");
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -54,6 +60,28 @@ export function StrategySettings({
     );
     setIsMock(config.is_mock !== false);
     setAiCount(parseInt(String(config.ai_stock_count), 10) || 3);
+    setPartialTpEn(config.partial_tp_enabled !== false);
+    setPartialTpTrig(
+      config.partial_tp_trigger_pct != null
+        ? (config.partial_tp_trigger_pct * 100).toFixed(1)
+        : "5",
+    );
+    setPartialTpSell(
+      config.partial_tp_sell_ratio != null
+        ? String(Math.round(config.partial_tp_sell_ratio * 100))
+        : "30",
+    );
+    setPartialTpTight(config.partial_tp_tighten_stop !== false);
+    setSlipMockPct(
+      config.max_entry_slip_pct_mock != null
+        ? (config.max_entry_slip_pct_mock * 100).toFixed(1)
+        : "5",
+    );
+    setSlipLivePct(
+      config.max_entry_slip_pct_live != null
+        ? (config.max_entry_slip_pct_live * 100).toFixed(1)
+        : "3",
+    );
   }, [config]);
 
   async function save() {
@@ -89,6 +117,12 @@ export function StrategySettings({
           .filter(Boolean),
         is_mock: isMock,
         ai_stock_count: aiCount,
+        partial_tp_enabled: partialTpEn,
+        partial_tp_trigger_pct: (parseFloat(partialTpTrig) || 5) / 100,
+        partial_tp_sell_ratio: (parseFloat(partialTpSell) || 30) / 100,
+        partial_tp_tighten_stop: partialTpTight,
+        max_entry_slip_pct_mock: (parseFloat(slipMockPct) || 5) / 100,
+        max_entry_slip_pct_live: (parseFloat(slipLivePct) || 3) / 100,
       };
       const data = await apiFetch<{ ok: boolean; error?: string }>(
         "/api/config",
@@ -228,7 +262,90 @@ export function StrategySettings({
             </div>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-3">
+
+        <div className="mt-6 pt-5 border-t border-white/10">
+          <p className="text-xs font-medium text-slate-400 mb-3">
+            분할 익절 · 돌파 후 추격 방지 (슬리피지)
+          </p>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-2">
+            <label className="flex items-center gap-2 text-xs text-slate-300 col-span-2 md:col-span-1 cursor-pointer">
+              <input
+                type="checkbox"
+                className="rounded border-white/20"
+                checked={partialTpEn}
+                onChange={(e) => setPartialTpEn(e.target.checked)}
+              />
+              분할익절 사용
+            </label>
+            <div>
+              <label className="text-xs text-slate-500 block mb-1">
+                분할익절 시작 (%)
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                min={0.5}
+                title="평단 대비"
+                className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                value={partialTpTrig}
+                onChange={(e) => setPartialTpTrig(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 block mb-1">
+                분할 매도 비중 (%)
+              </label>
+              <input
+                type="number"
+                step="1"
+                min={10}
+                max={90}
+                title="보유 수량 중"
+                className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                value={partialTpSell}
+                onChange={(e) => setPartialTpSell(e.target.value)}
+              />
+            </div>
+            <label className="flex items-center gap-2 text-xs text-slate-300 md:col-span-2 cursor-pointer">
+              <input
+                type="checkbox"
+                className="rounded border-white/20"
+                checked={partialTpTight}
+                onChange={(e) => setPartialTpTight(e.target.checked)}
+              />
+              익절 후 손절선 본전 상향
+            </label>
+            <div>
+              <label className="text-xs text-slate-500 block mb-1">
+                추격 허용 (모의 %)
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                value={slipMockPct}
+                onChange={(e) => setSlipMockPct(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 block mb-1">
+                추격 허용 (실전 %)
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                value={slipLivePct}
+                onChange={(e) => setSlipLivePct(e.target.value)}
+              />
+            </div>
+          </div>
+          <p className="text-[10px] text-slate-600 mt-2">
+            미저장 시 표시 기본값: 익절 +5% / 매도 30% / 모의 추격 5%·실전 3% (백엔드 기본과 동일)
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 mt-4">
           <button
             type="button"
             disabled={saving}

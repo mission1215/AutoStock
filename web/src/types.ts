@@ -32,6 +32,13 @@ export interface AppConfig {
   daily_profit_target?: number;
   is_mock?: boolean;
   setup_complete?: boolean;
+  /** 분할 익절·추격 방지 등 (백엔드와 동일 키) */
+  partial_tp_enabled?: boolean;
+  partial_tp_trigger_pct?: number;
+  partial_tp_sell_ratio?: number;
+  partial_tp_tighten_stop?: boolean;
+  max_entry_slip_pct_mock?: number;
+  max_entry_slip_pct_live?: number;
 }
 
 export interface PositionKr {

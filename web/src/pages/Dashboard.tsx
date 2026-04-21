@@ -14,7 +14,12 @@ import { StrategySettings } from "../components/StrategySettings";
 import { AiSessionButtons } from "../components/AiSessionButtons";
 import { HoldingsPanel } from "../components/HoldingsPanel";
 import { MarketFlowStrip } from "../components/MarketFlowStrip";
-import { pickRecord, watchlistCodeKeys } from "../utils/sparklineCloses";
+import {
+  pickRecord,
+  watchlistCodeKeys,
+  buildSparklineCloses,
+} from "../utils/sparklineCloses";
+import { Sparkline } from "../components/Sparkline";
 import { tvSymbol } from "../utils/tradingViewSymbol";
 import { formatKst } from "../utils/formatKst";
 
@@ -392,111 +397,160 @@ export function Dashboard({
               );
               const owned = !!pos;
               const cr = parseFloat(String(wd.change_rate || "0"));
-              const current = wd.current_price;
+              const displayPrice =
+                pos?.current_price != null && Number(pos.current_price) > 0
+                  ? Number(pos.current_price)
+                  : wd.current_price != null
+                    ? Number(wd.current_price)
+                    : null;
               const priceStr =
                 currentMarket === "US"
-                  ? current != null
-                    ? `$${Number(current).toFixed(2)}`
+                  ? displayPrice != null
+                    ? `$${displayPrice.toFixed(2)}`
                     : "—"
-                  : current != null
-                    ? `${Number(current).toLocaleString()}원`
+                  : displayPrice != null
+                    ? `${displayPrice.toLocaleString()}원`
                     : "—";
+              const breakout = wd.target_breakout ?? 0;
+              const ma5wl = wd.ma5 ?? 0;
+              const showBuySignal =
+                !owned &&
+                currentMarket === "KR" &&
+                breakout > 0 &&
+                displayPrice != null &&
+                displayPrice >= breakout;
+              const sparkCloses = buildSparklineCloses(wd, pos);
               return (
                 <div
                   key={code}
-                  className={`glass rounded-xl p-3 ${owned ? "ring-1 ring-blue-500/30" : ""}`}
+                  className={`glass rounded-xl p-3 flex flex-col min-h-[200px] ${owned ? "ring-1 ring-blue-500/30" : ""}`}
                 >
-                  <div className="flex justify-between items-start gap-2 mb-1">
-                    <div className="min-w-0 flex-1">
-                      <div className="font-semibold text-white text-sm sm:text-[15px] leading-snug truncate">
-                        {wd.stock_name || code}
-                      </div>
-                      {(wd.stock_name || "").trim() ? (
-                        <div className="font-mono text-[11px] text-slate-500 tabular-nums mt-0.5">
-                          {code}
-                        </div>
-                      ) : null}
-                    </div>
-                    {owned && (
+                  <div className="flex items-center justify-between mb-0.5 shrink-0 gap-2">
+                    <span className="font-bold text-white text-sm font-mono tabular-nums">
+                      {code}
+                    </span>
+                    {owned ? (
                       <span className="shrink-0 text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full">
                         보유
                       </span>
+                    ) : showBuySignal ? (
+                      <span className="shrink-0 text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full font-medium">
+                        매수신호
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-transparent select-none" aria-hidden>
+                        ·
+                      </span>
                     )}
                   </div>
-                  <div className="flex items-baseline gap-2 mb-1">
+                  {(wd.stock_name || "").trim() ? (
+                    <div className="text-xs text-slate-400 mb-1 truncate shrink-0">
+                      {wd.stock_name}
+                    </div>
+                  ) : (
+                    <div className="mb-1 h-4 shrink-0" aria-hidden />
+                  )}
+                  <div className="flex items-baseline gap-1.5 mb-1 shrink-0">
                     <span className="text-sm font-bold text-slate-200">
                       {priceStr}
                     </span>
                     <span
                       className={
                         cr > 0
-                          ? "text-emerald-400"
+                          ? "text-xs font-semibold text-emerald-400"
                           : cr < 0
-                            ? "text-red-400"
-                            : "text-slate-500"
+                            ? "text-xs font-semibold text-red-400"
+                            : "text-xs font-semibold text-slate-500"
                       }
                     >
-                      {cr !== 0 ? `${cr > 0 ? "▲" : "▼"}${Math.abs(cr).toFixed(2)}%` : ""}
+                      {cr !== 0
+                        ? `${cr > 0 ? "▲" : "▼"}${Math.abs(cr).toFixed(2)}%`
+                        : ""}
                     </span>
                   </div>
-                  {owned && pos && (
-                    <>
-                      {pos.pnl != null && (
-                        <div
-                          className={`text-xs font-semibold mb-1 ${(pos.pnl ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}
-                        >
-                          {(pos.pnl ?? 0) >= 0 ? "+" : ""}
-                          {currentMarket === "US"
-                            ? `$${Math.abs(pos.pnl ?? 0).toFixed(2)}`
-                            : `${Math.abs(pos.pnl ?? 0).toLocaleString()}원`}{" "}
-                          ({(pos.pnl_ratio ?? 0) >= 0 ? "+" : ""}
-                          {pos.pnl_ratio ?? 0}%)
-                        </div>
-                      )}
-                      <div className="text-[11px] text-slate-500 space-y-0.5">
-                        <div>
-                          매수{" "}
-                          <span className="text-slate-400">
+                  <div
+                    className="shrink-0 space-y-0.5"
+                    style={{ minHeight: "3.25rem" }}
+                  >
+                    {owned && pos ? (
+                      <>
+                        {pos.pnl != null && (
+                          <div
+                            className={`text-xs font-semibold ${(pos.pnl ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}
+                          >
+                            {(pos.pnl ?? 0) >= 0 ? "+" : ""}
                             {currentMarket === "US"
-                              ? pos.buy_price != null
-                                ? `$${Number(pos.buy_price).toFixed(2)}`
-                                : "—"
-                              : pos.buy_price != null
-                                ? `${Number(pos.buy_price).toLocaleString()}원`
+                              ? `$${Math.abs(pos.pnl ?? 0).toFixed(2)}`
+                              : `${Math.abs(pos.pnl ?? 0).toLocaleString()}원`}{" "}
+                            ({(pos.pnl_ratio ?? 0) >= 0 ? "+" : ""}
+                            {pos.pnl_ratio ?? 0}%)
+                          </div>
+                        )}
+                        <div className="text-[11px] text-slate-500 space-y-0.5">
+                          <div>
+                            매수{" "}
+                            <span className="text-slate-400">
+                              {currentMarket === "US"
+                                ? pos.buy_price != null
+                                  ? `$${Number(pos.buy_price).toFixed(2)}`
+                                  : "—"
+                                : pos.buy_price != null
+                                  ? `${Number(pos.buy_price).toLocaleString()}원`
+                                  : "—"}
+                            </span>
+                          </div>
+                          <div>
+                            목표{" "}
+                            <span className="text-emerald-400/90">
+                              {(pos.target_sell_price ?? 0) > 0
+                                ? currentMarket === "US"
+                                  ? `$${Number(pos.target_sell_price).toFixed(2)}`
+                                  : `${Number(pos.target_sell_price).toLocaleString()}`
                                 : "—"}
-                          </span>
+                            </span>{" "}
+                            / 손절{" "}
+                            <span className="text-red-400/90">
+                              {(pos.stop_loss_price ?? 0) > 0
+                                ? currentMarket === "US"
+                                  ? `$${Number(pos.stop_loss_price).toFixed(2)}`
+                                  : `${Number(pos.stop_loss_price).toLocaleString()}`
+                                : "—"}
+                            </span>
+                          </div>
                         </div>
-                        <div>
-                          목표{" "}
-                          <span className="text-emerald-400/90">
-                            {(pos.target_sell_price ?? 0) > 0
-                              ? currentMarket === "US"
-                                ? `$${Number(pos.target_sell_price).toFixed(2)}`
-                                : `${Number(pos.target_sell_price).toLocaleString()}`
-                              : "—"}
-                          </span>{" "}
-                          / 손절{" "}
-                          <span className="text-red-400/90">
-                            {(pos.stop_loss_price ?? 0) > 0
-                              ? currentMarket === "US"
-                                ? `$${Number(pos.stop_loss_price).toFixed(2)}`
-                                : `${Number(pos.stop_loss_price).toLocaleString()}`
-                              : "—"}
+                      </>
+                    ) : currentMarket === "KR" && breakout > 0 ? (
+                      <div className="mt-1 pt-1 border-t border-white/5">
+                        <div className="flex justify-between text-xs gap-2">
+                          <span
+                            className={
+                              showBuySignal
+                                ? "text-emerald-400 font-semibold"
+                                : "text-slate-500"
+                            }
+                          >
+                            돌파가 {breakout.toLocaleString()}
                           </span>
+                          {ma5wl > 0 ? (
+                            <span className="text-slate-600 shrink-0">
+                              MA {ma5wl.toLocaleString()}
+                            </span>
+                          ) : null}
                         </div>
                       </div>
-                    </>
-                  )}
+                    ) : null}
+                  </div>
+                  <div className="spark-slot mt-auto pt-2 shrink-0 h-[60px] w-full min-w-0">
+                    <Sparkline closes={sparkCloses} changeRate={cr} />
+                  </div>
                   <a
                     href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSymbol(code, currentMarket))}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="mt-3 flex items-center justify-center gap-1 rounded-lg border border-indigo-500/20 bg-indigo-950/40 py-2.5 text-[11px] font-medium text-indigo-200/90 hover:bg-indigo-500/15 transition-colors"
+                    onClick={(e) => e.stopPropagation()}
+                    className="shrink-0 mt-1.5 flex items-center justify-center gap-1 rounded-lg border border-indigo-500/[0.18] bg-indigo-500/10 py-1.5 text-[11px] text-[#818cf8] hover:bg-indigo-500/15 transition-colors"
                   >
-                    TradingView에서 차트 열기
-                    <span className="opacity-70" aria-hidden>
-                      ↗
-                    </span>
+                    TradingView에서 차트 열기 ↗
                   </a>
                 </div>
               );
