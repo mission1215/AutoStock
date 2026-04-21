@@ -231,6 +231,34 @@ export function Dashboard({
         </div>
       </section>
 
+      {/* 누적 손익·비중 차트 — 대시보드 핵심 위젯(레이아웃 수정 시 이 블록 유지 권장) */}
+      <section
+        className="mt-7 grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-5"
+        aria-label="실현손익 및 보유 비중"
+      >
+        <div className="glass rounded-2xl p-4 min-w-0">
+          <div className="mb-3">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
+              누적 실현손익
+            </h2>
+            <p className="text-[10px] text-slate-600 mt-0.5">매도 체결 기준</p>
+          </div>
+          <EquityChart trades={trades} />
+        </div>
+        <div className="glass rounded-2xl p-4 min-w-0">
+          <div className="mb-3">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
+              보유 비중
+            </h2>
+            <p className="text-[10px] text-slate-600 mt-0.5">종목별 평가액</p>
+          </div>
+          <PositionMixChart
+            positionsKr={positionsKr}
+            positionsUs={positionsUs}
+          />
+        </div>
+      </section>
+
       {/* 자동매매 봇 */}
       <section className="mt-7 glass rounded-2xl p-4 sm:p-5">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -288,31 +316,6 @@ export function Dashboard({
           중지 시 스케줄 AI·규칙 매매가 실행되지 않습니다. 「매매 재개」는 일일 목표 달성 등으로
           일시 중단된 경우에만 사용합니다.
         </p>
-      </section>
-
-      {/* 차트 */}
-      <section className="mt-7 grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-5">
-        <div className="glass rounded-2xl p-4 min-w-0">
-          <div className="mb-3">
-            <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
-              누적 실현손익
-            </h2>
-            <p className="text-[10px] text-slate-600 mt-0.5">매도 체결 기준</p>
-          </div>
-          <EquityChart trades={trades} />
-        </div>
-        <div className="glass rounded-2xl p-4 min-w-0">
-          <div className="mb-3">
-            <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
-              보유 비중
-            </h2>
-            <p className="text-[10px] text-slate-600 mt-0.5">종목별 평가액</p>
-          </div>
-          <PositionMixChart
-            positionsKr={positionsKr}
-            positionsUs={positionsUs}
-          />
-        </div>
       </section>
 
       {/* 탭 */}
