@@ -2365,16 +2365,11 @@ function renderPositions(positions) {
           <div class="text-center"><div class="text-slate-500 mb-0.5">수익률</div><div class="font-bold ${pc}">${(pr>=0?'+':'')+pr}%</div></div>
           <div class="text-center"><div class="text-slate-500 mb-0.5">보유</div><div class="text-slate-300 font-medium">${daysHeld}</div></div>
         </div>
-        ${target>0?`
-        <div class="mb-2">
-          <div class="flex justify-between text-xs text-slate-500 mb-1">
-            <span>목표 ${isUS?'$'+parseFloat(target).toFixed(2):target.toLocaleString()}</span>
-            <span>${progress.toFixed(0)}%</span>
-          </div>
-          <div class="h-1.5 rounded-full bg-white/10 overflow-hidden">
-            <div class="h-full rounded-full transition-all" style="width:${progress}%;background:linear-gradient(90deg,#3b82f6,#22c55e)"></div>
-          </div>
-        </div>`:(p.source==='수동'?`<div class="mb-2 text-xs text-slate-600 text-center py-1 rounded-lg" style="background:rgba(255,255,255,.03)">목표가/손절 미설정 — 장마감(15:20) 자동청산</div>`:'')
+        ${(function(){
+          if(target>0) return '<div class="mb-2"><div class="flex justify-between text-xs text-slate-500 mb-1"><span>목표 '+(isUS?'$'+parseFloat(target).toFixed(2):target.toLocaleString())+'</span><span>'+progress.toFixed(0)+'%</span></div><div class="h-1.5 rounded-full bg-white/10 overflow-hidden"><div class="h-full rounded-full transition-all" style="width:'+progress+'%;background:linear-gradient(90deg,#3b82f6,#22c55e)"></div></div></div>';
+          if(p.source==='수동') return '<div class="mb-2 text-xs text-slate-600 text-center py-1 rounded-lg" style="background:rgba(255,255,255,.03)">목표가/손절 미설정 \u2014 장마감(15:20) 자동청산</div>';
+          return '';
+        })()}
         <div class="flex items-center justify-between">
           <span class="text-xs text-red-400">손절 ${isUS?'$'+(p.stop_loss_price||0).toFixed(2):(p.stop_loss_price||0).toLocaleString()}</span>
           <button type="button" class="btn-quick-sell text-xs font-semibold px-3 py-1.5 rounded-lg transition-all" style="background:rgba(239,68,68,.2);color:#fca5a5;border:1px solid rgba(239,68,68,.3)" data-sell-code="${safeCode}" data-sell-market="${sellMkt}">매도</button>
