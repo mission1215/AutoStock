@@ -2443,7 +2443,7 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
     if now_min % 5 == 0 and _check_drawdown(uid, cfg):
         return
 
-    verbose = (now_min % 10 == 0)
+    verbose = (now_min % 5 == 0)
 
     positions = get_positions(uid, "KR")
     for code, pos in list(positions.items()):
@@ -2717,7 +2717,11 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
             # K팩터 진입 슬리피지 필터:
             # 목표가를 이미 max_entry_slip(기본 2%) 이상 지나쳤으면 추격 매수 금지.
             # 돌파 직후 시장가로 들어가야 기대값이 있음.
-            max_slip    = cfg.get("max_entry_slip_pct", 0.02)
+            _is_mock_kr = cfg.get("is_mock", True)
+            max_slip    = cfg.get(
+                "max_entry_slip_pct_mock" if _is_mock_kr else "max_entry_slip_pct_live",
+                cfg.get("max_entry_slip_pct", 0.05 if _is_mock_kr else 0.03)
+            )
             above_target = target <= current <= target * (1 + max_slip)
             above_ma5    = current > ma5
 
@@ -3877,7 +3881,11 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                 today_open = opens_us[0] if opens_us else current
                 k_us       = cfg.get("k_factor", 0.3)
                 target_us  = today_open + k_us * (highs_us[1] - lows_us[1])
-                max_slip   = cfg.get("max_entry_slip_pct", 0.02)
+                _is_mock_us = cfg.get("is_mock", True)
+                max_slip   = cfg.get(
+                    "max_entry_slip_pct_mock" if _is_mock_us else "max_entry_slip_pct_live",
+                    cfg.get("max_entry_slip_pct", 0.05 if _is_mock_us else 0.03)
+                )
                 if target_us > 0 and current > target_us * (1 + max_slip):
                     _add_log(uid, "INFO",
                              f"[US][{code}] 돌파 후 추격 금지 | "
@@ -4493,7 +4501,10 @@ def route_setup():
         "us_watchlist": body.get("us_watchlist", ["AAPL", "NVDA", "TSLA"]),
         "k_factor": float(body.get("k_factor", 0.5)),
         "max_entry_slip_pct": float(body.get("max_entry_slip_pct", 0.05)),
+        "max_entry_slip_pct_mock": float(body.get("max_entry_slip_pct_mock", 0.05)),
+        "max_entry_slip_pct_live": float(body.get("max_entry_slip_pct_live", 0.03)),
         "ma_period": int(body.get("ma_period", 5)),
+        "min_score_kr": int(body.get("min_score_kr", 40)),
         "stop_loss_ratio": float(body.get("stop_loss_ratio", 0.03)),
         "max_position_ratio": float(body.get("max_position_ratio", 0.10)),
         "daily_profit_target": float(body.get("daily_profit_target", 0.03)),
@@ -4924,7 +4935,7 @@ def route_config():
     body = request.get_json() or {}
     allowed = {"is_mock", "kr_watchlist", "us_watchlist", "k_factor", "ma_period",
                 "stop_loss_ratio", "max_position_ratio", "daily_profit_target",
-                "bot_enabled", "ai_stock_count", "min_score_us", "min_score_us_ai",
+                "bot_enabled", "ai_stock_count", "min_score_kr", "min_score_us", "min_score_us_ai",
                 "ai_afford_one_share", "max_us_qty",
                 "partial_tp_enabled", "partial_tp_trigger_pct", "partial_tp_sell_ratio",
                 "partial_tp_tighten_stop",
@@ -4942,7 +4953,7 @@ def route_config():
                 "risk_per_trade_pct",
                 "reconcile_enabled", "fill_check_enabled",
                 "monday_morning_skip_enabled", "monday_morning_skip_min",
-                "max_entry_slip_pct"}
+                "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400
