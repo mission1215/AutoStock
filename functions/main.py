@@ -2972,6 +2972,16 @@ def _research_fallback_response(uid: str, market: str, dk: str, quota: bool, det
     }
 
 
+# Gemini 호출 실패 시 순차 시도 순서 (무료 티어는 모델·메트릭별 한도가 분리되는 경우가 있음)
+_GEMINI_FALLBACK_MODELS: tuple[str, ...] = (
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+)
+
+
 def _gemini_generate_with_fallback(
     client: genai.Client,
     prompt: str,
@@ -2980,14 +2990,18 @@ def _gemini_generate_with_fallback(
     primary_env: str | None = None,
     default_model: str = "gemini-2.0-flash",
 ) -> str:
-    """여러 모델 순차 시도 — 429·모델 미지원 시 다음 후보."""
+    """여러 모델 순차 시도 — 429·모델 미지원 시 다음 후보.
+
+    무료 플랜에서 특정 *-flash-lite 만 limit:0 으로 막히는 경우가 있어
+    동일 계열 비-lite 모델을 먼저 시도합니다. 429 직후 짧은 대기 후 다음 모델.
+    """
     primary = (os.environ.get(primary_env) or default_model).strip() if primary_env else default_model
-    models: list[str] = [primary]
-    for m in ("gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-2.0-flash-lite"):
-        if m not in models:
+    models: list[str] = []
+    for m in (primary, *_GEMINI_FALLBACK_MODELS):
+        if m and m not in models:
             models.append(m)
     last_exc: BaseException | None = None
-    for model in models:
+    for i, model in enumerate(models):
         try:
             response = client.models.generate_content(model=model, contents=prompt)
             text = (response.text or "").strip()
@@ -2997,6 +3011,8 @@ def _gemini_generate_with_fallback(
         except Exception as e:
             last_exc = e
             logger.warning("[%s] model=%s error: %s", log_prefix, model, e)
+            if _is_gemini_quota_error(e) and i + 1 < len(models):
+                time_module.sleep(1.2)
             continue
     if last_exc:
         raise last_exc
@@ -3307,8 +3323,17 @@ def _run_ai_session_impl(
     try:
         candidate_codes, reasons_map = query_gemini_candidates(uid, stock_data, session, market)
     except Exception as e:
-        _add_log(uid, "ERROR", f"[AI] Gemini 오류: {e}")
+        if _is_gemini_quota_error(e):
+            _add_log(
+                uid,
+                "WARNING",
+                "[AI] Gemini 할당량 초과(429) 또는 쿼터 없음 — 알고리즘만으로 후보를 고릅니다. "
+                "Google AI Studio / Cloud Billing에서 요금제·일일 한도를 확인하세요.",
+            )
+        else:
+            _add_log(uid, "ERROR", f"[AI] Gemini 오류: {e}")
         candidate_codes = []
+        reasons_map = {}
 
     # 스코어링 대상: (1) Gemini가 준 후보(최대 20)만 — 알고리즘으로 재정렬 후 상위 N 노출
     # (2) Gemini 실패 시: 입력 유니버스 전체를 스코어링(폴백)
