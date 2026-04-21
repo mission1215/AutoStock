@@ -4492,6 +4492,7 @@ def route_setup():
         "kr_watchlist": body.get("kr_watchlist", ["005930", "000660", "035420"]),
         "us_watchlist": body.get("us_watchlist", ["AAPL", "NVDA", "TSLA"]),
         "k_factor": float(body.get("k_factor", 0.5)),
+        "max_entry_slip_pct": float(body.get("max_entry_slip_pct", 0.05)),
         "ma_period": int(body.get("ma_period", 5)),
         "stop_loss_ratio": float(body.get("stop_loss_ratio", 0.03)),
         "max_position_ratio": float(body.get("max_position_ratio", 0.10)),
@@ -4940,7 +4941,8 @@ def route_config():
                 "us_index_drop_limit_pct", "us_index_proxy",
                 "risk_per_trade_pct",
                 "reconcile_enabled", "fill_check_enabled",
-                "monday_morning_skip_enabled", "monday_morning_skip_min"}
+                "monday_morning_skip_enabled", "monday_morning_skip_min",
+                "max_entry_slip_pct"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400

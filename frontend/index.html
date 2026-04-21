@@ -870,7 +870,8 @@
       </button>
       <div id="settingsBody" class="hidden border-t border-white/5 p-5">
         <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-4">
-          <div><label class="text-xs text-slate-500 block mb-1.5">K 팩터</label><input id="cfgK" type="number" step="0.1"/></div>
+          <div><label class="text-xs text-slate-500 block mb-1.5">K 팩터 <span class="text-[10px] text-slate-600" title="시가 + K × 전일범위 = 매수목표가. 낮을수록 더 쉽게 매수">(?)</span></label><input id="cfgK" type="number" step="0.1" min="0.1" max="1.5"/></div>
+          <div><label class="text-xs text-slate-500 block mb-1.5">추격 허용 폭 (%) <span class="text-[10px] text-slate-600" title="목표가 돌파 후 이 % 이내면 매수. 모의: 5%, 실전: 2~3% 권장">(?)</span></label><input id="cfgSlip" type="number" step="0.5" min="0.5" max="10"/></div>
           <div><label class="text-xs text-slate-500 block mb-1.5">이동평균 기간</label><input id="cfgMA" type="number"/></div>
           <div><label class="text-xs text-slate-500 block mb-1.5">손절 비율 (%)</label><input id="cfgStopLoss" type="number" step="0.1"/></div>
           <div>
@@ -2388,6 +2389,7 @@ function renderPositions(positions) {
 function renderConfig(cfg) {
   const set=(id,v)=>{const e=document.getElementById(id);if(e&&v!==undefined)e.value=v;};
   set('cfgK',cfg.k_factor);
+  set('cfgSlip',cfg.max_entry_slip_pct!=null?(cfg.max_entry_slip_pct*100).toFixed(1):'2.0');
   set('cfgMA',cfg.ma_period);
   set('cfgStopLoss',cfg.stop_loss_ratio!==undefined?(cfg.stop_loss_ratio*100).toFixed(1):'');
   set('cfgMaxPos',cfg.max_position_ratio!==undefined?(cfg.max_position_ratio*100).toFixed(0):'');
@@ -2694,6 +2696,7 @@ async function saveConfig() {
   }
   const payload={
     k_factor:parseFloat(document.getElementById('cfgK').value),
+    max_entry_slip_pct:parseFloat(document.getElementById('cfgSlip').value)/100,
     ma_period:parseInt(document.getElementById('cfgMA').value),
     stop_loss_ratio:parseFloat(document.getElementById('cfgStopLoss').value)/100,
     max_position_ratio:maxPosRaw/100,
