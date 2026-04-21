@@ -3963,6 +3963,17 @@ def scheduled_cleanup_history(event: scheduler_fn.ScheduledEvent) -> None:
 def scheduled_prepare(event: scheduler_fn.ScheduledEvent) -> None:
     for uid, cfg in _get_all_users():
         try:
+            # 전날 로그 정리 (오늘 날짜 기준 2일 이전 삭제 → 로그 무한 누적 방지)
+            cutoff = datetime.now(KST) - timedelta(days=2)
+            old_logs = list(
+                _uref(uid).collection("logs")
+                .where("timestamp", "<", cutoff)
+                .limit(500)
+                .stream()
+            )
+            for doc in old_logs:
+                doc.reference.delete()
+
             invalidate_token(uid)
             get_token(uid, cfg)
             equity = _get_total_equity_kr(uid, cfg)
@@ -3972,7 +3983,7 @@ def scheduled_prepare(event: scheduler_fn.ScheduledEvent) -> None:
                 "start_equity": equity, "peak_equity": equity,
                 "today": date.today().isoformat(),
             })
-            _add_log(uid, "INFO", f"[08:50] 준비 완료 | 기준자산={equity:,.0f}원")
+            _add_log(uid, "INFO", f"[08:50] 준비 완료 | 기준자산={equity:,.0f}원 | 로그초기화완료")
         except Exception as e:
             _add_log(uid, "ERROR", f"[08:50] 초기화 오류: {e}")
 
