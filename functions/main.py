@@ -2945,6 +2945,109 @@ def _is_gemini_quota_error(exc: BaseException) -> bool:
     return False
 
 
+class GeminiQuotaBudgetExhausted(Exception):
+    """환경변수 GEMINI_DAILY_CALL_BUDGET(일일 API 호출 상한) 소진."""
+
+
+def _gemini_daily_budget() -> int:
+    """0이면 무제한(기본). 양수면 UTC 자정 기준 일일 카운터 상한."""
+    raw = (os.environ.get("GEMINI_DAILY_CALL_BUDGET") or "0").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _gemini_quota_doc_ref():
+    dk = datetime.now(timezone.utc).date().isoformat()
+    return get_db().collection("gemini_quota").document(dk)
+
+
+def _gemini_calls_today() -> int:
+    try:
+        snap = _gemini_quota_doc_ref().get()
+        if not snap.exists:
+            return 0
+        return int((snap.to_dict() or {}).get("calls", 0))
+    except Exception:
+        return 0
+
+
+def _gemini_allow_new_call() -> bool:
+    b = _gemini_daily_budget()
+    if b <= 0:
+        return True
+    return _gemini_calls_today() < b
+
+
+@transactional
+def _gemini_increment_txn(transaction, ref):
+    snap = ref.get(transaction=transaction)
+    c = int((snap.to_dict() or {}).get("calls", 0))
+    transaction.set(ref, {"calls": c + 1}, merge=True)
+
+
+def _gemini_increment_call() -> None:
+    try:
+        ref = _gemini_quota_doc_ref()
+        txn = get_db().transaction()
+        _gemini_increment_txn(txn, ref)
+    except Exception as e:
+        logger.warning("[gemini_quota] increment failed: %s", e)
+
+
+def _ai_candidates_cache_doc_id(market: str, session: str, dk: str) -> str:
+    return f"ai_candidates_{market}_{session}_{dk}"
+
+
+def _load_ai_candidates_cache(
+    uid: str, market: str, session: str, dk: str,
+) -> tuple[list[str], dict[str, str]] | None:
+    ref = _uref(uid).collection("cache").document(_ai_candidates_cache_doc_id(market, session, dk))
+    snap = ref.get()
+    if not snap.exists:
+        return None
+    d = snap.to_dict() or {}
+    codes = d.get("candidate_codes")
+    reasons = d.get("reasons_map") or {}
+    if not isinstance(codes, list) or not codes:
+        return None
+    return [str(x).strip() for x in codes if str(x).strip()], dict(reasons)
+
+
+def _save_ai_candidates_cache(
+    uid: str, market: str, session: str, dk: str,
+    candidate_codes: list[str], reasons_map: dict[str, str],
+) -> None:
+    try:
+        _uref(uid).collection("cache").document(_ai_candidates_cache_doc_id(market, session, dk)).set(
+            {
+                "candidate_codes": candidate_codes,
+                "reasons_map": reasons_map,
+                "market": market,
+                "session": session,
+                "date_key": dk,
+                "updated_at": datetime.now(KST).isoformat(),
+            },
+            merge=True,
+        )
+    except Exception as e:
+        logger.warning("[Gemini] 후보 캐시 저장 실패: %s", e)
+
+
+def _load_any_fallback_ai_cache(
+    uid: str, market: str, dk: str,
+) -> tuple[list[str], dict[str, str]] | None:
+    """같은 거래일·같은 시장에서 이미 성공한 세션 캐시를 late → afternoon → morning 순으로 탐색."""
+    for sess in ("late", "afternoon", "morning"):
+        hit = _load_ai_candidates_cache(uid, market, sess, dk)
+        if hit and hit[0]:
+            return hit
+    return None
+
+
 def _research_fallback_response(uid: str, market: str, dk: str, quota: bool, detail: str = "") -> dict:
     """Gemini 실패 시 Firestore에 쓰지 않고 UI용 문구만 반환."""
     if quota:
@@ -2994,7 +3097,11 @@ def _gemini_generate_with_fallback(
 
     무료 플랜에서 특정 *-flash-lite 만 limit:0 으로 막히는 경우가 있어
     동일 계열 비-lite 모델을 먼저 시도합니다. 429 직후 짧은 대기 후 다음 모델.
+
+    GEMINI_DAILY_CALL_BUDGET>0 이면 성공 응답 1회당 gemini_quota/{UTC날짜}.calls 를 +1.
     """
+    if not _gemini_allow_new_call():
+        raise GeminiQuotaBudgetExhausted("GEMINI_DAILY_CALL_BUDGET 초과")
     primary = (os.environ.get(primary_env) or default_model).strip() if primary_env else default_model
     models: list[str] = []
     for m in (primary, *_GEMINI_FALLBACK_MODELS):
@@ -3007,6 +3114,7 @@ def _gemini_generate_with_fallback(
             text = (response.text or "").strip()
             if text:
                 logger.info("[%s] ok model=%s", log_prefix, model)
+                _gemini_increment_call()
                 return text
         except Exception as e:
             last_exc = e
@@ -3057,6 +3165,20 @@ def get_or_create_daily_research(uid: str, market: str, force_refresh: bool = Fa
             "fallback": True,
         }
 
+    if not _gemini_allow_new_call():
+        return {
+            "market": market,
+            "date": dk,
+            "title": "AI 리서치 — 호출 예산",
+            "bullets": [
+                "오늘 설정된 Gemini 일일 호출 예산(GEMINI_DAILY_CALL_BUDGET)을 모두 사용했습니다.",
+                "카운터는 UTC 자정 기준으로 갱신됩니다. 내일 다시 시도하거나 예산을 늘리세요.",
+            ],
+            "cached": False,
+            "fallback": True,
+            "budget_exceeded": True,
+        }
+
     client = genai.Client(api_key=api_key)
     if market == "US":
         prompt = """You are a US equity strategist. Write a concise Korean summary for retail investors about what to watch today in US markets (indices mood, key sectors, volatility/risk). Do not claim real-time prices.
@@ -3071,6 +3193,19 @@ Use exactly 3 bullets, each under 120 characters."""
 
     try:
         raw_text = _generate_research_content(client, prompt)
+    except GeminiQuotaBudgetExhausted:
+        return {
+            "market": market,
+            "date": dk,
+            "title": "AI 리서치 — 호출 예산",
+            "bullets": [
+                "Gemini 호출 직전에 일일 예산이 소진되었습니다(동시 요청 등).",
+                "잠시 후 새로고침하거나 GEMINI_DAILY_CALL_BUDGET을 조정해 주세요.",
+            ],
+            "cached": False,
+            "fallback": True,
+            "budget_exceeded": True,
+        }
     except Exception as e:
         return _research_fallback_response(
             uid, market, dk, quota=_is_gemini_quota_error(e), detail=str(e)
@@ -3150,6 +3285,21 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
+
+    dk = _research_date_key(market)
+    hit = _load_ai_candidates_cache(uid, market, session, dk)
+    if hit and hit[0]:
+        _add_log(uid, "INFO", f"[Gemini] 세션 캐시 사용 ({market}/{session})")
+        return hit
+
+    if not _gemini_allow_new_call():
+        fb = _load_any_fallback_ai_cache(uid, market, dk)
+        if fb and fb[0]:
+            _add_log(uid, "INFO", "[Gemini] 일일 예산 소진 — 다른 세션 캐시 사용")
+            return fb
+        _add_log(uid, "WARNING", "[Gemini] 일일 예산 소진·캐시 없음 — 알고리즘만으로 진행")
+        return [], {}
+
     client = genai.Client(api_key=api_key)
     session_labels = {"morning": "오전 (09:30)", "afternoon": "오후 (13:00)", "late": "마감 (15:30)"}
     us_sessions    = {"morning": "오전 (ET 10:30)", "afternoon": "오후 (ET 13:00)", "late": "마감 (ET 15:30)"}
@@ -3241,9 +3391,16 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
 
 허용 종목코드(이 중에서만 선택): {allowed_flat}
 """
-    raw_text = _gemini_generate_with_fallback(
-        client, prompt, log_prefix="candidates", primary_env="GEMINI_MODEL_AI", default_model="gemini-2.0-flash"
-    )
+    try:
+        raw_text = _gemini_generate_with_fallback(
+            client, prompt, log_prefix="candidates", primary_env="GEMINI_MODEL_AI", default_model="gemini-2.0-flash"
+        )
+    except GeminiQuotaBudgetExhausted:
+        fb = _load_any_fallback_ai_cache(uid, market, dk)
+        if fb and fb[0]:
+            _add_log(uid, "INFO", "[Gemini] 예산 한도 직전 경쟁 — 캐시 사용")
+            return fb
+        return [], {}
     clean = re.sub(r"```(?:json)?", "", raw_text).strip().rstrip("`").strip()
     parsed = json.loads(clean)
     raw_candidates = parsed.get("candidates", [])[:GEMINI_MAX_CANDIDATES]
@@ -3266,6 +3423,8 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
         candidate_codes.append(code)
         if reason:
             reasons_map[code] = reason
+    if candidate_codes:
+        _save_ai_candidates_cache(uid, market, session, dk, candidate_codes, reasons_map)
     _add_log(uid, "INFO", f"[Gemini] {session_label} 후보 {len(candidate_codes)}종목")
     return candidate_codes, reasons_map
 
