@@ -30,6 +30,9 @@ logs/
 # macOS
 .DS_Store
 
+# 로컬 백업·임시 복사본 (커밋 제외)
+*.bak
+
 # Firebase 로컬 캐시
 .firebase/
 
