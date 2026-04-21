@@ -1,90 +1,144 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { apiFetch } from "../api/client";
-import type { AppConfig } from "../types";
+import type { AppConfig, ModeProfiles } from "../types";
+
+type StrategyFormState = {
+  k: string;
+  ma: string;
+  stopPct: string;
+  maxPct: string;
+  dailyPct: string;
+  krWl: string;
+  usWl: string;
+  aiCount: number;
+  partialTpEn: boolean;
+  partialTpTrig: string;
+  partialTpSell: string;
+  partialTpTight: boolean;
+  slipMockPct: string;
+  slipLivePct: string;
+};
+
+function emptyForm(): StrategyFormState {
+  return {
+    k: "",
+    ma: "",
+    stopPct: "",
+    maxPct: "",
+    dailyPct: "",
+    krWl: "",
+    usWl: "",
+    aiCount: 3,
+    partialTpEn: true,
+    partialTpTrig: "5",
+    partialTpSell: "30",
+    partialTpTight: true,
+    slipMockPct: "5",
+    slipLivePct: "3",
+  };
+}
+
+function configToForm(config: Partial<AppConfig> | undefined): StrategyFormState {
+  if (!config) return emptyForm();
+  return {
+    k: String(config.k_factor ?? 0.5),
+    ma: String(config.ma_period ?? 5),
+    stopPct:
+      config.stop_loss_ratio != null
+        ? (config.stop_loss_ratio * 100).toFixed(1)
+        : "",
+    maxPct:
+      config.max_position_ratio != null
+        ? String(Math.round(config.max_position_ratio * 100))
+        : "",
+    dailyPct:
+      config.daily_profit_target != null
+        ? (config.daily_profit_target * 100).toFixed(1)
+        : "",
+    krWl: Array.isArray(config.kr_watchlist)
+      ? config.kr_watchlist.join(",")
+      : String(config.kr_watchlist || ""),
+    usWl: Array.isArray(config.us_watchlist)
+      ? config.us_watchlist.join(",")
+      : String(config.us_watchlist || ""),
+    aiCount: parseInt(String(config.ai_stock_count), 10) || 3,
+    partialTpEn: config.partial_tp_enabled !== false,
+    partialTpTrig:
+      config.partial_tp_trigger_pct != null
+        ? (config.partial_tp_trigger_pct * 100).toFixed(1)
+        : "5",
+    partialTpSell:
+      config.partial_tp_sell_ratio != null
+        ? String(Math.round(config.partial_tp_sell_ratio * 100))
+        : "30",
+    partialTpTight: config.partial_tp_tighten_stop !== false,
+    slipMockPct:
+      config.max_entry_slip_pct_mock != null
+        ? (config.max_entry_slip_pct_mock * 100).toFixed(1)
+        : "5",
+    slipLivePct:
+      config.max_entry_slip_pct_live != null
+        ? (config.max_entry_slip_pct_live * 100).toFixed(1)
+        : "3",
+  };
+}
 
 export function StrategySettings({
   idToken,
   config,
+  profiles,
   onSaved,
 }: {
   idToken: string;
   config: AppConfig | undefined;
+  profiles?: ModeProfiles;
   onSaved: () => void;
 }) {
-  const [k, setK] = useState("");
-  const [ma, setMa] = useState("");
-  const [stopPct, setStopPct] = useState("");
-  const [maxPct, setMaxPct] = useState("");
-  const [dailyPct, setDailyPct] = useState("");
-  const [krWl, setKrWl] = useState("");
-  const [usWl, setUsWl] = useState("");
+  const [mockForm, setMockForm] = useState<StrategyFormState>(() =>
+    emptyForm(),
+  );
+  const [liveForm, setLiveForm] = useState<StrategyFormState>(() =>
+    emptyForm(),
+  );
   const [isMock, setIsMock] = useState(true);
-  const [aiCount, setAiCount] = useState(3);
-  const [partialTpEn, setPartialTpEn] = useState(true);
-  const [partialTpTrig, setPartialTpTrig] = useState("5");
-  const [partialTpSell, setPartialTpSell] = useState("30");
-  const [partialTpTight, setPartialTpTight] = useState(true);
-  const [slipMockPct, setSlipMockPct] = useState("5");
-  const [slipLivePct, setSlipLivePct] = useState("3");
+  const [dirty, setDirty] = useState(false);
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
 
+  const profilesStr = useMemo(
+    () => (profiles ? JSON.stringify(profiles) : ""),
+    [profiles],
+  );
+
   useEffect(() => {
-    if (!config) return;
-    setK(String(config.k_factor ?? 0.5));
-    setMa(String(config.ma_period ?? 5));
-    setStopPct(
-      config.stop_loss_ratio != null
-        ? (config.stop_loss_ratio * 100).toFixed(1)
-        : "",
-    );
-    setMaxPct(
-      config.max_position_ratio != null
-        ? String(Math.round(config.max_position_ratio * 100))
-        : "",
-    );
-    setDailyPct(
-      config.daily_profit_target != null
-        ? (config.daily_profit_target * 100).toFixed(1)
-        : "",
-    );
-    setKrWl(
-      Array.isArray(config.kr_watchlist)
-        ? config.kr_watchlist.join(",")
-        : String(config.kr_watchlist || ""),
-    );
-    setUsWl(
-      Array.isArray(config.us_watchlist)
-        ? config.us_watchlist.join(",")
-        : String(config.us_watchlist || ""),
-    );
-    setIsMock(config.is_mock !== false);
-    setAiCount(parseInt(String(config.ai_stock_count), 10) || 3);
-    setPartialTpEn(config.partial_tp_enabled !== false);
-    setPartialTpTrig(
-      config.partial_tp_trigger_pct != null
-        ? (config.partial_tp_trigger_pct * 100).toFixed(1)
-        : "5",
-    );
-    setPartialTpSell(
-      config.partial_tp_sell_ratio != null
-        ? String(Math.round(config.partial_tp_sell_ratio * 100))
-        : "30",
-    );
-    setPartialTpTight(config.partial_tp_tighten_stop !== false);
-    setSlipMockPct(
-      config.max_entry_slip_pct_mock != null
-        ? (config.max_entry_slip_pct_mock * 100).toFixed(1)
-        : "5",
-    );
-    setSlipLivePct(
-      config.max_entry_slip_pct_live != null
-        ? (config.max_entry_slip_pct_live * 100).toFixed(1)
-        : "3",
-    );
-  }, [config]);
+    if (dirty) return;
+    if (profiles?.mock != null && profiles?.live != null) {
+      setMockForm(configToForm(profiles.mock));
+      setLiveForm(configToForm(profiles.live));
+      if (config) setIsMock(config.is_mock !== false);
+      return;
+    }
+    if (config) {
+      const f = configToForm(config);
+      setMockForm(f);
+      setLiveForm(f);
+      setIsMock(config.is_mock !== false);
+    }
+  }, [profilesStr, config, dirty]);
+
+  const form = isMock ? mockForm : liveForm;
+
+  function patchActive(patch: Partial<StrategyFormState>) {
+    setDirty(true);
+    if (isMock) {
+      setMockForm((prev) => ({ ...prev, ...patch }));
+    } else {
+      setLiveForm((prev) => ({ ...prev, ...patch }));
+    }
+  }
 
   async function save() {
+    const f = form;
     if (!isMock) {
       if (
         !window.confirm(
@@ -93,7 +147,7 @@ export function StrategySettings({
       )
         return;
     }
-    const maxPosRaw = parseFloat(maxPct);
+    const maxPosRaw = parseFloat(f.maxPct);
     if (isNaN(maxPosRaw) || maxPosRaw <= 0 || maxPosRaw > 100) {
       setMsg("❌ 최대 비중은 1~100 사이로 입력해 주세요.");
       return;
@@ -102,27 +156,27 @@ export function StrategySettings({
     setMsg("저장 중…");
     try {
       const payload = {
-        k_factor: parseFloat(k) || 0.5,
-        ma_period: parseInt(ma, 10) || 5,
-        stop_loss_ratio: (parseFloat(stopPct) || 0) / 100,
+        k_factor: parseFloat(f.k) || 0.5,
+        ma_period: parseInt(f.ma, 10) || 5,
+        stop_loss_ratio: (parseFloat(f.stopPct) || 0) / 100,
         max_position_ratio: maxPosRaw / 100,
-        daily_profit_target: (parseFloat(dailyPct) || 0) / 100,
-        kr_watchlist: krWl
+        daily_profit_target: (parseFloat(f.dailyPct) || 0) / 100,
+        kr_watchlist: f.krWl
           .split(",")
           .map((s) => s.trim())
           .filter(Boolean),
-        us_watchlist: usWl
+        us_watchlist: f.usWl
           .split(",")
           .map((s) => s.trim().toUpperCase())
           .filter(Boolean),
         is_mock: isMock,
-        ai_stock_count: aiCount,
-        partial_tp_enabled: partialTpEn,
-        partial_tp_trigger_pct: (parseFloat(partialTpTrig) || 5) / 100,
-        partial_tp_sell_ratio: (parseFloat(partialTpSell) || 30) / 100,
-        partial_tp_tighten_stop: partialTpTight,
-        max_entry_slip_pct_mock: (parseFloat(slipMockPct) || 5) / 100,
-        max_entry_slip_pct_live: (parseFloat(slipLivePct) || 3) / 100,
+        ai_stock_count: f.aiCount,
+        partial_tp_enabled: f.partialTpEn,
+        partial_tp_trigger_pct: (parseFloat(f.partialTpTrig) || 5) / 100,
+        partial_tp_sell_ratio: (parseFloat(f.partialTpSell) || 30) / 100,
+        partial_tp_tighten_stop: f.partialTpTight,
+        max_entry_slip_pct_mock: (parseFloat(f.slipMockPct) || 5) / 100,
+        max_entry_slip_pct_live: (parseFloat(f.slipLivePct) || 3) / 100,
       };
       const data = await apiFetch<{ ok: boolean; error?: string }>(
         "/api/config",
@@ -133,6 +187,7 @@ export function StrategySettings({
         },
       );
       if (data.ok) {
+        setDirty(false);
         setMsg("✅ 저장 완료");
         onSaved();
         setTimeout(() => setMsg(""), 2500);
@@ -158,6 +213,10 @@ export function StrategySettings({
         </span>
       </summary>
       <div className="p-4 sm:p-5 border-t border-white/5">
+        <p className="text-[11px] text-slate-500 mb-3">
+          모의·실전 각각 별도 저장됩니다. 투자 모드를 바꾸면 해당 모드에 저장된 값이
+          표시됩니다.
+        </p>
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-4">
           <div>
             <label className="text-xs text-slate-500 block mb-1">K 팩터</label>
@@ -165,8 +224,8 @@ export function StrategySettings({
               type="number"
               step="0.1"
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-              value={k}
-              onChange={(e) => setK(e.target.value)}
+              value={form.k}
+              onChange={(e) => patchActive({ k: e.target.value })}
             />
           </div>
           <div>
@@ -174,8 +233,8 @@ export function StrategySettings({
             <input
               type="number"
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-              value={ma}
-              onChange={(e) => setMa(e.target.value)}
+              value={form.ma}
+              onChange={(e) => patchActive({ ma: e.target.value })}
             />
           </div>
           <div>
@@ -184,8 +243,8 @@ export function StrategySettings({
               type="number"
               step="0.1"
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-              value={stopPct}
-              onChange={(e) => setStopPct(e.target.value)}
+              value={form.stopPct}
+              onChange={(e) => patchActive({ stopPct: e.target.value })}
             />
           </div>
           <div>
@@ -195,8 +254,8 @@ export function StrategySettings({
               min={1}
               max={100}
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-              value={maxPct}
-              onChange={(e) => setMaxPct(e.target.value)}
+              value={form.maxPct}
+              onChange={(e) => patchActive({ maxPct: e.target.value })}
             />
           </div>
           <div>
@@ -205,8 +264,8 @@ export function StrategySettings({
               type="number"
               step="0.1"
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-              value={dailyPct}
-              onChange={(e) => setDailyPct(e.target.value)}
+              value={form.dailyPct}
+              onChange={(e) => patchActive({ dailyPct: e.target.value })}
             />
           </div>
           <div className="md:col-span-2">
@@ -215,8 +274,8 @@ export function StrategySettings({
             </label>
             <input
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-              value={krWl}
-              onChange={(e) => setKrWl(e.target.value)}
+              value={form.krWl}
+              onChange={(e) => patchActive({ krWl: e.target.value })}
               placeholder="005930,000660"
             />
           </div>
@@ -226,8 +285,8 @@ export function StrategySettings({
             </label>
             <input
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-              value={usWl}
-              onChange={(e) => setUsWl(e.target.value)}
+              value={form.usWl}
+              onChange={(e) => patchActive({ usWl: e.target.value })}
               placeholder="AAPL,NVDA"
             />
           </div>
@@ -236,7 +295,10 @@ export function StrategySettings({
             <select
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
               value={isMock ? "mock" : "real"}
-              onChange={(e) => setIsMock(e.target.value === "mock")}
+              onChange={(e) => {
+                setIsMock(e.target.value === "mock");
+                setDirty(true);
+              }}
             >
               <option value="mock">모의투자</option>
               <option value="real">실전투자 ⚠️</option>
@@ -249,9 +311,9 @@ export function StrategySettings({
                 <button
                   key={n}
                   type="button"
-                  onClick={() => setAiCount(n)}
+                  onClick={() => patchActive({ aiCount: n })}
                   className={`flex-1 py-2 rounded-lg text-sm font-bold ${
-                    aiCount === n
+                    form.aiCount === n
                       ? "bg-indigo-600 text-white"
                       : "bg-white/5 text-slate-500"
                   }`}
@@ -272,8 +334,8 @@ export function StrategySettings({
               <input
                 type="checkbox"
                 className="rounded border-white/20"
-                checked={partialTpEn}
-                onChange={(e) => setPartialTpEn(e.target.checked)}
+                checked={form.partialTpEn}
+                onChange={(e) => patchActive({ partialTpEn: e.target.checked })}
               />
               분할익절 사용
             </label>
@@ -287,8 +349,8 @@ export function StrategySettings({
                 min={0.5}
                 title="평단 대비"
                 className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-                value={partialTpTrig}
-                onChange={(e) => setPartialTpTrig(e.target.value)}
+                value={form.partialTpTrig}
+                onChange={(e) => patchActive({ partialTpTrig: e.target.value })}
               />
             </div>
             <div>
@@ -302,16 +364,16 @@ export function StrategySettings({
                 max={90}
                 title="보유 수량 중"
                 className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-                value={partialTpSell}
-                onChange={(e) => setPartialTpSell(e.target.value)}
+                value={form.partialTpSell}
+                onChange={(e) => patchActive({ partialTpSell: e.target.value })}
               />
             </div>
             <label className="flex items-center gap-2 text-xs text-slate-300 md:col-span-2 cursor-pointer">
               <input
                 type="checkbox"
                 className="rounded border-white/20"
-                checked={partialTpTight}
-                onChange={(e) => setPartialTpTight(e.target.checked)}
+                checked={form.partialTpTight}
+                onChange={(e) => patchActive({ partialTpTight: e.target.checked })}
               />
               익절 후 손절선 본전 상향
             </label>
@@ -323,8 +385,8 @@ export function StrategySettings({
                 type="number"
                 step="0.1"
                 className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-                value={slipMockPct}
-                onChange={(e) => setSlipMockPct(e.target.value)}
+                value={form.slipMockPct}
+                onChange={(e) => patchActive({ slipMockPct: e.target.value })}
               />
             </div>
             <div>
@@ -335,8 +397,8 @@ export function StrategySettings({
                 type="number"
                 step="0.1"
                 className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
-                value={slipLivePct}
-                onChange={(e) => setSlipLivePct(e.target.value)}
+                value={form.slipLivePct}
+                onChange={(e) => patchActive({ slipLivePct: e.target.value })}
               />
             </div>
           </div>

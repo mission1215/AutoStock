@@ -508,18 +508,121 @@ def verify_token(req) -> str:
 
 
 # ══════════════════════════════════════════════════════════
-# 설정 관리 (per-user)
+# 설정 관리 (per-user) — 모의/실전 프로필 분리
 # ══════════════════════════════════════════════════════════
 
-def get_config(uid: str) -> dict:
+# Firestore config/settings: { is_mock, setup_complete, profiles: { mock: {...}, live: {...} } }
+# 레거시(평면 1문서)는 get_config 시 그대로 읽고, save_config 시 profiles 로 이관.
+_CONFIG_TOP_KEYS = frozenset({"is_mock", "setup_complete", "display_name", "email", "created_at"})
+_CONFIG_PROFILE_KEYS = frozenset({
+    "app_key", "app_secret", "account_no",
+    "kr_watchlist", "us_watchlist", "k_factor", "ma_period",
+    "stop_loss_ratio", "max_position_ratio", "daily_profit_target",
+    "ai_stock_count", "min_score_kr", "min_score_us", "min_score_us_ai",
+    "ai_afford_one_share", "max_us_qty",
+    "partial_tp_enabled", "partial_tp_trigger_pct", "partial_tp_sell_ratio",
+    "partial_tp_tighten_stop",
+    "avg_down_enabled", "avg_down_trigger_pct", "avg_down_max_times",
+    "avg_down_qty_ratio", "avg_down_min_interval_hours",
+    "trailing_stop_enabled", "trailing_stop_pct", "trailing_stop_activate_pct",
+    "breakeven_stop_enabled", "breakeven_trigger_pct",
+    "time_stop_enabled", "time_stop_days", "time_stop_flat_pct",
+    "partial_tp_tighten_buffer_pct",
+    "kr_sell_ord_dvsn",
+    "kr_skip_buy_first_min", "kr_skip_buy_last_min",
+    "us_skip_buy_first_min", "us_skip_buy_last_min",
+    "daily_loss_limit", "kr_index_drop_limit_pct",
+    "us_index_drop_limit_pct", "us_index_proxy",
+    "risk_per_trade_pct",
+    "reconcile_enabled", "fill_check_enabled",
+    "monday_morning_skip_enabled", "monday_morning_skip_min",
+    "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live",
+    "bot_enabled",
+})
+
+
+def _sanitize_profile_for_client(prof: dict) -> dict:
+    return {k: v for k, v in prof.items() if k not in ("app_key", "app_secret")}
+
+
+def _profiles_for_client_payload(raw: dict) -> dict:
+    """GET 응답용 mock/live 프로필 (비밀키 제거). 레거시 평면 문서는 ensure 후 양쪽에 복제."""
+    if not raw:
+        return {"mock": {}, "live": {}}
+    merged = _ensure_profiles_structure(dict(raw))
+    profs = merged.get("profiles") or {}
+    return {
+        "mock": _sanitize_profile_for_client(dict(profs.get("mock") or {})),
+        "live": _sanitize_profile_for_client(dict(profs.get("live") or {})),
+    }
+
+
+def _ensure_profiles_structure(raw: dict) -> dict:
+    if "profiles" in raw and isinstance(raw.get("profiles"), dict):
+        p = raw["profiles"]
+        return {
+            **raw,
+            "profiles": {
+                "mock": dict(p.get("mock") or {}),
+                "live": dict(p.get("live") or {}),
+            },
+        }
+    prof = {k: raw[k] for k in _CONFIG_PROFILE_KEYS if k in raw}
+    cleaned = {k: v for k, v in raw.items() if k not in _CONFIG_PROFILE_KEYS}
+    cleaned["profiles"] = {"mock": prof.copy(), "live": prof.copy()}
+    return cleaned
+
+
+def get_config_raw(uid: str) -> dict:
     doc = _uref(uid).collection("config").document("settings").get()
-    if doc.exists:
-        return doc.to_dict()
-    return {}
+    if not doc.exists:
+        return {}
+    return doc.to_dict() or {}
+
+
+def get_config(uid: str) -> dict:
+    """활성 모드(mock/live) 프로필 + 공통 메타를 평면 dict 로 병합 (기존 코드 호환)."""
+    raw = get_config_raw(uid)
+    if not raw:
+        return {}
+    if "profiles" not in raw or not isinstance(raw.get("profiles"), dict):
+        return raw
+    raw = _ensure_profiles_structure(raw)
+    mode = "mock" if raw.get("is_mock", True) else "live"
+    p = raw["profiles"].get(mode) or {}
+    out = {**p}
+    out["is_mock"] = raw.get("is_mock", True)
+    for k in ("setup_complete", "display_name", "email", "created_at"):
+        if k in raw:
+            out[k] = raw[k]
+    return out
 
 
 def save_config(uid: str, data: dict):
-    _uref(uid).collection("config").document("settings").set(data, merge=True)
+    """병합 저장: is_mock 등은 최상위, 전략·API키는 현재 모드 프로필에만 기록."""
+    ref = _uref(uid).collection("config").document("settings")
+    snap = ref.get()
+    raw = snap.to_dict() if snap.exists else {}
+    raw = _ensure_profiles_structure(raw)
+    profiles = raw.get("profiles") or {"mock": {}, "live": {}}
+    for k in _CONFIG_TOP_KEYS:
+        if k in data:
+            raw[k] = data[k]
+    is_m = raw.get("is_mock", True)
+    if isinstance(is_m, str):
+        is_m = str(is_m).lower() not in ("false", "0", "no", "")
+    raw["is_mock"] = bool(is_m)
+    mode = "mock" if raw["is_mock"] else "live"
+    prof = dict(profiles.get(mode) or {})
+    for k, v in data.items():
+        if k in _CONFIG_PROFILE_KEYS:
+            prof[k] = v
+    profiles[mode] = prof
+    raw["profiles"] = profiles
+    for k in list(raw.keys()):
+        if k in _CONFIG_PROFILE_KEYS:
+            del raw[k]
+    ref.set(raw)
 
 
 def _base_url(is_mock: bool) -> str:
@@ -4676,11 +4779,14 @@ def route_setup():
     for f in required:
         if not body.get(f):
             return jsonify({"ok": False, "error": f"{f} 필수"}), 400
-    cfg = {
+    is_m = body.get("is_mock", True)
+    if isinstance(is_m, str):
+        is_m = str(is_m).lower() not in ("false", "0", "no", "")
+    cfg_flat = {
         "app_key": body["app_key"].strip(),
         "app_secret": body["app_secret"].strip(),
         "account_no": body["account_no"].strip(),
-        "is_mock": body.get("is_mock", True),
+        "is_mock": is_m,
         "kr_watchlist": body.get("kr_watchlist", ["005930", "000660", "035420"]),
         "us_watchlist": body.get("us_watchlist", ["AAPL", "NVDA", "TSLA"]),
         "k_factor": float(body.get("k_factor", 0.5)),
@@ -4699,10 +4805,25 @@ def route_setup():
         "setup_complete": True,
         "created_at": datetime.now(KST).isoformat(),
     }
-    save_config(uid, cfg)
+    prof = {k: cfg_flat[k] for k in _CONFIG_PROFILE_KEYS if k in cfg_flat}
+    mode = "mock" if is_m else "live"
+    other = "live" if mode == "mock" else "mock"
+    seed_other = {k: v for k, v in prof.items() if k not in ("app_key", "app_secret", "account_no")}
+    doc_out = {
+        "is_mock": is_m,
+        "setup_complete": True,
+        "display_name": cfg_flat.get("display_name", ""),
+        "email": cfg_flat.get("email", ""),
+        "created_at": cfg_flat.get("created_at", ""),
+        "profiles": {
+            mode: prof,
+            other: seed_other,
+        },
+    }
+    _uref(uid).collection("config").document("settings").set(doc_out)
     update_bot_state(uid, {"bot_enabled": True, "trading_halted": False,
                             "is_market_open": False, "realized_pnl": 0.0})
-    _add_log(uid, "INFO", f"계정 설정 완료 | 모드={'모의' if cfg['is_mock'] else '실전'}")
+    _add_log(uid, "INFO", f"계정 설정 완료 | 모드={'모의' if is_m else '실전'} (프로필 분리 저장)")
     return jsonify({"ok": True, "message": "설정 완료"})
 
 
@@ -4712,8 +4833,14 @@ def route_status():
     if err: return err
     try:
         cfg = get_config(uid)
+        raw_cfg = get_config_raw(uid)
+        profiles_payload = _profiles_for_client_payload(raw_cfg)
         if not cfg.get("setup_complete"):
-            return jsonify({"ok": True, "setup_required": True})
+            return jsonify({
+                "ok": True,
+                "setup_required": True,
+                "profiles": profiles_payload,
+            })
 
         state = get_bot_state(uid)
         positions_kr = get_positions(uid, "KR")
@@ -4946,6 +5073,7 @@ def route_status():
             "positions_kr": positions_kr_detail, "positions_us": positions_us_detail,
             "watchlist_data": watchlist_data, "us_watchlist_data": us_watchlist_data,
             "config": safe_cfg,
+            "profiles": profiles_payload,
             "mode": "모의투자" if cfg.get("is_mock") else "실전투자",
             "updated_at": datetime.now(KST).strftime("%H:%M:%S"),
             "kis_error": kis_error,
@@ -5114,8 +5242,10 @@ def route_config():
     if err: return err
     if request.method == "GET":
         cfg = get_config(uid)
+        raw_cfg = get_config_raw(uid)
+        profiles_payload = _profiles_for_client_payload(raw_cfg)
         safe = {k: v for k, v in cfg.items() if k not in ("app_key", "app_secret")}
-        return jsonify({"ok": True, "config": safe})
+        return jsonify({"ok": True, "config": safe, "profiles": profiles_payload})
     body = request.get_json() or {}
     allowed = {"is_mock", "kr_watchlist", "us_watchlist", "k_factor", "ma_period",
                 "stop_loss_ratio", "max_position_ratio", "daily_profit_target",

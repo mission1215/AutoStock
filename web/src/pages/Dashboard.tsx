@@ -580,6 +580,7 @@ export function Dashboard({
       <StrategySettings
         idToken={idToken}
         config={cfg}
+        profiles={status?.profiles}
         onSaved={() => loadStatus()}
       />
 

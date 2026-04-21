@@ -6,6 +6,12 @@ export interface BotState {
   realized_pnl?: number;
 }
 
+/** GET /api/status, /api/config — 모의·실전 전략·키 분리 저장용 */
+export interface ModeProfiles {
+  mock?: AppConfig;
+  live?: AppConfig;
+}
+
 export interface StatusResponse {
   ok: boolean;
   setup_required?: boolean;
@@ -16,6 +22,8 @@ export interface StatusResponse {
   watchlist_data?: Record<string, WatchlistEntry>;
   us_watchlist_data?: Record<string, WatchlistEntry>;
   config?: AppConfig;
+  /** 서버 저장 mock/live 프로필 (app_key/app_secret 제외) */
+  profiles?: ModeProfiles;
   updated_at?: string;
   kis_error?: string | null;
   error?: string;
