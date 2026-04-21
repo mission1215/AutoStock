@@ -982,6 +982,9 @@
 <!-- 토스트 -->
 <div id="toast" class="fixed bottom-5 right-5 glass rounded-2xl px-4 py-3 text-sm text-white shadow-2xl opacity-0 transition-opacity duration-300 pointer-events-none max-w-xs z-[90] border border-white/10"></div>
 
+<!-- 매도 완료 알림 스택 -->
+<div id="sellNoticeStack" class="fixed bottom-5 right-5 flex flex-col gap-2 z-[95] pointer-events-none" style="max-width:22rem"></div>
+
 <!-- 주문 성공 안내 (매도 등 눈에 띄게) -->
 <div id="modalOrderSuccess" class="hidden fixed inset-0 z-[160] flex items-center justify-center px-4" style="background:rgba(6,11,24,.75);backdrop-filter:blur(6px)" onclick="if(event.target===this)closeOrderSuccessModal()">
   <div class="w-full max-w-sm glass rounded-3xl p-6 border border-white/10 shadow-2xl fade-up" role="dialog" aria-modal="true" aria-labelledby="modalOrderSuccessTitle" onclick="event.stopPropagation()">
@@ -1011,6 +1014,7 @@
 //  앱 상태
 // ════════════════════════════════════════════════════════
 let currentTab='auto', currentMarket='KR', tradesLoaded=false, logsLoaded=false, currentStockCount=3;
+const _seenSellIds = new Set();
 let _orderQuoteTimer=null, _lastOrderQuote=null;
 let _refreshTimer = null, _countdownTimer = null, _countdownSec = 30;
 /** 리서치 패널에 이미 채운 마켓 (불필요한 재요청 방지) */
@@ -1846,7 +1850,69 @@ async function loadAll() {
   finally { if(icon) icon.classList.remove('spin'); }
 }
 
+/* ══════════ 매도 완료 알림 ══════════ */
+let _sellsInitialized = false;
+function checkNewSells(data) {
+  const sells = data.recent_sells || [];
+  if (!_sellsInitialized) {
+    // 최초 로드: 기존 매도 ID 등록만 하고 알림은 표시 안 함
+    sells.forEach(s => { if (s.id) _seenSellIds.add(s.id); });
+    _sellsInitialized = true;
+    return;
+  }
+  sells.forEach(s => {
+    if (!s.id || _seenSellIds.has(s.id)) return;
+    _seenSellIds.add(s.id);
+    _showSellNotice(s);
+  });
+}
+
+function _showSellNotice(s) {
+  const stack = document.getElementById('sellNoticeStack');
+  if (!stack) return;
+  const pnl = parseFloat(s.pnl) || 0;
+  const pnlSign = pnl > 0 ? '+' : '';
+  const pnlColor = pnl > 0 ? '#4ade80' : pnl < 0 ? '#f87171' : '#94a3b8';
+  const strategyLabel = {
+    '목표가_달성': '🎯 목표가 도달', '손절': '🛑 손절', '트레일링스탑': '📉 트레일링 스탑',
+    '분할익절': '✂️ 분할 익절', '시간청산': '⏱️ 시간 청산', '장마감_청산': '🔔 장마감 청산',
+  }[s.strategy] || ('📋 ' + (s.strategy || '매도'));
+  const name = s.stock_name || s.stock_code;
+  const price = s.market === 'US' ? `$${parseFloat(s.price).toFixed(2)}` : `${parseInt(s.price).toLocaleString('ko-KR')}원`;
+  const pnlFmt = s.market === 'US'
+    ? `${pnlSign}$${Math.abs(pnl).toFixed(2)}`
+    : `${pnlSign}${Math.abs(pnl).toLocaleString('ko-KR')}원`;
+
+  const card = document.createElement('div');
+  card.className = 'pointer-events-auto';
+  card.innerHTML = `
+    <div style="background:linear-gradient(135deg,rgba(15,23,42,.97),rgba(30,41,59,.97));border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:14px 16px;box-shadow:0 8px 32px rgba(0,0,0,.5);min-width:260px;position:relative;overflow:hidden;">
+      <div style="position:absolute;left:0;top:0;bottom:0;width:3px;background:${pnlColor};border-radius:3px 0 0 3px;"></div>
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding-left:8px;">
+        <div>
+          <div style="font-size:10px;font-weight:700;letter-spacing:.4px;color:#94a3b8;margin-bottom:4px;text-transform:uppercase;">매도 완료</div>
+          <div style="font-size:14px;font-weight:700;color:#f1f5f9;">${escapeHtml(name)}</div>
+          <div style="font-size:11px;color:#64748b;margin-top:2px;">${strategyLabel} · ${s.qty}주 @ ${price}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0;">
+          <div style="font-size:16px;font-weight:800;color:${pnlColor};">${pnlFmt}</div>
+          <div style="font-size:10px;color:#475569;margin-top:2px;">${s.timestamp||''}</div>
+        </div>
+      </div>
+    </div>`;
+
+  stack.prepend(card);
+  // 8초 후 페이드 아웃 + 제거
+  setTimeout(() => {
+    card.style.transition = 'opacity .5s, transform .5s';
+    card.style.opacity = '0';
+    card.style.transform = 'translateX(20px)';
+    setTimeout(() => card.remove(), 500);
+  }, 8000);
+}
+
 function renderWithData(data) {
+  checkNewSells(data);
   renderHeader(data);
   renderStats(data);
   const wld = currentMarket==='KR'?(data.watchlist_data||{}):(data.us_watchlist_data||{});

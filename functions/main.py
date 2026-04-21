@@ -4693,6 +4693,32 @@ def route_status():
         except Exception as e:
             risk_gates = {"error": str(e)}
 
+        # 최근 매도 5건 (알림 팝업용)
+        recent_sells: list[dict] = []
+        try:
+            sell_docs = (
+                _uref(uid).collection("trades")
+                .where("side", "==", "sell")
+                .order_by("timestamp", direction="DESCENDING")
+                .limit(5)
+                .stream()
+            )
+            for d in sell_docs:
+                td = d.to_dict()
+                recent_sells.append({
+                    "id": d.id,
+                    "stock_code": td.get("stock_code", ""),
+                    "stock_name": td.get("stock_name", ""),
+                    "market": td.get("market", "KR"),
+                    "price": td.get("price", 0),
+                    "qty": td.get("qty", 0),
+                    "pnl": td.get("pnl", 0),
+                    "strategy": td.get("strategy", ""),
+                    "timestamp": _ts_to_str(td.get("timestamp")),
+                })
+        except Exception:
+            pass
+
         return jsonify({
             "ok": True,
             "state": state, "balance": balance_data,
@@ -4703,6 +4729,7 @@ def route_status():
             "updated_at": datetime.now(KST).strftime("%H:%M:%S"),
             "kis_error": kis_error,
             "risk_gates": risk_gates,
+            "recent_sells": recent_sells,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
