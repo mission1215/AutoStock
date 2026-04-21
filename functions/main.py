@@ -1198,17 +1198,18 @@ def _get_available_cash_us(uid: str, cfg: dict) -> float:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_kis_holdings_kr(uid: str, cfg: dict) -> dict[str, int]:
-    """국내 KIS 잔고 → {종목코드(6자리): 보유수량}. 실패 시 빈 dict.
+    """국내 KIS 잔고 → {종목코드(6자리): 보유수량}. 실패 시 빈 dict."""
+    return {k: v["qty"] for k, v in _get_kis_holdings_full_kr(uid, cfg).items()}
 
-    `get_balance_kr` 의 `output1[*]` 배열에서 `pdno` (종목코드) /
-    `hldg_qty` (보유수량) 추출. 6자리 미만은 zero-pad.
-    """
+
+def _get_kis_holdings_full_kr(uid: str, cfg: dict) -> dict[str, dict]:
+    """국내 KIS 잔고 → {종목코드: {qty, avg_price, stock_name}}. 실패 시 빈 dict."""
     try:
         bal = get_balance_kr(uid, cfg)
     except Exception as e:
         _add_log(uid, "WARNING", f"[reconcile][KR] 잔고 조회 실패: {e}")
         return {}
-    holdings: dict[str, int] = {}
+    holdings: dict[str, dict] = {}
     for row in bal.get("output1") or []:
         if not isinstance(row, dict):
             continue
@@ -1222,7 +1223,9 @@ def _get_kis_holdings_kr(uid: str, cfg: dict) -> dict[str, int]:
         except Exception:
             qty = 0
         if qty > 0:
-            holdings[code] = qty
+            avg_price = float(str(row.get("pchs_avg_pric", "0")).replace(",", "") or 0)
+            stock_name = str(row.get("prdt_name", "") or "").strip()
+            holdings[code] = {"qty": qty, "avg_price": avg_price, "stock_name": stock_name}
     return holdings
 
 
@@ -1339,13 +1342,35 @@ def reconcile_positions(uid: str, cfg: dict, market: str) -> dict:
             )
             summary["external_extra"].append((code, fs_qty, kis_qty))
 
+    # KIS에만 있는 종목 → 수동 매수로 Firestore에 자동 등록
+    kis_full = _get_kis_holdings_full_kr(uid, cfg) if market == "KR" else {}
     for code, kis_qty in kis_hold.items():
         if code in fs_pos:
             continue
-        _add_log(
-            uid, "INFO",
-            f"[reconcile][{market}][{code}] KIS {kis_qty}주 보유, Firestore 미등록 — 외부 매수 추정 (전략 미관리)",
-        )
+        detail = kis_full.get(code, {})
+        avg_price = float(detail.get("avg_price", 0) or 0)
+        sname = detail.get("stock_name", "") or _stock_name("", code, market)
+        if avg_price > 0:
+            # 수동 매수: Firestore에 등록 (target/stop 미설정 → 봇이 장마감 청산만 담당)
+            _uref(uid).collection(f"positions_{market}").document(code).set({
+                "stock_code": code,
+                "stock_name": sname,
+                "buy_price": avg_price,
+                "quantity": kis_qty,
+                "target_sell_price": 0,
+                "stop_loss_price": 0,
+                "source": "수동",
+                "entry_time": datetime.now(KST),
+                "partial_tp_done": False,
+                "breakeven_applied": False,
+            })
+            add_trade(uid, market, code, "buy", avg_price, kis_qty, "수동매수_자동등록", 0.0, stock_name=sname)
+            _add_log(uid, "INFO",
+                f"[reconcile][{market}][{code}] 수동매수 감지 → Firestore 등록 | "
+                f"{kis_qty}주@{avg_price:,.0f} ({sname})")
+        else:
+            _add_log(uid, "INFO",
+                f"[reconcile][{market}][{code}] KIS {kis_qty}주 보유, 평단가 조회 불가 — 수동 확인 필요")
         summary["external_only"].append((code, kis_qty))
 
     return summary

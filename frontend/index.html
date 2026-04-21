@@ -2351,6 +2351,7 @@ function renderPositions(positions) {
                 <span class="font-bold text-white">${escapeHtml(safeCode)}</span>
                 <span class="text-xs px-1 py-0.5 rounded" style="background:rgba(255,255,255,.08);color:#94a3b8">${isUS?'🇺🇸':'🇰🇷'}</span>
                 ${isAI?`<span class="text-xs font-bold px-1.5 py-0.5 rounded-full" style="background:rgba(139,92,246,.2);color:#a78bfa">AI</span>`:''}
+                ${(p.source==='수동')?`<span class="text-xs font-bold px-1.5 py-0.5 rounded-full" style="background:rgba(234,179,8,.18);color:#fde68a" title="수동 매수 — 목표가/손절 미설정">수동</span>`:''}
               </div>
               ${stockName?`<div class="text-xs text-slate-400">${escapeHtml(stockName)}</div>`:''}
             </div>
@@ -2372,7 +2373,7 @@ function renderPositions(positions) {
           <div class="h-1.5 rounded-full bg-white/10 overflow-hidden">
             <div class="h-full rounded-full transition-all" style="width:${progress}%;background:linear-gradient(90deg,#3b82f6,#22c55e)"></div>
           </div>
-        </div>`:''}
+        </div>`:(p.source==='수동'?`<div class="mb-2 text-xs text-slate-600 text-center py-1 rounded-lg" style="background:rgba(255,255,255,.03)">목표가/손절 미설정 — 장마감(15:20) 자동청산</div>`:'')
         <div class="flex items-center justify-between">
           <span class="text-xs text-red-400">손절 ${isUS?'$'+(p.stop_loss_price||0).toFixed(2):(p.stop_loss_price||0).toLocaleString()}</span>
           <button type="button" class="btn-quick-sell text-xs font-semibold px-3 py-1.5 rounded-lg transition-all" style="background:rgba(239,68,68,.2);color:#fca5a5;border:1px solid rgba(239,68,68,.3)" data-sell-code="${safeCode}" data-sell-market="${sellMkt}">매도</button>
