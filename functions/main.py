@@ -4215,15 +4215,17 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
 # ══════════════════════════════════════════════════════════
 
 def _get_all_users() -> list[tuple[str, dict]]:
-    """설정 완료된 유저 목록 반환 [(uid, cfg), ...]"""
+    """설정 완료된 유저 목록 반환 [(uid, cfg), ...].
+
+    `profiles.mock` / `profiles.live` 에만 키가 있는 문서는 raw 로는 app_key 가 없어
+    스케줄이 전부 스킵되므로 반드시 get_config(병합)로 읽는다.
+    """
     result = []
     for user_doc in get_db().collection("users").stream():
         uid = user_doc.id
-        cfg_doc = _uref(uid).collection("config").document("settings").get()
-        if cfg_doc.exists:
-            cfg = cfg_doc.to_dict()
-            if cfg.get("app_key") and cfg.get("app_secret") and cfg.get("account_no"):
-                result.append((uid, cfg))
+        cfg = get_config(uid)
+        if cfg.get("app_key") and cfg.get("app_secret") and cfg.get("account_no"):
+            result.append((uid, cfg))
     return result
 
 
