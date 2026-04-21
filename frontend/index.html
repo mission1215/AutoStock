@@ -179,6 +179,58 @@
     }
     .ai-step-pill{transition:background .35s,color .35s,box-shadow .35s;}
     .ai-step-pill.on{background:rgba(139,92,246,.25);color:#c4b5fd;box-shadow:0 0 20px rgba(139,92,246,.2);}
+
+    /* ── Pro Dashboard: 숫자 조판 / KPI / 리스크 게이트 ───────── */
+    .num{font-variant-numeric:tabular-nums;font-feature-settings:'tnum' 1;letter-spacing:-0.01em;}
+    .mono-num{font-family:'SF Mono','JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;letter-spacing:-0.02em;}
+    .kpi-card{position:relative;overflow:hidden;}
+    .kpi-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--kpi-accent,#334155);opacity:.8;}
+    .kpi-card.kpi-pos{--kpi-accent:#22c55e;}
+    .kpi-card.kpi-neg{--kpi-accent:#ef4444;}
+    .kpi-card.kpi-warn{--kpi-accent:#f59e0b;}
+    .kpi-card.kpi-info{--kpi-accent:#3b82f6;}
+    .kpi-label{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:#64748b;font-weight:600;}
+    .kpi-value{font-size:1.45rem;line-height:1.15;font-weight:700;color:#f8fafc;}
+    .kpi-sub{font-size:11px;color:#94a3b8;}
+    .kpi-chip{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;padding:2px 7px;border-radius:999px;font-weight:600;}
+    .chip-pos{background:rgba(34,197,94,.14);color:#4ade80;border:1px solid rgba(34,197,94,.28);}
+    .chip-neg{background:rgba(239,68,68,.14);color:#f87171;border:1px solid rgba(239,68,68,.28);}
+    .chip-neutral{background:rgba(148,163,184,.12);color:#94a3b8;border:1px solid rgba(148,163,184,.22);}
+    .chip-info{background:rgba(59,130,246,.14);color:#60a5fa;border:1px solid rgba(59,130,246,.28);}
+    .chip-warn{background:rgba(245,158,11,.14);color:#fbbf24;border:1px solid rgba(245,158,11,.28);}
+
+    /* 리스크 게이트 배너 */
+    .gate-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
+    .gate-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:10px;font-size:11.5px;font-weight:600;border:1px solid transparent;transition:background .15s;}
+    .gate-pill .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+    .gate-ok{background:rgba(34,197,94,.08);color:#86efac;border-color:rgba(34,197,94,.22);}
+    .gate-ok .dot{background:#22c55e;box-shadow:0 0 6px rgba(34,197,94,.6);}
+    .gate-block{background:rgba(239,68,68,.1);color:#fca5a5;border-color:rgba(239,68,68,.28);}
+    .gate-block .dot{background:#ef4444;box-shadow:0 0 6px rgba(239,68,68,.6);}
+    .gate-warn{background:rgba(245,158,11,.1);color:#fcd34d;border-color:rgba(245,158,11,.28);}
+    .gate-warn .dot{background:#f59e0b;box-shadow:0 0 6px rgba(245,158,11,.6);}
+    .gate-off{background:rgba(71,85,105,.14);color:#64748b;border-color:rgba(71,85,105,.24);}
+    .gate-off .dot{background:#475569;}
+
+    /* 봇 상태 — 눈에 띄게 */
+    .bot-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid transparent;}
+    .bot-badge .dot{width:7px;height:7px;border-radius:50%;}
+    .bot-live{background:rgba(34,197,94,.14);color:#4ade80;border-color:rgba(34,197,94,.35);}
+    .bot-live .dot{background:#22c55e;animation:pulseG 2s infinite;box-shadow:0 0 10px rgba(34,197,94,.8);}
+    .bot-off{background:rgba(71,85,105,.2);color:#94a3b8;border-color:rgba(71,85,105,.4);}
+    .bot-off .dot{background:#64748b;}
+    .bot-halt{background:rgba(239,68,68,.14);color:#fca5a5;border-color:rgba(239,68,68,.35);}
+    .bot-halt .dot{background:#ef4444;animation:pulseG 1.2s infinite;}
+
+    /* 모의투자 배지 */
+    .mock-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font-size:10px;font-weight:800;letter-spacing:.3px;background:linear-gradient(135deg,rgba(234,179,8,.22),rgba(249,115,22,.22));color:#fde68a;border:1px solid rgba(234,179,8,.45);text-transform:uppercase;box-shadow:0 0 12px rgba(234,179,8,.18) inset;}
+    .live-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font-size:10px;font-weight:800;letter-spacing:.3px;background:linear-gradient(135deg,rgba(239,68,68,.2),rgba(236,72,153,.18));color:#fecaca;border:1px solid rgba(239,68,68,.45);text-transform:uppercase;}
+
+    /* 세션 타이머 */
+    .session-ind{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);font-size:11px;}
+    .session-ind .label{color:#64748b;}
+    .session-ind .time{color:#e2e8f0;font-weight:600;}
+    .session-ind .mkt{font-size:10px;color:#94a3b8;}
   </style>
 </head>
 <body class="text-white min-h-screen">
@@ -463,21 +515,33 @@
 
   <!-- 헤더 -->
   <header class="sticky top-0 z-50 px-5 py-3.5 border-b border-white/5" style="background:rgba(6,11,24,.85);backdrop-filter:blur(20px)">
-    <div class="max-w-6xl mx-auto flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <div class="w-9 h-9 rounded-xl flex items-center justify-center font-black text-base" style="background:linear-gradient(135deg,#3b82f6,#8b5cf6)">A</div>
-        <div>
-          <span class="font-bold text-white text-base">AutoStock</span>
-          <span id="modeBadge" class="hidden"></span>
+    <div class="max-w-6xl mx-auto flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3 min-w-0">
+        <div class="w-9 h-9 rounded-xl flex items-center justify-center font-black text-base shrink-0" style="background:linear-gradient(135deg,#3b82f6,#8b5cf6)">A</div>
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <span class="font-bold text-white text-base">AutoStock</span>
+            <span id="modeBadge" class="hidden"></span>
+            <span id="mockBadge" class="mock-badge hidden" title="모의투자 모드 — 실제 돈이 아닙니다">🧪 모의투자</span>
+            <span id="botBadge" class="bot-badge bot-off"><span class="dot"></span><span id="botBadgeText">연결 중</span></span>
+          </div>
+          <div id="sessionBar" class="hidden sm:flex items-center gap-1.5 mt-1 flex-wrap">
+            <span class="session-ind" id="sessionKR" title="한국 정규장">
+              <span class="mkt">🇰🇷 KR</span>
+              <span class="label" id="sessionKRLabel">대기</span>
+              <span class="time mono-num" id="sessionKRTime">--:--</span>
+            </span>
+            <span class="session-ind" id="sessionUS" title="미국 정규장">
+              <span class="mkt">🇺🇸 US</span>
+              <span class="label" id="sessionUSLabel">대기</span>
+              <span class="time mono-num" id="sessionUSTime">--:--</span>
+            </span>
+          </div>
         </div>
       </div>
-      <div class="flex items-center gap-4">
-        <div class="flex items-center gap-2">
-          <div id="botDot" class="w-2 h-2 rounded-full bg-slate-600"></div>
-          <span id="botStatusText" class="text-xs text-slate-400 hidden sm:block"></span>
-        </div>
-        <span class="text-xs text-slate-600 hidden sm:block" id="updatedAt"></span>
-        <span class="text-[10px] text-slate-700 hidden sm:block font-mono" id="refreshCountdown" title="다음 자동 갱신까지"></span>
+      <div class="flex items-center gap-3 shrink-0">
+        <span class="text-xs text-slate-600 hidden sm:block mono-num" id="updatedAt"></span>
+        <span class="text-[10px] text-slate-700 hidden sm:block mono-num" id="refreshCountdown" title="다음 자동 갱신까지"></span>
         <button onclick="manualRefresh()" class="w-8 h-8 rounded-lg glass glass-hover flex items-center justify-center">
           <svg id="refreshIcon" class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
@@ -554,33 +618,90 @@
       </div>
     </div>
 
-    <!-- 상단 지표 카드 -->
+    <!-- 상단 지표 카드 (프로 트레이딩 대시보드) -->
     <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
-      <div class="glass rounded-2xl p-4">
-        <p class="text-xs text-slate-500 mb-1.5">총자산</p>
-        <p id="totalEquity" class="text-xl font-bold text-white">-</p>
+
+      <!-- 총자산 -->
+      <div class="glass kpi-card rounded-2xl p-4" id="kpiEquity">
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="kpi-label">총자산</span>
+          <span id="kpiEquityDelta" class="kpi-chip chip-neutral">—</span>
+        </div>
+        <p id="totalEquity" class="kpi-value num">-</p>
+        <div class="flex items-center justify-between mt-1.5 text-[11px]">
+          <span class="text-slate-500">시작 <span id="kpiStartEq" class="num text-slate-400">-</span></span>
+          <span class="text-slate-500">고점 <span id="kpiPeakEq" class="num text-slate-400">-</span></span>
+        </div>
         <div id="drawdownInfo" class="hidden mt-2">
-          <div class="flex items-center justify-between text-xs mb-1">
+          <div class="flex items-center justify-between text-[11px] mb-1">
             <span class="text-slate-600">드로우다운</span>
-            <span id="drawdownPct" class="font-semibold text-green-400">0%</span>
+            <span id="drawdownPct" class="font-semibold num text-green-400">0%</span>
           </div>
           <div class="h-1 rounded-full overflow-hidden" style="background:rgba(255,255,255,.08)">
             <div id="drawdownBar" class="h-full rounded-full transition-all duration-500" style="width:0%;background:#ef4444"></div>
           </div>
         </div>
       </div>
-      <div class="glass rounded-2xl p-4">
-        <p class="text-xs text-slate-500 mb-1.5">주문가능</p>
-        <p id="availableCash" class="text-xl font-bold text-white">-</p>
+
+      <!-- 주문가능 -->
+      <div class="glass kpi-card rounded-2xl p-4" id="kpiCash">
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="kpi-label">주문가능</span>
+          <span id="kpiCashPct" class="kpi-chip chip-info num">—</span>
+        </div>
+        <p id="availableCash" class="kpi-value num">-</p>
+        <div class="mt-1.5">
+          <div class="flex items-center justify-between text-[11px] mb-1">
+            <span class="text-slate-600">현금 비중</span>
+            <span id="kpiCashPctBar" class="text-slate-500 num">0%</span>
+          </div>
+          <div class="h-1 rounded-full overflow-hidden" style="background:rgba(255,255,255,.08)">
+            <div id="kpiCashBar" class="h-full rounded-full transition-all duration-500" style="width:0%;background:#3b82f6"></div>
+          </div>
+        </div>
       </div>
-      <div class="glass rounded-2xl p-4">
-        <p class="text-xs text-slate-500 mb-1.5">오늘 실현손익</p>
-        <p id="realizedPnl" class="text-xl font-bold text-white">-</p>
+
+      <!-- 오늘 실현손익 -->
+      <div class="glass kpi-card rounded-2xl p-4" id="kpiPnl">
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="kpi-label">오늘 실현손익</span>
+          <span id="kpiPnlRatio" class="kpi-chip chip-neutral num">—</span>
+        </div>
+        <p id="realizedPnl" class="kpi-value num">-</p>
+        <div class="mt-1.5">
+          <div class="flex items-center justify-between text-[11px] mb-1">
+            <span class="text-slate-600">게이트 한도</span>
+            <span id="kpiPnlBounds" class="text-slate-500 num">—</span>
+          </div>
+          <div class="relative h-1 rounded-full overflow-hidden" style="background:rgba(255,255,255,.08)">
+            <div class="absolute top-0 bottom-0" id="kpiPnlMid" style="left:50%;width:1px;background:rgba(255,255,255,.25)"></div>
+            <div id="kpiPnlBar" class="absolute top-0 bottom-0 rounded-full transition-all duration-500" style="left:50%;width:0%;background:#22c55e"></div>
+          </div>
+        </div>
       </div>
-      <div class="glass rounded-2xl p-4">
-        <p class="text-xs text-slate-500 mb-1.5">보유 포지션</p>
-        <p id="positionSummary" class="text-xl font-bold text-white">-</p>
+
+      <!-- 보유 포지션 -->
+      <div class="glass kpi-card rounded-2xl p-4" id="kpiPositions">
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="kpi-label">보유 포지션</span>
+          <span id="kpiPosPnl" class="kpi-chip chip-neutral num">—</span>
+        </div>
+        <p id="positionSummary" class="kpi-value num">-</p>
+        <div class="flex items-center justify-between mt-1.5 text-[11px]">
+          <span class="text-slate-500">주식평가 <span id="kpiStockValue" class="num text-slate-400">-</span></span>
+          <span class="text-slate-500 num" id="kpiPosExposure">비중 —</span>
+        </div>
       </div>
+    </div>
+
+    <!-- 리스크 게이트 배너 (왜 신규매수가 가능/차단인지 한눈에) -->
+    <div id="riskGateBar" class="glass rounded-2xl p-3 hidden">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="w-1.5 h-4 rounded-full bg-amber-500 inline-block"></span>
+        <span class="text-xs font-semibold text-slate-300">신규매수 게이트 상태</span>
+        <span class="text-[10px] text-slate-600 ml-auto" id="riskGateHint">OK = 매수 가능 · 차단 = 해제될 때까지 신규매수 보류</span>
+      </div>
+      <div class="gate-bar" id="riskGatePills"></div>
     </div>
 
     <!-- 마켓 탭 (한국 / 미국) -->
@@ -774,8 +895,9 @@
               <div><label class="text-[11px] text-slate-500 block mb-1">물타기 최소 간격(h)</label><input id="cfgAvgDownGapH" type="number" step="1" min="1" max="168"/></div>
             </div>
           </div>
-          <div style="display:none"><label class="text-xs text-slate-500 block mb-1.5">투자 모드</label>
-            <select id="cfgMock"><option value="true">모의투자</option><option value="false">실전투자 ⚠️</option></select>
+          <div class="mt-3 pt-3 border-t border-white/5">
+            <label class="text-xs text-slate-400 block mb-1.5 font-semibold">💼 투자 모드 <span class="text-[10px] text-slate-600 font-normal">· 모의/실전 전환 시 API 키를 다시 등록해야 합니다</span></label>
+            <select id="cfgMock" class="max-w-xs"><option value="true">🧪 모의투자 (테스트, 실제 돈 아님)</option><option value="false">💰 실전투자 ⚠️ (실제 자금)</option></select>
           </div>
         </div>
         <div class="flex items-center gap-3">
@@ -845,8 +967,8 @@
       <div><label class="text-xs text-slate-500 block mb-1.5">App Key</label><input id="modalAppKey" type="text"/></div>
       <div><label class="text-xs text-slate-500 block mb-1.5">App Secret <span style="color:#f87171;font-size:11px">(저장 시 필수 입력)</span></label><input id="modalAppSecret" type="password" placeholder="App Secret 입력 (필수)"/></div>
       <div><label class="text-xs text-slate-500 block mb-1.5">계좌번호</label><input id="modalAccountNo" type="text"/></div>
-      <div style="display:none"><label class="text-xs text-slate-500 block mb-1.5">투자 모드</label>
-        <select id="modalMock"><option value="true">모의투자</option><option value="false">실전투자 ⚠️</option></select>
+      <div><label class="text-xs text-slate-500 block mb-1.5">투자 모드</label>
+        <select id="modalMock"><option value="true">🧪 모의투자 (테스트)</option><option value="false">💰 실전투자 ⚠️</option></select>
       </div>
     </div>
     <div id="modalSettingsError" class="text-red-400 text-xs mt-2 hidden"></div>
@@ -1738,34 +1860,75 @@ function renderWithData(data) {
   if(currentTab==='auto') loadRecommendations();
 }
 
+/* ══════════ 렌더: 헤더/세션/봇 배지 ══════════ */
+function _fmtRemain(sec){
+  if(!sec||sec<=0) return '';
+  const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60);
+  if(h>=1) return h+'시간 '+m+'분';
+  if(m>=1) return m+'분';
+  return Math.max(0,sec)+'초';
+}
+
 function renderHeader(data) {
-  const state=data.state||{}, mode=data.mode||'모의투자';
+  const state=data.state||{};
   const badge=document.getElementById('modeBadge');
   if(badge) badge.classList.add('hidden');
 
   const enabled=state.bot_enabled!==false, halted=state.trading_halted, open=state.is_market_open;
-  let dc,st,bt,bc;
-  if(!enabled){dc='bg-slate-500';st='봇 비활성';bt='비활성';bc='bg-slate-700 text-slate-400';}
-  else if(halted){
-    dc='bg-yellow-400';
-    const hr=(state.halt_reason||'').toLowerCase();
-    let haltTxt;
-    if(hr.includes('drawdown')){
-      // halt_reason 형식: "drawdown_5.2" 또는 "drawdown"
-      const pct=hr.replace(/drawdown_?/,'');
-      haltTxt = pct ? ('DD ' + parseFloat(pct).toFixed(1) + '% 초과') : '드로우다운 중단';
-    } else {
-      haltTxt = '목표 달성';
-    }
-    st=haltTxt; bt=haltTxt+' · 중단';
-    bc='bg-yellow-500/20 text-yellow-400';
+
+  // 봇 배지 (헤더) — 확대 + 색상 구분
+  // 모의투자 배지 (실전 vs 모의 명확히 표시)
+  const mb=document.getElementById('mockBadge');
+  if(mb){
+    const isMock = (data.mode==='모의투자') || (data.cfg && (data.cfg.is_mock===true||data.cfg.is_mock==='true'));
+    if(isMock){ mb.className='mock-badge'; mb.textContent='🧪 모의투자'; mb.title='모의투자 모드 — 실제 돈이 아닙니다'; }
+    else { mb.className='live-badge'; mb.textContent='💰 실전투자'; mb.title='실전투자 모드 — 실제 자금이 사용됩니다'; }
   }
-  else if(open){dc='bg-green-400 pulse-green';st='매매 중';bt='🟢 실행 중';bc='bg-green-500/20 text-green-400';}
-  else{dc='bg-slate-400';st='대기 중';bt='대기';bc='bg-slate-700 text-slate-400';}
-  document.getElementById('botDot').className='w-2 h-2 rounded-full '+dc;
-  document.getElementById('botStatusText').textContent=st;
+
+  const bb=document.getElementById('botBadge'), bbt=document.getElementById('botBadgeText');
+  let bbClass='bot-badge ', bbLabel='';
+  if(!enabled){ bbClass+='bot-off'; bbLabel='봇 비활성'; }
+  else if(halted){
+    bbClass+='bot-halt';
+    const hr=(state.halt_reason||'').toLowerCase();
+    if(hr.includes('drawdown')){
+      const pct=hr.replace(/drawdown_?/,'');
+      bbLabel = pct ? ('DD ' + parseFloat(pct).toFixed(1) + '% 중단') : '드로우다운 중단';
+    } else if(hr.includes('목표')||hr.includes('target')) bbLabel='목표달성 중단';
+    else bbLabel='매매 중단';
+  }
+  else if(open){ bbClass+='bot-live'; bbLabel='LIVE'; }
+  else{ bbClass+='bot-off'; bbLabel='대기'; }
+  if(bb){ bb.className=bbClass; }
+  if(bbt){ bbt.textContent=bbLabel; }
+
+  // 자동매매 패널 큰 배지도 같은 톤으로
   const big=document.getElementById('botStatusBig');
-  if(big){big.textContent=bt;big.className='text-xs font-bold px-2.5 py-1 rounded-full '+bc;}
+  if(big){
+    let bt,bc;
+    if(!enabled){bt='비활성';bc='bg-slate-700 text-slate-400';}
+    else if(halted){bt=bbLabel;bc='bg-red-500/15 text-red-300';}
+    else if(open){bt='🟢 LIVE';bc='bg-green-500/20 text-green-400';}
+    else{bt='대기';bc='bg-slate-700 text-slate-400';}
+    big.textContent=bt;
+    big.className='text-xs font-bold px-2.5 py-1 rounded-full '+bc;
+  }
+
+  // 세션 타이머 (KR/US)
+  const rg=data.risk_gates||{};
+  const sbar=document.getElementById('sessionBar');
+  if(sbar){ sbar.classList.remove('hidden'); }
+  const sKR=document.getElementById('sessionKR'), sKRL=document.getElementById('sessionKRLabel'), sKRT=document.getElementById('sessionKRTime');
+  const sUS=document.getElementById('sessionUS'), sUSL=document.getElementById('sessionUSLabel'), sUST=document.getElementById('sessionUSTime');
+  if(rg.kr && sKR){
+    if(rg.kr.market_open){ sKRL.textContent='마감까지'; sKRT.textContent=_fmtRemain(rg.kr.remain_sec); sKR.style.borderColor='rgba(34,197,94,.28)'; }
+    else { sKRL.textContent='장외'; sKRT.textContent=rg.now_kst||'--:--'; sKR.style.borderColor='rgba(255,255,255,.08)'; }
+  }
+  if(rg.us && sUS){
+    if(rg.us.market_open){ sUSL.textContent='마감까지'; sUST.textContent=_fmtRemain(rg.us.remain_sec); sUS.style.borderColor='rgba(34,197,94,.28)'; }
+    else { sUSL.textContent='장외'; sUST.textContent=rg.now_et||'--:--'; sUS.style.borderColor='rgba(255,255,255,.08)'; }
+  }
+
   document.getElementById('updatedAt').textContent='갱신 '+(data.updated_at||'');
 
   const btnStart=document.getElementById('btnStart'), btnStop=document.getElementById('btnStop');
@@ -1773,36 +1936,245 @@ function renderHeader(data) {
     if(enabled&&!halted){ btnStart.style.opacity='0.35';btnStart.style.cursor='not-allowed';btnStop.style.opacity='1';btnStop.style.cursor='pointer'; }
     else { btnStart.style.opacity='1';btnStart.style.cursor='pointer';btnStop.style.opacity='0.35';btnStop.style.cursor='not-allowed'; }
   }
+
+  renderRiskGates(data);
 }
 
+/* ══════════ 렌더: 리스크 게이트 배너 ══════════ */
+function renderRiskGates(data){
+  const bar=document.getElementById('riskGateBar');
+  const grid=document.getElementById('riskGatePills');
+  if(!bar||!grid) return;
+  const rg=data.risk_gates;
+  if(!rg||rg.error){ bar.classList.add('hidden'); return; }
+  const state=data.state||{};
+
+  const pills=[];
+  const push = (cls,label,val,title)=>pills.push(
+    `<span class="gate-pill ${cls}" title="${escapeHtml(title||'')}">
+       <span class="dot"></span>
+       <span>${escapeHtml(label)}</span>
+       ${val?`<span class="mono-num opacity-90 ml-0.5">${escapeHtml(val)}</span>`:''}
+     </span>`
+  );
+
+  // 봇/중단 상태 칩
+  if(!rg.halt?.bot_enabled){
+    push('gate-off','봇 OFF','','/api/bot 에서 시작');
+  } else if(rg.halt?.halted){
+    push('gate-block','중단',rg.halt.reason||'halt','trading_halted=true');
+  } else {
+    push('gate-ok','봇 LIVE','','bot_enabled & not halted');
+  }
+
+  // KR 시장
+  if(rg.kr){
+    const mkt=rg.kr.market_open?'gate-ok':'gate-off';
+    push(mkt,'🇰🇷 KR',rg.kr.market_open?_fmtRemain(rg.kr.remain_sec):'장외','한국 정규장 09:00~15:30 KST');
+
+    if(rg.kr.market_open){
+      // 블랙아웃 시간대
+      if(rg.kr.buy_window_ok) push('gate-ok','매수창','','블랙아웃 외');
+      else push('gate-warn','매수창차단',rg.kr.buy_window_reason||'',rg.kr.buy_window_reason||'개장/마감 블랙아웃');
+
+      // KOSPI 지수 게이트
+      const chg=rg.kr.index_change_pct;
+      if(chg===null||chg===undefined){
+        push('gate-off','KOSPI','—','지수 조회 실패/미수행');
+      } else {
+        const lim=rg.kr.index_limit_pct||1.5;
+        const ok=rg.kr.index_gate_ok;
+        const sign=chg>=0?'+':'';
+        const disp=sign+chg.toFixed(2)+'%';
+        if(ok) push('gate-ok','KOSPI',disp,'레짐 필터 통과');
+        else push('gate-block','KOSPI',disp,'급락 게이트 -'+lim+'% 이하');
+      }
+    }
+  }
+
+  // US 시장
+  if(rg.us){
+    const mkt=rg.us.market_open?'gate-ok':'gate-off';
+    push(mkt,'🇺🇸 US',rg.us.market_open?_fmtRemain(rg.us.remain_sec):'장외','미국 정규장 09:30~16:00 ET');
+    if(rg.us.market_open){
+      if(rg.us.buy_window_ok) push('gate-ok','매수창','','블랙아웃 외');
+      else push('gate-warn','매수창차단',rg.us.buy_window_reason||'',rg.us.buy_window_reason||'개장/마감 블랙아웃');
+
+      const chg=rg.us.index_change_pct;
+      if(chg===null||chg===undefined){
+        push('gate-off',rg.us.index_proxy||'SPY','—','지수 프록시 조회 실패');
+      } else {
+        const lim=rg.us.index_limit_pct||1.5;
+        const ok=rg.us.index_gate_ok;
+        const sign=chg>=0?'+':'';
+        const disp=sign+chg.toFixed(2)+'%';
+        if(ok) push('gate-ok',rg.us.index_proxy||'SPY',disp,'레짐 필터 통과');
+        else push('gate-block',rg.us.index_proxy||'SPY',disp,'급락 게이트 -'+lim+'% 이하');
+      }
+    }
+  }
+
+  // 일간 PnL 게이트
+  const dp=rg.daily_pnl;
+  if(dp && dp.start_equity>0){
+    const r=dp.ratio_pct||0, sign=r>=0?'+':'';
+    const disp=sign+r.toFixed(2)+'%';
+    if(dp.ok){
+      const cls=r>0?'gate-ok':(r<0?'gate-warn':'gate-ok');
+      push(cls,'일간손익',disp,`목표 +${dp.target_pct}% / 한도 -${dp.loss_limit_pct}%`);
+    } else {
+      push('gate-block','일간게이트',dp.reason||disp,'수익잠금 또는 손실한도 도달');
+    }
+  } else {
+    push('gate-off','일간손익','대기','장 시작 준비(scheduled_prepare) 전');
+  }
+
+  grid.innerHTML=pills.join('');
+  bar.classList.remove('hidden');
+}
+
+/* ══════════ 렌더: 상단 KPI 4카드 ══════════ */
+function _fmtKRW(n){ const v=parseFloat(n); return isNaN(v)?'-':v.toLocaleString('ko-KR')+'원'; }
+function _fmtPnlKRW(n){ const v=parseFloat(n)||0; return (v>0?'+':v<0?'-':'')+Math.abs(v).toLocaleString('ko-KR')+'원'; }
+
 function renderStats(data) {
-  const bal=data.balance||{}, state=data.state||{};
-  document.getElementById('totalEquity').textContent=fmt(bal.total_equity);
-  document.getElementById('availableCash').textContent=fmt(bal.available_cash);
-  const pnl=state.realized_pnl||0;
-  const el=document.getElementById('realizedPnl');
-  el.textContent=(pnl>=0?'+':'')+pnl.toLocaleString('ko-KR')+'원';
-  el.className='text-xl font-bold '+(pnl>0?'text-green-400':pnl<0?'text-red-400':'text-white');
-  const krCount=Object.keys(data.positions_kr||{}).length;
-  const usCount=Object.keys(data.positions_us||{}).length;
-  document.getElementById('positionSummary').textContent=(krCount+usCount)+'종목'+(krCount&&usCount?` (KR${krCount}+US${usCount})`:'');
-  // 드로우다운 미터
-  const peakEquity=parseFloat(state.peak_equity)||0;
+  const bal=data.balance||{}, state=data.state||{}, rg=data.risk_gates||{};
   const totalEquity=parseFloat(bal.total_equity)||0;
+  const availableCash=parseFloat(bal.available_cash)||0;
+  const stockValue=parseFloat(bal.stock_value)||0;
+  const startEq=parseFloat(state.start_equity)||0;
+  const peakEq=parseFloat(state.peak_equity)||0;
+  const pnl=parseFloat(state.realized_pnl)||0;
+
+  // ── 총자산 카드 ─────────────────────────────────────────
+  document.getElementById('totalEquity').textContent=_fmtKRW(totalEquity);
+  const kpiEqEl=document.getElementById('kpiEquity');
+  const deltaEl=document.getElementById('kpiEquityDelta');
+  if(startEq>0 && totalEquity>0){
+    const delta=totalEquity-startEq;
+    const deltaPct=(delta/startEq*100);
+    const sign=delta>=0?'+':'';
+    deltaEl.textContent=sign+deltaPct.toFixed(2)+'%';
+    deltaEl.className='kpi-chip num '+(delta>0?'chip-pos':delta<0?'chip-neg':'chip-neutral');
+    kpiEqEl.classList.remove('kpi-pos','kpi-neg','kpi-warn','kpi-info');
+    kpiEqEl.classList.add(delta>0?'kpi-pos':delta<0?'kpi-neg':'kpi-info');
+  } else {
+    deltaEl.textContent='—';
+    deltaEl.className='kpi-chip chip-neutral';
+    kpiEqEl.classList.remove('kpi-pos','kpi-neg','kpi-warn');
+    kpiEqEl.classList.add('kpi-info');
+  }
+  document.getElementById('kpiStartEq').textContent=startEq>0?startEq.toLocaleString('ko-KR'):'-';
+  document.getElementById('kpiPeakEq').textContent=peakEq>0?peakEq.toLocaleString('ko-KR'):'-';
+
+  // 드로우다운 미터
   const ddInfo=document.getElementById('drawdownInfo');
-  if(ddInfo&&peakEquity>0&&totalEquity>0){
-    const ddPct=Math.max(0,(peakEquity-totalEquity)/peakEquity*100);
+  if(ddInfo&&peakEq>0&&totalEquity>0){
+    const ddPct=Math.max(0,(peakEq-totalEquity)/peakEq*100);
     const ddEl=document.getElementById('drawdownPct');
     const ddBar=document.getElementById('drawdownBar');
     if(ddEl){
-      ddEl.textContent=ddPct.toFixed(1)+'%';
-      ddEl.className='font-semibold '+(ddPct>=3?'text-red-400':ddPct>=1?'text-yellow-400':'text-green-400');
+      ddEl.textContent=ddPct.toFixed(2)+'%';
+      ddEl.className='font-semibold num '+(ddPct>=3?'text-red-400':ddPct>=1?'text-yellow-400':'text-green-400');
     }
-    if(ddBar) ddBar.style.width=Math.min(100,ddPct*10)+'%'; // 10% DD → 100% bar
+    if(ddBar){
+      ddBar.style.width=Math.min(100,ddPct*10)+'%';
+      ddBar.style.background=ddPct>=3?'#ef4444':ddPct>=1?'#f59e0b':'#22c55e';
+    }
     ddInfo.classList.remove('hidden');
   } else if(ddInfo){
     ddInfo.classList.add('hidden');
   }
+
+  // ── 주문가능 카드 ────────────────────────────────────────
+  document.getElementById('availableCash').textContent=_fmtKRW(availableCash);
+  const cashPct = totalEquity>0 ? (availableCash/totalEquity*100) : 0;
+  const cpEl=document.getElementById('kpiCashPct');
+  const cpBarLabel=document.getElementById('kpiCashPctBar');
+  const cpBar=document.getElementById('kpiCashBar');
+  const kpiCashEl=document.getElementById('kpiCash');
+  if(totalEquity>0){
+    cpEl.textContent=cashPct.toFixed(1)+'%';
+    cpEl.className='kpi-chip num '+(cashPct>=70?'chip-info':cashPct>=30?'chip-neutral':'chip-warn');
+    cpBarLabel.textContent=cashPct.toFixed(1)+'%';
+    cpBar.style.width=Math.min(100,cashPct)+'%';
+    cpBar.style.background=cashPct>=70?'#3b82f6':cashPct>=30?'#6366f1':'#f59e0b';
+    kpiCashEl.classList.remove('kpi-pos','kpi-neg','kpi-warn','kpi-info');
+    kpiCashEl.classList.add(cashPct<15?'kpi-warn':'kpi-info');
+  } else {
+    cpEl.textContent='—'; cpEl.className='kpi-chip chip-neutral';
+    cpBarLabel.textContent='—';
+    cpBar.style.width='0%';
+  }
+
+  // ── 오늘 실현손익 카드 ──────────────────────────────────
+  const el=document.getElementById('realizedPnl');
+  el.textContent=_fmtPnlKRW(pnl);
+  el.className='kpi-value num '+(pnl>0?'text-green-400':pnl<0?'text-red-400':'text-white');
+  const ratioEl=document.getElementById('kpiPnlRatio');
+  const boundsEl=document.getElementById('kpiPnlBounds');
+  const pnlBar=document.getElementById('kpiPnlBar');
+  const kpiPnlCard=document.getElementById('kpiPnl');
+  const tgt=rg.daily_pnl?.target_pct||3, loss=rg.daily_pnl?.loss_limit_pct||2;
+  boundsEl.textContent='-'+loss.toFixed(1)+'% ~ +'+tgt.toFixed(1)+'%';
+  if(startEq>0){
+    const r=(pnl/startEq*100);
+    const sign=r>=0?'+':'';
+    ratioEl.textContent=sign+r.toFixed(2)+'%';
+    ratioEl.className='kpi-chip num '+(r>0?'chip-pos':r<0?'chip-neg':'chip-neutral');
+    // bar: 중앙(50%) 기점, +tgt 또는 -loss 로 클램프
+    if(pnlBar){
+      const maxPct=r>=0?tgt:loss;
+      const frac=Math.min(1, Math.abs(r)/(maxPct||1)) * 50; // 절반폭 기준
+      if(r>=0){
+        pnlBar.style.left='50%'; pnlBar.style.width=frac+'%';
+        pnlBar.style.background='#22c55e';
+      } else {
+        pnlBar.style.left=(50-frac)+'%'; pnlBar.style.width=frac+'%';
+        pnlBar.style.background='#ef4444';
+      }
+    }
+    kpiPnlCard.classList.remove('kpi-pos','kpi-neg','kpi-warn','kpi-info');
+    kpiPnlCard.classList.add(pnl>0?'kpi-pos':pnl<0?'kpi-neg':'kpi-info');
+  } else {
+    ratioEl.textContent='—'; ratioEl.className='kpi-chip chip-neutral';
+    if(pnlBar){ pnlBar.style.left='50%'; pnlBar.style.width='0%'; }
+  }
+
+  // ── 보유 포지션 카드 ────────────────────────────────────
+  const kr=data.positions_kr||{}, us=data.positions_us||{};
+  const krCount=Object.keys(kr).length, usCount=Object.keys(us).length;
+  document.getElementById('positionSummary').textContent=
+    (krCount+usCount)+'종목'+(krCount&&usCount?` (KR${krCount}+US${usCount})`:'');
+  // 미실현 합(원화만 합산 — US 달러는 별도 표시)
+  let unrealKR=0, unrealUSD=0;
+  Object.values(kr).forEach(p=>{ unrealKR += (parseFloat(p.pnl)||0); });
+  Object.values(us).forEach(p=>{ unrealUSD += (parseFloat(p.pnl)||0); });
+  const posPnlEl=document.getElementById('kpiPosPnl');
+  const kpiPosCard=document.getElementById('kpiPositions');
+  if(krCount+usCount===0){
+    posPnlEl.textContent='—'; posPnlEl.className='kpi-chip chip-neutral';
+    kpiPosCard.classList.remove('kpi-pos','kpi-neg','kpi-warn'); kpiPosCard.classList.add('kpi-info');
+  } else {
+    // 메인 지표: KR 미실현 손익 %. USD는 서브로.
+    let dispText='';
+    if(krCount>0){
+      const sumBuy=Object.values(kr).reduce((a,p)=>a+(parseFloat(p.buy_price)||0)*(parseFloat(p.quantity)||0),0);
+      const r = sumBuy>0 ? (unrealKR/sumBuy*100) : 0;
+      dispText=(r>=0?'+':'')+r.toFixed(2)+'%';
+      posPnlEl.textContent=dispText;
+      posPnlEl.className='kpi-chip num '+(unrealKR>0?'chip-pos':unrealKR<0?'chip-neg':'chip-neutral');
+      kpiPosCard.classList.remove('kpi-pos','kpi-neg','kpi-warn','kpi-info');
+      kpiPosCard.classList.add(unrealKR>0?'kpi-pos':unrealKR<0?'kpi-neg':'kpi-info');
+    } else {
+      const sign=unrealUSD>=0?'+':'-';
+      posPnlEl.textContent=sign+'$'+Math.abs(unrealUSD).toFixed(2);
+      posPnlEl.className='kpi-chip num '+(unrealUSD>0?'chip-pos':unrealUSD<0?'chip-neg':'chip-neutral');
+    }
+  }
+  document.getElementById('kpiStockValue').textContent=stockValue>0?stockValue.toLocaleString('ko-KR'):'-';
+  const expo = totalEquity>0?(stockValue/totalEquity*100):0;
+  document.getElementById('kpiPosExposure').textContent=totalEquity>0?('비중 '+expo.toFixed(1)+'%'):'비중 —';
 }
 
 // ── 추천 종목 티커 ──────────────────────────────────────

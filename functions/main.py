@@ -4328,6 +4328,110 @@ def _require_auth():
         return None, (jsonify({"ok": False, "error": f"인증 오류: {e}"}), 401)
 
 
+def _compute_risk_gates(uid: str, cfg: dict, state: dict) -> dict:
+    """UI 상단 리스크-게이트 상태 배너용 요약.
+
+    전략 사이클과 동일한 게이트 함수를 호출해 "왜 지금 신규매수가 가능/불가능한가"를
+    사용자가 한눈에 볼 수 있게 한다. 모든 필드는 표시 목적이며, 매매 결정에는 직접
+    참여하지 않는다 (실제 게이트 판정은 여전히 run_strategy_cycle_* 안에서 이뤄짐).
+
+    지수 API는 `_get_kr_index_change_pct` / `_get_us_index_change_pct` 의 60초 캐시를
+    재사용하므로 status 폴링으로 추가 부담이 크지 않다. 장외 시간엔 아예 호출하지 않는다.
+    """
+    now_kst = datetime.now(KST)
+    now_et = datetime.now(ET)
+
+    kr_open = now_kst.replace(hour=9, minute=0, second=0, microsecond=0)
+    kr_close = now_kst.replace(hour=15, minute=30, second=0, microsecond=0)
+    kr_is_weekday = now_kst.weekday() < 5
+    kr_open_now = kr_is_weekday and kr_open <= now_kst <= kr_close
+    kr_remain_sec = int((kr_close - now_kst).total_seconds()) if kr_open_now else 0
+    try:
+        kr_win_ok, kr_win_reason = _kr_buy_window_ok(cfg)
+    except Exception:
+        kr_win_ok, kr_win_reason = True, ""
+
+    us_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    us_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    us_is_weekday = now_et.weekday() < 5
+    us_open_now = us_is_weekday and us_open <= now_et <= us_close
+    us_remain_sec = int((us_close - now_et).total_seconds()) if us_open_now else 0
+    try:
+        us_win_ok, us_win_reason = _us_buy_window_ok(cfg)
+    except Exception:
+        us_win_ok, us_win_reason = True, ""
+
+    try:
+        pnl_ok, pnl_reason = _daily_pnl_buy_gate(state, cfg)
+    except Exception:
+        pnl_ok, pnl_reason = True, ""
+    start_eq = float(state.get("start_equity", 0) or 0)
+    pnl_abs = float(state.get("realized_pnl", 0) or 0)
+    pnl_ratio = (pnl_abs / start_eq * 100) if start_eq > 0 else 0.0
+
+    kospi_chg: float | None = None
+    kospi_gate_ok = True
+    if kr_open_now:
+        try:
+            kospi_chg = float(_get_kr_index_change_pct(uid, cfg, "0001"))
+            lim = abs(float(cfg.get("kr_index_drop_limit_pct", 1.5)))
+            kospi_gate_ok = (kospi_chg > -lim) if lim > 0 else True
+        except Exception:
+            kospi_chg = None
+
+    spy_chg: float | None = None
+    spy_gate_ok = True
+    if us_open_now:
+        try:
+            spy_chg = float(_get_us_index_change_pct(uid, cfg, cfg.get("us_index_proxy", "SPY")))
+            lim = abs(float(cfg.get("us_index_drop_limit_pct", 1.5)))
+            spy_gate_ok = (spy_chg > -lim) if lim > 0 else True
+        except Exception:
+            spy_chg = None
+
+    # peak_equity 대비 현재 드로우다운 % (total_equity는 호출 측에서 알고 있지만, 백엔드에선 state만 사용)
+    peak_eq = float(state.get("peak_equity", 0) or 0)
+
+    return {
+        "now_kst": now_kst.strftime("%H:%M:%S"),
+        "now_et": now_et.strftime("%H:%M:%S"),
+        "kr": {
+            "market_open": kr_open_now,
+            "remain_sec": max(0, kr_remain_sec),
+            "buy_window_ok": bool(kr_win_ok),
+            "buy_window_reason": kr_win_reason or "",
+            "index_change_pct": kospi_chg,
+            "index_gate_ok": bool(kospi_gate_ok),
+            "index_limit_pct": float(cfg.get("kr_index_drop_limit_pct", 1.5)),
+        },
+        "us": {
+            "market_open": us_open_now,
+            "remain_sec": max(0, us_remain_sec),
+            "buy_window_ok": bool(us_win_ok),
+            "buy_window_reason": us_win_reason or "",
+            "index_change_pct": spy_chg,
+            "index_gate_ok": bool(spy_gate_ok),
+            "index_limit_pct": float(cfg.get("us_index_drop_limit_pct", 1.5)),
+            "index_proxy": cfg.get("us_index_proxy", "SPY"),
+        },
+        "daily_pnl": {
+            "ok": bool(pnl_ok),
+            "reason": pnl_reason or "",
+            "ratio_pct": round(pnl_ratio, 2),
+            "target_pct": round(float(cfg.get("daily_profit_target", 0.03)) * 100, 2),
+            "loss_limit_pct": round(abs(float(cfg.get("daily_loss_limit", 0.02))) * 100, 2),
+            "realized_pnl": pnl_abs,
+            "start_equity": start_eq,
+            "peak_equity": peak_eq,
+        },
+        "halt": {
+            "halted": bool(state.get("trading_halted", False)),
+            "reason": state.get("halt_reason", "") or "",
+            "bot_enabled": bool(state.get("bot_enabled", True)),
+        },
+    }
+
+
 @flask_app.route("/api/setup", methods=["POST"])
 def route_setup():
     """최초 설정 — KIS API 키 + 계좌번호 저장"""
@@ -4567,6 +4671,11 @@ def route_status():
 
         safe_cfg = {k: v for k, v in cfg.items() if k not in ("app_key", "app_secret")}
 
+        try:
+            risk_gates = _compute_risk_gates(uid, cfg, state)
+        except Exception as e:
+            risk_gates = {"error": str(e)}
+
         return jsonify({
             "ok": True,
             "state": state, "balance": balance_data,
@@ -4576,6 +4685,7 @@ def route_status():
             "mode": "모의투자" if cfg.get("is_mock") else "실전투자",
             "updated_at": datetime.now(KST).strftime("%H:%M:%S"),
             "kis_error": kis_error,
+            "risk_gates": risk_gates,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
