@@ -2748,16 +2748,22 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                     diag_parts.append(f"{code}=돌파했으나잔액부족(가격{current:,}/잔액{available:,.0f})")
             else:
                 gap = current - target
-                diag_parts.append(
-                    f"{code}:현재{current:,}/돌파{target:,.0f}({'O' if above_target else f'X gap{gap:+,.0f}'})"
-                    f"/MA5_{ma5:,.0f}({'O' if above_ma5 else 'X'})"
-                )
+                reason = []
+                if current < target:
+                    reason.append(f"미돌파(현재{current:,}/목표{target:,.0f}/차이{gap:+,.0f})")
+                elif current > target * (1 + max_slip):
+                    reason.append(f"추격금지(현재{current:,}/상한{target*(1+max_slip):,.0f})")
+                if not above_ma5:
+                    reason.append(f"MA5하회(현재{current:,}/MA5{ma5:,.0f})")
+                diag_parts.append(f"{code}:{'·'.join(reason) or '조건미달'}")
         except Exception as e:
             diag_parts.append(f"{code}=오류")
             _add_log(uid, "ERROR", f"[KR][{code}] 매수 체크 오류: {e}")
 
+    bought = [p for p in diag_parts if "✅" in p]
     if verbose and diag_parts:
-        _add_log(uid, "DEBUG", f"[전략] {' | '.join(diag_parts)}")
+        label = "스캔결과" if bought else "매수없음"
+        _add_log(uid, "INFO", f"[KR] {label} | {' | '.join(diag_parts)}")
 
 
 # ══════════════════════════════════════════════════════════
