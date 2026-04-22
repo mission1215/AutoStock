@@ -1,5 +1,6 @@
 import { apiFetch } from "../api/client";
 import type { PositionKr, PositionUs } from "../types";
+import { tvSymbol } from "../utils/tradingViewSymbol";
 
 function fmtPrice(mkt: "KR" | "US", v: number | undefined) {
   if (v == null || Number.isNaN(v)) return "—";
@@ -71,7 +72,7 @@ export function HoldingsPanel({
           )}
         </h3>
         <p className="text-[10px] text-slate-600 leading-snug sm:text-right sm:max-w-[60%]">
-          매수가·목표·손절은 전략·주문 시점 기준입니다.
+          매수가·목표·손절은 전략·주문 시점 기준입니다. 아래 링크로 TradingView(새 창).
         </p>
       </div>
 
@@ -196,13 +197,23 @@ export function HoldingsPanel({
                       )}
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => quickSell(code, mkt)}
-                      className="tap-target shrink-0 min-h-10 min-w-[3.25rem] text-xs sm:text-xs font-semibold px-3 py-2 rounded-lg bg-red-500/15 text-red-300/95 border border-red-500/25 hover:bg-red-500/25 opacity-90 group-hover:opacity-100 transition-opacity"
-                    >
-                      매도
-                    </button>
+                    <div className="shrink-0 flex flex-col items-stretch gap-1.5">
+                      <a
+                        href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSymbol(code, mkt))}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="tap-target min-h-9 text-center text-[11px] font-medium px-2.5 py-2 rounded-lg border border-indigo-500/[0.22] bg-indigo-500/10 text-[#a5b4fc] hover:bg-indigo-500/16 transition-colors"
+                      >
+                        TradingView 차트 ↗
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => quickSell(code, mkt)}
+                        className="tap-target shrink-0 min-h-10 min-w-[3.25rem] text-xs sm:text-xs font-semibold px-3 py-2 rounded-lg bg-red-500/15 text-red-300/95 border border-red-500/25 hover:bg-red-500/25 opacity-90 group-hover:opacity-100 transition-opacity"
+                      >
+                        매도
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
