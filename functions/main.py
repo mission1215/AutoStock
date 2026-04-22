@@ -3814,7 +3814,7 @@ def _run_ai_session_impl(
     _add_log(uid, "INFO", f"[AI][{market}] 스코어 상위: {score_summary}")
 
     # ai_stock_count = 해당 시장 최대 보유 종목 수(상한 3~5). 추천 카드는 상한만큼 노출.
-    cap = min(max(int(cfg.get("ai_stock_count", 3)), 3), 5)
+    cap = min(max(int(cfg.get("ai_stock_count", 5)), 3), 5)
     positions_early = get_positions(uid, market)
     held = len(positions_early)
     slots = max(0, cap - held)
@@ -4959,8 +4959,8 @@ def route_setup():
         "app_secret": body["app_secret"].strip(),
         "account_no": body["account_no"].strip(),
         "is_mock": is_m,
-        "kr_watchlist": body.get("kr_watchlist", ["005930", "000660", "035420"]),
-        "us_watchlist": body.get("us_watchlist", ["AAPL", "NVDA", "TSLA"]),
+        "kr_watchlist": body.get("kr_watchlist", ["005930", "000660", "035420", "035720", "051910"]),
+        "us_watchlist": body.get("us_watchlist", ["AAPL", "NVDA", "TSLA", "MSFT", "GOOGL"]),
         "k_factor": float(body.get("k_factor", 0.5)),
         "max_entry_slip_pct": float(body.get("max_entry_slip_pct", 0.05)),
         "max_entry_slip_pct_mock": float(body.get("max_entry_slip_pct_mock", 0.05)),
@@ -4970,7 +4970,7 @@ def route_setup():
         "stop_loss_ratio": float(body.get("stop_loss_ratio", 0.03)),
         "max_position_ratio": float(body.get("max_position_ratio", 0.10)),
         "daily_profit_target": float(body.get("daily_profit_target", 0.03)),
-        "ai_stock_count": int(body.get("ai_stock_count", 3)),
+        "ai_stock_count": int(body.get("ai_stock_count", 5)),
         "bot_enabled": True,
         "display_name": body.get("display_name", ""),
         "email": body.get("email", ""),

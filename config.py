@@ -24,7 +24,7 @@ class Config:
     # ── 감시 종목 ──────────────────────────────────────
     WATCHLIST: list[str] = [
         s.strip()
-        for s in os.getenv("WATCHLIST", "005930,000660,035420").split(",")
+        for s in os.getenv("WATCHLIST", "005930,000660,035420,035720,051910").split(",")
         if s.strip()
     ]
 

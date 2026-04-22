@@ -29,7 +29,7 @@ type StrategyFormState = {
 const PRESET_MOCK: StrategyFormState = {
   k: "0.3", ma: "5", stopPct: "3.0", maxPct: "20", dailyPct: "1.0",
   idxGatePct: "0", minScoreKr: "25",
-  krWl: "005930,000660,035420", usWl: "AAPL,NVDA,TSLA", aiCount: 3,
+  krWl: "005930,000660,035420,035720,051910", usWl: "AAPL,NVDA,TSLA,MSFT,GOOGL", aiCount: 5,
   partialTpEn: true, partialTpTrig: "2.0", partialTpSell: "30", partialTpTight: true,
   slipMockPct: "5.0", slipLivePct: "3.0",
   avgDownEn: true, avgDownTrig: "4.0", avgDownMax: "2", avgDownQty: "35", avgDownGapH: "20",
@@ -38,7 +38,7 @@ const PRESET_MOCK: StrategyFormState = {
 const PRESET_LIVE: StrategyFormState = {
   k: "0.5", ma: "5", stopPct: "2.0", maxPct: "10", dailyPct: "2.0",
   idxGatePct: "1.5", minScoreKr: "40",
-  krWl: "005930,000660,035420", usWl: "AAPL,NVDA,TSLA", aiCount: 3,
+  krWl: "005930,000660,035420,035720,051910", usWl: "AAPL,NVDA,TSLA,MSFT,GOOGL", aiCount: 5,
   partialTpEn: true, partialTpTrig: "3.0", partialTpSell: "30", partialTpTight: true,
   slipMockPct: "5.0", slipLivePct: "3.0",
   avgDownEn: false, avgDownTrig: "4.0", avgDownMax: "2", avgDownQty: "35", avgDownGapH: "20",

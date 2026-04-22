@@ -366,7 +366,7 @@ export function Dashboard({
           <AiSessionButtons
             idToken={idToken}
             market={currentMarket}
-            aiStockCount={cfg?.ai_stock_count ?? 3}
+            aiStockCount={cfg?.ai_stock_count ?? 5}
             onDone={() => {
               void loadStatus();
               void loadTrades();
