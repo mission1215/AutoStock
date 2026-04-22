@@ -490,6 +490,21 @@ def _uref(uid: str):
     return get_db().collection("users").document(uid)
 
 
+def _ensure_user_root_doc(uid: str) -> None:
+    """`users` 컬렉션 `.stream()` 에 잡히도록 `users/{uid}` 문서를 보장.
+
+    서브컬렉션만 있고 루트가 비어 있으면 나열되지 않아 `_get_all_users` 가 0명이 될 수 있음.
+    이미 루트가 있으면 쓰지 않는다(폴링/저장 반복 시 불필요한 갱신 방지).
+    """
+    r = _uref(uid)
+    if r.get().exists:
+        return
+    r.set(
+        {"autostock_user": True, "user_doc_at": datetime.now(KST).isoformat()},
+        merge=True,
+    )
+
+
 # ══════════════════════════════════════════════════════════
 # 인증 (Firebase ID Token 검증)
 # ══════════════════════════════════════════════════════════
@@ -627,11 +642,21 @@ def save_config(uid: str, data: dict):
         if k in _CONFIG_PROFILE_KEYS:
             prof[k] = v
     profiles[mode] = prof
+    # 자격증명 크로스-프로필 동기화: 한 쪽에만 있으면 다른 쪽에도 복사
+    _cred_keys = ("app_key", "app_secret", "account_no")
+    for src, dst in (("mock", "live"), ("live", "mock")):
+        sp = profiles.get(src) or {}
+        dp = profiles.get(dst) or {}
+        if all(sp.get(k) for k in _cred_keys) and not all(dp.get(k) for k in _cred_keys):
+            for k in _cred_keys:
+                dp[k] = sp[k]
+            profiles[dst] = dp
     raw["profiles"] = profiles
     for k in list(raw.keys()):
         if k in _CONFIG_PROFILE_KEYS:
             del raw[k]
     ref.set(raw)
+    _ensure_user_root_doc(uid)
 
 
 def _base_url(is_mock: bool) -> str:
@@ -4868,6 +4893,7 @@ def route_setup():
         },
     }
     _uref(uid).collection("config").document("settings").set(doc_out)
+    _ensure_user_root_doc(uid)
     update_bot_state(uid, {"bot_enabled": True, "trading_halted": False,
                             "is_market_open": False, "realized_pnl": 0.0})
     _add_log(uid, "INFO", f"계정 설정 완료 | 모드={'모의' if is_m else '실전'} (프로필 분리 저장)")
@@ -4888,6 +4914,9 @@ def route_status():
                 "setup_required": True,
                 "profiles": profiles_payload,
             })
+
+        # users/{uid} 루트가 없으면 collection("users").stream() 에 0명 → 스케줄 전부 스킵
+        _ensure_user_root_doc(uid)
 
         state = get_bot_state(uid)
         positions_kr = get_positions(uid, "KR")
