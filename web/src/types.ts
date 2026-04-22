@@ -47,6 +47,13 @@ export interface AppConfig {
   partial_tp_tighten_stop?: boolean;
   max_entry_slip_pct_mock?: number;
   max_entry_slip_pct_live?: number;
+  kr_index_drop_limit_pct?: number;
+  min_score_kr?: number;
+  avg_down_enabled?: boolean;
+  avg_down_trigger_pct?: number;
+  avg_down_max_times?: number;
+  avg_down_qty_ratio?: number;
+  avg_down_min_interval_hours?: number;
 }
 
 export interface PositionKr {
