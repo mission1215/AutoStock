@@ -1254,6 +1254,12 @@ def add_trade(uid: str, market: str, stock_code: str, side: str,
         "price": price, "quantity": quantity, "reason": reason,
         "pnl": pnl, "timestamp": datetime.now(KST),
     })
+    s = (side or "").lower()
+    if s in ("buy", "sell"):
+        try:
+            _notify_telegram_trade(uid, market, stock_code, side, price, quantity, reason, pnl, stock_name)
+        except Exception as e:
+            logger.warning("[Telegram] 매매 알림 생략: %s", e)
 
 
 def _add_log(uid: str, level: str, message: str):
@@ -1263,22 +1269,66 @@ def _add_log(uid: str, level: str, message: str):
     logger.info("[%s][%s] %s", uid[:8], level, message)
 
 
-def _send_telegram(text: str) -> bool:
+def _send_telegram(
+    text: str,
+    *,
+    parse_mode: str | None = "HTML",
+    log_if_unconfigured: bool = True,
+) -> bool:
+    """텔레그램 봇 전송. parse_mode=None 이면 일반 텍스트(종목명 특수문자 이슈 회피)."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
-        logger.warning("[Telegram] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 미설정")
+        if log_if_unconfigured:
+            logger.warning("[Telegram] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 미설정")
         return False
     try:
+        payload: dict = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         resp = http_requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            json=payload,
             timeout=10,
         )
         return resp.status_code == 200
     except Exception as e:
         logger.error("[Telegram] 전송 실패: %s", e)
         return False
+
+
+def _notify_telegram_trade(
+    uid: str,
+    market: str,
+    stock_code: str,
+    side: str,
+    price: float,
+    quantity: int,
+    reason: str,
+    pnl: float,
+    stock_name: str,
+) -> None:
+    if not (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip() or not (os.environ.get("TELEGRAM_CHAT_ID") or "").strip():
+        return
+    label = "매수" if (side or "").lower() == "buy" else "매도"
+    mkt = (market or "KR").upper()
+    name = (stock_name or "").strip() or stock_code
+    if mkt == "KR":
+        pr = f"{float(price):,.0f}원"
+    else:
+        pr = f"${float(price):.2f}"
+    lines = [
+        f"📌 [AutoStock] {label} ({mkt})  uid={uid[:8]}…",
+        f"종목: {stock_code}  {name}",
+        f"수량: {quantity}  /  가격: {pr}",
+        f"사유: {reason or '-'}",
+    ]
+    if (side or "").lower() == "sell":
+        if mkt == "KR":
+            lines.append(f"손익: {float(pnl):+,.0f}원")
+        else:
+            lines.append(f"손익: ${float(pnl):+.2f}")
+    _send_telegram("\n".join(lines), parse_mode=None, log_if_unconfigured=False)
 
 
 # ══════════════════════════════════════════════════════════
