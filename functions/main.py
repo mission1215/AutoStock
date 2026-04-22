@@ -775,6 +775,18 @@ def _headers_us(uid: str, cfg: dict, tr_id: str) -> dict:
     }
 
 
+def _headers_kr_real(uid: str, cfg: dict, tr_id: str) -> dict:
+    """국내 시세(조회)용 — get_daily_ohlcv_kr·미국과 동일히 실서버 토큰 (VTS는 output2 비는 경우가 있음)"""
+    return {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {get_token_real(uid, cfg)}",
+        "appkey": cfg["app_key"],
+        "appsecret": cfg["app_secret"],
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+
+
 # ══════════════════════════════════════════════════════════
 # KIS API 클라이언트
 # ══════════════════════════════════════════════════════════
@@ -884,22 +896,32 @@ def get_current_price_kr(uid: str, cfg: dict, stock_code: str) -> dict:
 
 
 def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
+    """일봉 FHKST01010400 — 시세(공개)이므로 실서버+실서버 토큰.
+
+    openapivts(모의)는 output2가 비어 `일봉부족(0)`이 되는 사례가 있어, inquire-price와
+    같이 J→Q로 더 긴 쪽을 택해 반환.
+    """
     last_exc: BaseException | None = None
     for attempt in range(4):
         try:
-            _kis_pace()
-            resp = http_requests.get(
-                _base_url(cfg.get("is_mock", True)) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
-                headers=_headers(uid, cfg, "FHKST01010400"),
-                params={
-                    "FID_COND_MRKT_DIV_CODE": "J",
-                    "FID_INPUT_ISCD": stock_code,
-                    "FID_PERIOD_DIV_CODE": "D",
-                    "FID_ORG_ADJ_PRC": "0",
-                },
-                timeout=10,
-            )
-            return _parse(resp, uid, cfg).get("output2", [])
+            best: list = []
+            for div in ("J", "Q"):
+                _kis_pace()
+                resp = http_requests.get(
+                    _base_url(False) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
+                    headers=_headers_kr_real(uid, cfg, "FHKST01010400"),
+                    params={
+                        "FID_COND_MRKT_DIV_CODE": div,
+                        "FID_INPUT_ISCD": stock_code,
+                        "FID_PERIOD_DIV_CODE": "D",
+                        "FID_ORG_ADJ_PRC": "0",
+                    },
+                    timeout=10,
+                )
+                ohlcv = _parse(resp, uid, cfg).get("output2", [])
+                if len(ohlcv) > len(best):
+                    best = ohlcv
+            return best
         except ApiError as e:
             last_exc = e
             if attempt < 3 and _is_kis_tps_exceeded(e):
