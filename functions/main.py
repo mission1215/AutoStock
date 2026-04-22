@@ -1269,6 +1269,21 @@ def _add_log(uid: str, level: str, message: str):
     logger.info("[%s][%s] %s", uid[:8], level, message)
 
 
+def _telegram_creds() -> tuple[str, str]:
+    """trend_new_bot 등과 동일 봇: Firebase/Cloud에 같은 값만 넣으면 됨. 별칭 키 지원."""
+    token = (
+        (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        or (os.environ.get("TELEGRAM_TOKEN") or "").strip()
+        or (os.environ.get("TG_BOT_TOKEN") or "").strip()
+    )
+    chat_id = (
+        (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+        or (os.environ.get("TELEGRAM_CHAT") or "").strip()
+        or (os.environ.get("TG_CHAT_ID") or "").strip()
+    )
+    return token, chat_id
+
+
 def _send_telegram(
     text: str,
     *,
@@ -1276,11 +1291,12 @@ def _send_telegram(
     log_if_unconfigured: bool = True,
 ) -> bool:
     """텔레그램 봇 전송. parse_mode=None 이면 일반 텍스트(종목명 특수문자 이슈 회피)."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    token, chat_id = _telegram_creds()
     if not token or not chat_id:
         if log_if_unconfigured:
-            logger.warning("[Telegram] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 미설정")
+            logger.warning(
+                "[Telegram] 봇 미설정 — TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID(또는 TELEGRAM_TOKEN+TG_CHAT_ID 별칭)"
+            )
         return False
     try:
         payload: dict = {"chat_id": chat_id, "text": text}
@@ -1308,7 +1324,8 @@ def _notify_telegram_trade(
     pnl: float,
     stock_name: str,
 ) -> None:
-    if not (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip() or not (os.environ.get("TELEGRAM_CHAT_ID") or "").strip():
+    t, c = _telegram_creds()
+    if not t or not c:
         return
     label = "매수" if (side or "").lower() == "buy" else "매도"
     mkt = (market or "KR").upper()
