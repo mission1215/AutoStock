@@ -581,7 +581,10 @@ def get_config_raw(uid: str) -> dict:
 
 
 def get_config(uid: str) -> dict:
-    """활성 모드(mock/live) 프로필 + 공통 메타를 평면 dict 로 병합 (기존 코드 호환)."""
+    """활성 모드(mock/live) 프로필 + 공통 메타를 평면 dict 로 병합 (기존 코드 호환).
+
+    활성 모드 프로필에 자격증명이 없으면 다른 모드 프로필에서 폴백.
+    """
     raw = get_config_raw(uid)
     if not raw:
         return {}
@@ -590,6 +593,12 @@ def get_config(uid: str) -> dict:
     raw = _ensure_profiles_structure(raw)
     mode = "mock" if raw.get("is_mock", True) else "live"
     p = raw["profiles"].get(mode) or {}
+    # 자격증명이 없으면 다른 모드에서 폴백 (모드 전환 후 재설정 전까지 동작 보장)
+    if not (p.get("app_key") and p.get("app_secret") and p.get("account_no")):
+        other_mode = "live" if mode == "mock" else "mock"
+        other_p = raw["profiles"].get(other_mode) or {}
+        if other_p.get("app_key") and other_p.get("app_secret") and other_p.get("account_no"):
+            p = {**other_p, **{k: v for k, v in p.items() if v is not None}}
     out = {**p}
     out["is_mock"] = raw.get("is_mock", True)
     for k in ("setup_complete", "display_name", "email", "created_at"):
@@ -2538,11 +2547,19 @@ def merge_position_after_avg_down(
 
 def run_strategy_cycle_kr(uid: str, cfg: dict):
     state = get_bot_state(uid)
-    if not state.get("bot_enabled", True): return
-    if not state.get("is_market_open", False) and not _is_kr_market_open(): return
-    if state.get("trading_halted", False): return
-    # 드로우다운 체크는 밸런스 API 호출 비용이 커 5분마다로 제한 (이미 halt면 위에서 return)
     now_min = datetime.now(KST).minute
+    if not state.get("bot_enabled", True):
+        if now_min % 10 == 0:
+            _add_log(uid, "INFO", "[KR] 봇 비활성 상태 — 전략 사이클 건너뜀 (UI에서 시작 필요)")
+        return
+    if not state.get("is_market_open", False) and not _is_kr_market_open():
+        return
+    if state.get("trading_halted", False):
+        if now_min % 10 == 0:
+            reason = state.get("halt_reason", "")
+            _add_log(uid, "WARNING", f"[KR] 매매 중단 상태 — halt_reason={reason or '없음'} (resume 필요)")
+        return
+    # 드로우다운 체크는 밸런스 API 호출 비용이 커 5분마다로 제한 (이미 halt면 위에서 return)
     if now_min % 5 == 0 and _check_drawdown(uid, cfg):
         return
 
@@ -2893,9 +2910,13 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
             _add_log(uid, "ERROR", f"[KR][{code}] 매수 체크 오류: {e}")
 
     bought = [p for p in diag_parts if "✅" in p]
-    if verbose and diag_parts:
-        label = "스캔결과" if bought else "매수없음"
-        _add_log(uid, "INFO", f"[KR] {label} | {' | '.join(diag_parts)}")
+    if verbose:
+        if diag_parts:
+            label = "스캔결과" if bought else "매수없음"
+            _add_log(uid, "INFO", f"[KR] {label} | {' | '.join(diag_parts)}")
+        else:
+            wl = cfg.get("kr_watchlist", [])
+            _add_log(uid, "WARNING", f"[KR] 감시종목 없음 — kr_watchlist={wl} (설정 필요)")
 
 
 # ══════════════════════════════════════════════════════════
@@ -4217,15 +4238,37 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
 def _get_all_users() -> list[tuple[str, dict]]:
     """설정 완료된 유저 목록 반환 [(uid, cfg), ...].
 
-    `profiles.mock` / `profiles.live` 에만 키가 있는 문서는 raw 로는 app_key 가 없어
-    스케줄이 전부 스킵되므로 반드시 get_config(병합)로 읽는다.
+    활성 모드 프로필에 자격증명이 없으면 다른 모드 프로필로 폴백.
     """
     result = []
+    total = 0
     for user_doc in get_db().collection("users").stream():
         uid = user_doc.id
+        total += 1
         cfg = get_config(uid)
-        if cfg.get("app_key") and cfg.get("app_secret") and cfg.get("account_no"):
-            result.append((uid, cfg))
+        if not (cfg.get("app_key") and cfg.get("app_secret") and cfg.get("account_no")):
+            # 활성 모드 프로필에 자격증명 없음 → 다른 모드 프로필에서 폴백 시도
+            raw = get_config_raw(uid)
+            profs = raw.get("profiles") or {}
+            active_mode = "mock" if raw.get("is_mock", True) else "live"
+            fallback_mode = "live" if active_mode == "mock" else "mock"
+            fallback_prof = profs.get(fallback_mode) or {}
+            if fallback_prof.get("app_key") and fallback_prof.get("app_secret") and fallback_prof.get("account_no"):
+                cfg = {**fallback_prof, "is_mock": raw.get("is_mock", True)}
+                for k in ("setup_complete", "display_name", "email", "created_at"):
+                    if k in raw:
+                        cfg[k] = raw[k]
+                logging.warning(
+                    f"[_get_all_users] {uid[:8]}… 활성모드={active_mode} 자격증명 없음 "
+                    f"→ {fallback_mode} 프로필로 폴백"
+                )
+            else:
+                missing = [k for k in ("app_key", "app_secret", "account_no") if not cfg.get(k)]
+                logging.warning(f"[_get_all_users] {uid[:8]}… 자격증명 미완료 {missing} — 스킵")
+                continue
+        result.append((uid, cfg))
+    if not result:
+        logging.warning(f"[_get_all_users] 유효 유저 0명 (전체 {total}명 검색) — 전략 사이클 실행 안됨")
     return result
 
 
@@ -4337,13 +4380,14 @@ def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
     market_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
     market_end = now.replace(hour=15, minute=20, second=0, microsecond=0)
     if not (market_start <= now <= market_end): return
-    for uid, cfg in _get_all_users():
+    all_users = _get_all_users()
+    for uid, cfg in all_users:
         try:
             run_strategy_cycle_kr(uid, cfg)
         except Exception as e:
             _add_log(uid, "ERROR", f"전략 사이클 오류: {e}")
-    if now.minute % 10 == 0:
-        logging.info(f"[scheduled_strategy_cycle] heartbeat {now.strftime('%H:%M')}")
+    if now.minute % 5 == 0:
+        logging.info(f"[scheduled_strategy_cycle] heartbeat users={len(all_users)} {now.strftime('%H:%M')}")
 
 
 @scheduler_fn.on_schedule(
@@ -4810,7 +4854,8 @@ def route_setup():
     prof = {k: cfg_flat[k] for k in _CONFIG_PROFILE_KEYS if k in cfg_flat}
     mode = "mock" if is_m else "live"
     other = "live" if mode == "mock" else "mock"
-    seed_other = {k: v for k, v in prof.items() if k not in ("app_key", "app_secret", "account_no")}
+    # 두 프로필 모두 자격증명 포함: 모드 전환 시 _get_all_users 드롭 방지
+    seed_other = dict(prof)
     doc_out = {
         "is_mock": is_m,
         "setup_complete": True,
