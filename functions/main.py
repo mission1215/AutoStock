@@ -798,6 +798,13 @@ class ApiError(Exception):
         self.msg_cd = msg_cd
 
 
+def _is_kis_mkt_div_mismatch(e: ApiError) -> bool:
+    """KIS가 종목-시장불일치 시(J↔Q) FID_COND 오류. 다른 div 재시도."""
+    m = f"{e} {getattr(e, 'msg_cd', '') or ''}"
+    m = m.upper()
+    return "INVALID FID_COND_MRKT" in m or "INVALID FID" in m and "MRKT" in m
+
+
 def _headers(uid: str, cfg: dict, tr_id: str) -> dict:
     return {
         "Content-Type": "application/json; charset=utf-8",
@@ -899,26 +906,31 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
     """일봉 FHKST01010400 — 시세(공개)이므로 실서버+실서버 토큰.
 
     openapivts(모의)는 output2가 비어 `일봉부족(0)`이 되는 사례가 있어, inquire-price와
-    같이 J→Q로 더 긴 쪽을 택해 반환.
+    같이 J→Q로 더 긴 쪽을 택해 반환. KOSPI에 Q(코스닥)로 부르면 INVALID FID 오류 → 스킵.
     """
     last_exc: BaseException | None = None
     for attempt in range(4):
         try:
             best: list = []
             for div in ("J", "Q"):
-                _kis_pace()
-                resp = http_requests.get(
-                    _base_url(False) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
-                    headers=_headers_kr_real(uid, cfg, "FHKST01010400"),
-                    params={
-                        "FID_COND_MRKT_DIV_CODE": div,
-                        "FID_INPUT_ISCD": stock_code,
-                        "FID_PERIOD_DIV_CODE": "D",
-                        "FID_ORG_ADJ_PRC": "0",
-                    },
-                    timeout=10,
-                )
-                ohlcv = _parse(resp, uid, cfg).get("output2", [])
+                try:
+                    _kis_pace()
+                    resp = http_requests.get(
+                        _base_url(False) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
+                        headers=_headers_kr_real(uid, cfg, "FHKST01010400"),
+                        params={
+                            "FID_COND_MRKT_DIV_CODE": div,
+                            "FID_INPUT_ISCD": stock_code,
+                            "FID_PERIOD_DIV_CODE": "D",
+                            "FID_ORG_ADJ_PRC": "0",
+                        },
+                        timeout=10,
+                    )
+                    ohlcv = _parse(resp, uid, cfg).get("output2", [])
+                except ApiError as e:
+                    if _is_kis_mkt_div_mismatch(e):
+                        continue
+                    raise
                 if len(ohlcv) > len(best):
                     best = ohlcv
             return best
