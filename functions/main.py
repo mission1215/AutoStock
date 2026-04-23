@@ -729,9 +729,8 @@ def invalidate_token(uid: str):
 
 
 def get_token_real(uid: str, cfg: dict) -> str:
-    """미국 주식 전용 실서버 토큰.
-    is_mock 설정과 무관하게 항상 실서버(openapi.koreainvestment.com)에서 발급.
-    모의 토큰으로 실서버 US 시세 API를 호출하면 401 → 이 함수로 해결.
+    """실전 도메인 전용 토큰(국내 일봉 `inquire-daily-price` 실시세 등).
+    모의 앱키로는 실전 OAuth가 거절될 수 있음 — 미국 잔고/주문은 `get_token`+VTS 사용.
     """
     doc = _uref(uid).collection("state").document("token_real").get()
     now = datetime.now(KST)
@@ -765,10 +764,10 @@ def get_token_real(uid: str, cfg: dict) -> str:
 
 
 def _headers_us(uid: str, cfg: dict, tr_id: str) -> dict:
-    """미국 주식 시세 API 헤더 — 항상 실서버 토큰 사용 (모의/실전 무관)"""
+    """미국(해외) API 헤더 — is_mock이면 VTS+모의토큰, 실전이면 실서버+실토큰. 앱키·도메인 불일치 시 HTTP 500."""
     return {
         "Content-Type": "application/json; charset=utf-8",
-        "authorization": f"Bearer {get_token_real(uid, cfg)}",
+        "authorization": f"Bearer {get_token(uid, cfg)}",
         "appkey": cfg["app_key"],
         "appsecret": cfg["app_secret"],
         "tr_id": tr_id,
@@ -777,7 +776,7 @@ def _headers_us(uid: str, cfg: dict, tr_id: str) -> dict:
 
 
 def _headers_kr_real(uid: str, cfg: dict, tr_id: str) -> dict:
-    """국내 시세(조회)용 — get_daily_ohlcv_kr·미국과 동일히 실서버 토큰 (VTS는 output2 비는 경우가 있음)"""
+    """국내 시세(조회)용 — get_daily_ohlcv_kr, VTS output2 공백 시 실서버 일봉용"""
     return {
         "Content-Type": "application/json; charset=utf-8",
         "authorization": f"Bearer {get_token_real(uid, cfg)}",
@@ -846,6 +845,13 @@ def _parse(resp: http_requests.Response, uid: str, cfg: dict) -> dict:
 
 def _tr_id(cfg: dict, real_id: str, mock_id: str) -> str:
     return mock_id if cfg.get("is_mock", True) else real_id
+
+
+def _us_tr_id(cfg: dict, j_tr_id: str) -> str:
+    """해외주식 TR_ID — 모의투자는 J→V (예: JTTT3012R→VTTT3012R). 한투 API 관례."""
+    if cfg.get("is_mock", True) and j_tr_id and j_tr_id[:1] == "J":
+        return "V" + j_tr_id[1:]
+    return j_tr_id
 
 
 def _with_retry(func, *args, retries: int = 3, **kwargs):
@@ -1054,11 +1060,11 @@ def _us_excd_quote(stock_code: str) -> str:
 
 
 def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
-    """미국 주식 현재가 조회 — 항상 실서버 + 실서버 토큰"""
+    """미국 주식 현재가 — is_mock마다 동일 도메인+토큰 짝 (모의앱키+실서버 호출 불가)."""
     def _call():
         _kis_pace()
         resp = http_requests.get(
-            _base_url(False) + "/uapi/overseas-price/v1/quotations/price",
+            _base_url(cfg.get("is_mock", True)) + "/uapi/overseas-price/v1/quotations/price",
             headers=_headers_us(uid, cfg, "HHDFS00000300"),
             params={"AUTH": "", "EXCD": _us_excd_quote(stock_code), "SYMB": stock_code},
             timeout=10,
@@ -1072,13 +1078,13 @@ def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
 
 
 def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
-    """미국 주식 일봉 조회 — 항상 실서버 + 실서버 토큰"""
+    """미국 주식 일봉 — get_current_price_us와 동일 호스트/인증."""
     last_exc: BaseException | None = None
     for attempt in range(4):
         try:
             _kis_pace()
             resp = http_requests.get(
-                _base_url(False) + "/uapi/overseas-price/v1/quotations/dailyprice",
+                _base_url(cfg.get("is_mock", True)) + "/uapi/overseas-price/v1/quotations/dailyprice",
                 headers=_headers_us(uid, cfg, "HHDFS76240000"),
                 params={
                     "AUTH": "", "EXCD": _us_excd_quote(stock_code),
@@ -1098,12 +1104,13 @@ def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
 
 
 def get_balance_us(uid: str, cfg: dict) -> dict:
-    """미국 주식 잔고 조회 — 항상 실서버 (VTS 미지원)"""
+    """미국 주식 잔고 — 모의: VTS + VTTT3012R, 실전: JTTT3012R."""
     def _call():
         _kis_pace()
+        tr_id = _us_tr_id(cfg, "JTTT3012R")
         resp = http_requests.get(
-            _base_url(False) + "/uapi/overseas-stock/v1/trading/inquire-balance",
-            headers=_headers_us(uid, cfg, "JTTT3012R"),
+            _base_url(cfg.get("is_mock", True)) + "/uapi/overseas-stock/v1/trading/inquire-balance",
+            headers=_headers_us(uid, cfg, tr_id),
             params={
                 "CANO": _account_prefix(cfg["account_no"]),
                 "ACNT_PRDT_CD": _account_suffix(cfg["account_no"]),
@@ -1118,9 +1125,8 @@ def get_balance_us(uid: str, cfg: dict) -> dict:
 
 
 def place_order_us(uid: str, cfg: dict, stock_code: str, side: str, quantity: int, price: float = 0) -> dict:
-    """미국 주식 매수/매도 주문"""
-    # KIS VTS(모의)는 미국 주식 매매 미지원 → 항상 실서버 + 실서버 TR ID
-    tr_id = "JTTT1002U" if side == "buy" else "JTTT1006U"
+    """미국 주식 매수/매도 — 모의: VTTT1002U/VTTT1006U + VTS."""
+    tr_id = _us_tr_id(cfg, "JTTT1002U" if side == "buy" else "JTTT1006U")
     ord_dvsn = "00" if price > 0 else "01"  # 00=지정가, 01=시장가
     body = {
         "CANO": _account_prefix(cfg["account_no"]),
@@ -1135,7 +1141,7 @@ def place_order_us(uid: str, cfg: dict, stock_code: str, side: str, quantity: in
     def _call():
         _kis_pace()
         resp = http_requests.post(
-            _base_url(False) + "/uapi/overseas-stock/v1/trading/order",
+            _base_url(cfg.get("is_mock", True)) + "/uapi/overseas-stock/v1/trading/order",
             headers=_headers_us(uid, cfg, tr_id),
             json=body,
             timeout=15,
@@ -1631,7 +1637,7 @@ def reconcile_positions(uid: str, cfg: dict, market: str) -> dict:
 #
 # 사용 API:
 #   - KR: /uapi/domestic-stock/v1/trading/inquire-daily-ccld (TR_ID TTTC8001R/VTTC8001R)
-#   - US: /uapi/overseas-stock/v1/trading/inquire-ccnl       (TR_ID JTTT3001R)
+#   - US: /uapi/overseas-stock/v1/trading/inquire-ccnl (JTTT3001R / 모의 VTTT3001R)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _today_kst_yyyymmdd() -> str:
@@ -1715,7 +1721,7 @@ def inquire_order_fill_us(uid: str, cfg: dict, order_no: str) -> dict | None:
     """미국 주문체결조회 — order_no 와 일치하는 항목 반환 (없으면 None).
 
     KIS API: /uapi/overseas-stock/v1/trading/inquire-ccnl
-       TR_ID: JTTT3001R (US는 모의서버 미지원이라 실서버 고정)
+       TR_ID: JTTT3001R / 모의 VTTT3001R
     평균 체결가 필드 우선순위: ft_ccld_unpr3 → avg_prvs → ovrs_ord_unpr.
 
     반환 dict 키:
@@ -1724,12 +1730,12 @@ def inquire_order_fill_us(uid: str, cfg: dict, order_no: str) -> dict | None:
     if not order_no or order_no in ("N/A", "0"):
         return None
     today = _today_kst_yyyymmdd()
-    tr_id = "JTTT3001R"
+    tr_id = _us_tr_id(cfg, "JTTT3001R")
 
     def _call():
         _kis_pace()
         resp = http_requests.get(
-            _base_url(False)
+            _base_url(cfg.get("is_mock", True))
             + "/uapi/overseas-stock/v1/trading/inquire-ccnl",
             headers=_headers_us(uid, cfg, tr_id),
             params={
