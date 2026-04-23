@@ -205,7 +205,10 @@ def _cached_ohlcv(uid: str, cfg: dict, code: str, market: str) -> list:
 
 
 # ── 주요 한국 종목명 맵 ──────────────────────────────────────
-# REST API에서 획득한 KR 종목명 인메모리 캐시
+# 1) 정확한 표시명은 항상 KIS에서 온다: `inquire-price`·잔고의 hts_kor_isnm / prdt_name
+#    → `_stock_name(한글명, code)`에 넣으면 그대로 쓰고, KR은 `_kr_name_cache`에도 저장.
+# 2) 아래 dict / US_STOCK_NAMES 는 API가 비었거나(일시 오류) 아직 시세를 못 부른
+#    콜드스타트 구간의 폴백이지, “마스터 데이터”가 아님. 상장폐지·이름 변경은 API가 우선.
 # Cloud Function 인스턴스가 재사용될 때 유지되므로 WebSocket 폴백 시 활용
 _kr_name_cache: dict[str, str] = {}
 
@@ -312,6 +315,11 @@ US_SECTOR_MAP: dict[str, str] = {
 
 
 def _stock_name(api_name: str, code: str, market: str = "KR") -> str:
+    """표시용 종목명. 우선순위: (1) API에서 준 공식명 (2) 이번 인스턴스 캐시 (3) 정적 폴백 (4) 티커.
+
+    자동/수동 매수·/api/status 의 enrich 경로는 가능하면 `get_current_price_*` / 잔고에서
+    받은 `hts_kor_isnm`·`prdt_name`을 api_name으로 넣는다. dict는 보조용.
+    """
     name = (api_name or "").strip()
     if name:
         # KR은 REST API에서 얻은 이름을 인스턴스 캐시에 저장 (WebSocket 폴백용)
