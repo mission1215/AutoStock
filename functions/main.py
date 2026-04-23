@@ -218,7 +218,8 @@ KR_STOCK_NAMES: dict[str, str] = {
     "017670": "SK텔레콤", "015760": "한국전력", "105560": "KB금융",
     "055550": "신한지주", "086790": "하나금융지주", "316140": "우리금융지주",
     "032830": "삼성생명", "033780": "KT&G", "028260": "삼성물산",
-    "012330": "현대모비스", "009150": "삼성전기", "011070": "LG이노텍",
+    "012330": "현대모비스", "066570": "LG전자", "034220": "LG디스플레이",
+    "009150": "삼성전기", "011070": "LG이노텍",
     "042700": "한미반도체", "000810": "삼성화재", "005490": "POSCO홀딩스",
     "010130": "고려아연", "004020": "현대제철", "009830": "한화솔루션",
     "010950": "S-Oil", "011200": "HMM", "003490": "대한항공",
@@ -5073,11 +5074,17 @@ def route_status():
                     qty = int(pos.get("quantity") or 0)
                     pnl = (current - bp) * qty
                     pnl_ratio = ((current - bp) / bp * 100) if bp else 0.0
+                    psn = (pos.get("stock_name") or "").strip()
+                    # Firestore·AI가 티커만 넣은 경우(066570) 등 → 시세/맵 기준 이름
+                    if not psn or psn == code:
+                        disp_name = sname
+                    else:
+                        disp_name = psn
                     detail[code] = {
                         **pos,
                         "entry_time": _ts_to_str(pos.get("entry_time")),
                         "current_price": current,
-                        "stock_name": pos.get("stock_name") or sname,
+                        "stock_name": disp_name,
                         "change_rate": change_rate,
                         "pnl": round(pnl, 2),
                         "pnl_ratio": round(pnl_ratio, 2),
@@ -5464,6 +5471,11 @@ def route_trades():
         for doc in docs:
             t = doc.to_dict()
             t["timestamp"] = _ts_to_str(t.get("timestamp"))
+            code = str(t.get("stock_code", "") or "").strip()
+            mkt = str(t.get("market", "KR") or "KR").upper()
+            sn = (t.get("stock_name") or "").strip()
+            if code and (not sn or sn == code):
+                t["stock_name"] = _stock_name("", code, "US" if mkt == "US" else "KR")
             trades.append(t)
         return jsonify({"ok": True, "trades": trades})
     except Exception as e:
