@@ -75,6 +75,7 @@ import os
 import math
 import logging
 import time as time_module
+from pathlib import Path
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -94,6 +95,21 @@ KST = ZoneInfo("Asia/Seoul")
 ET  = ZoneInfo("America/New_York")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# functions/.env — 로컬·배포 패키지에 포함될 때 텔레그램·Gemini 키 등 주입 (kis_ws.py 와 동일)
+_env_path = Path(__file__).resolve().parent / ".env"
+if _env_path.is_file():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_path)
+        logger.info("Loaded environment variables from .env")
+    except ImportError:
+        for line in _env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+        logger.info("Loaded .env (manual parse, no python-dotenv)")
 
 # KIS OpenAPI: 초당 거래(조회·주문) 건수 제한 — HTTP 500 "초당 거래건수를 초과하였습니다"
 # 주문·주문가능까지 같은 간격으로 묶이므로 0.2 미만이면 AI 연속 매수에서 자주 걸림
@@ -1465,6 +1481,12 @@ def _send_telegram(
             json=payload,
             timeout=10,
         )
+        if resp.status_code != 200:
+            logger.error(
+                "[Telegram] sendMessage HTTP %s: %s",
+                resp.status_code,
+                (resp.text or "")[:500],
+            )
         return resp.status_code == 200
     except Exception as e:
         logger.error("[Telegram] 전송 실패: %s", e)
@@ -3163,7 +3185,7 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                 elif current > target * (1 + max_slip):
                     reason.append(f"추격금지(현재{current:,}/상한{target*(1+max_slip):,.0f})")
                 if not above_ma5:
-                    reason.append(f"MA5하회(현재{current:,}/MA5{ma5:,.0f})")
+                    reason.append(f"MA5하회(현재{current:,}/MA5={ma5:,.0f})")
                 diag_parts.append(f"{code}:{'·'.join(reason) or '조건미달'}")
         except Exception as e:
             diag_parts.append(f"{code}=오류")

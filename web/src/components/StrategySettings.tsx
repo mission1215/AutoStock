@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { apiFetch } from "../api/client";
 import type { AppConfig, ModeProfiles } from "../types";
+import {
+  getStrategyPreset,
+  STRATEGY_TIER_LABELS,
+  type StrategyTier,
+} from "../config/strategyPresets";
 
 type StrategyFormState = {
   k: string;
@@ -26,22 +31,17 @@ type StrategyFormState = {
   avgDownGapH: string;
 };
 
-const PRESET_MOCK: StrategyFormState = {
-  k: "0.3", ma: "5", stopPct: "3.0", maxPct: "20", dailyPct: "1.0",
-  idxGatePct: "0", minScoreKr: "25",
-  krWl: "005930,000660,035420,035720,051910", usWl: "AAPL,NVDA,TSLA,MSFT,GOOGL", aiCount: 5,
-  partialTpEn: true, partialTpTrig: "2.0", partialTpSell: "30", partialTpTight: true,
-  slipMockPct: "5.0", slipLivePct: "3.0",
-  avgDownEn: true, avgDownTrig: "4.0", avgDownMax: "2", avgDownQty: "35", avgDownGapH: "20",
+/** 권장 기본(보통) — 모의/실전 프리셋 */
+const WATCH_DEFAULTS = {
+  krWl: "005930,000660,035420,035720,051910",
+  usWl: "AAPL,NVDA,TSLA,MSFT,GOOGL",
 };
 
+const PRESET_MOCK: StrategyFormState = {
+  ...getStrategyPreset("balanced", true, WATCH_DEFAULTS),
+};
 const PRESET_LIVE: StrategyFormState = {
-  k: "0.5", ma: "5", stopPct: "2.0", maxPct: "10", dailyPct: "2.0",
-  idxGatePct: "1.5", minScoreKr: "40",
-  krWl: "005930,000660,035420,035720,051910", usWl: "AAPL,NVDA,TSLA,MSFT,GOOGL", aiCount: 5,
-  partialTpEn: true, partialTpTrig: "3.0", partialTpSell: "30", partialTpTight: true,
-  slipMockPct: "5.0", slipLivePct: "3.0",
-  avgDownEn: false, avgDownTrig: "4.0", avgDownMax: "2", avgDownQty: "35", avgDownGapH: "20",
+  ...getStrategyPreset("balanced", false, WATCH_DEFAULTS),
 };
 
 function configToForm(config: Partial<AppConfig> | undefined): StrategyFormState {
@@ -58,7 +58,10 @@ function configToForm(config: Partial<AppConfig> | undefined): StrategyFormState
     minScoreKr: config.min_score_kr != null ? String(config.min_score_kr) : base.minScoreKr,
     krWl: Array.isArray(config.kr_watchlist) ? config.kr_watchlist.join(",") : String(config.kr_watchlist || base.krWl),
     usWl: Array.isArray(config.us_watchlist) ? config.us_watchlist.join(",") : String(config.us_watchlist || base.usWl),
-    aiCount: parseInt(String(config.ai_stock_count), 10) || base.aiCount,
+    aiCount: (() => {
+      const n = Number(config.ai_stock_count);
+      return Number.isFinite(n) && n >= 3 && n <= 5 ? Math.round(n) : base.aiCount;
+    })(),
     partialTpEn: config.partial_tp_enabled !== false,
     partialTpTrig: config.partial_tp_trigger_pct != null ? (config.partial_tp_trigger_pct * 100).toFixed(1) : base.partialTpTrig,
     partialTpSell: config.partial_tp_sell_ratio != null ? String(Math.round(config.partial_tp_sell_ratio * 100)) : base.partialTpSell,
@@ -86,7 +89,7 @@ export function StrategySettings({
   idToken: string;
   config: AppConfig | undefined;
   profiles?: ModeProfiles;
-  onSaved: () => void;
+  onSaved: () => void | Promise<void>;
 }) {
   const [mockForm, setMockForm] = useState<StrategyFormState>(() => ({ ...PRESET_MOCK }));
   const [liveForm, setLiveForm] = useState<StrategyFormState>(() => ({ ...PRESET_LIVE }));
@@ -94,6 +97,7 @@ export function StrategySettings({
   const [dirty, setDirty] = useState(false);
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
+  const [tierHint, setTierHint] = useState<string | null>(null);
 
   const profilesStr = useMemo(() => (profiles ? JSON.stringify(profiles) : ""), [profiles]);
 
@@ -121,13 +125,29 @@ export function StrategySettings({
     else setLiveForm((prev) => ({ ...prev, ...p }));
   }
 
-  function applyPreset() {
+  /** 이전 "모의/실전 권장값" = 보통(균형) 프리셋 + 현재 감시종목 유지 */
+  function applyModeDefaults() {
     setDirty(true);
-    const preset = isMock ? PRESET_MOCK : PRESET_LIVE;
     const current = isMock ? mockForm : liveForm;
-    const merged = { ...preset, krWl: current.krWl, usWl: current.usWl, aiCount: current.aiCount };
-    if (isMock) setMockForm(merged);
-    else setLiveForm(merged);
+    const next = getStrategyPreset("balanced", isMock, {
+      krWl: current.krWl,
+      usWl: current.usWl,
+    });
+    if (isMock) setMockForm({ ...next });
+    else setLiveForm({ ...next });
+    setTierHint(STRATEGY_TIER_LABELS.balanced.blurb);
+  }
+
+  function applyStrategyTier(tier: StrategyTier) {
+    setDirty(true);
+    const current = isMock ? mockForm : liveForm;
+    const next = getStrategyPreset(tier, isMock, {
+      krWl: current.krWl,
+      usWl: current.usWl,
+    });
+    if (isMock) setMockForm({ ...next });
+    else setLiveForm({ ...next });
+    setTierHint(STRATEGY_TIER_LABELS[tier].blurb);
   }
 
   async function save() {
@@ -151,7 +171,7 @@ export function StrategySettings({
         kr_watchlist: form.krWl.split(",").map((s) => s.trim()).filter(Boolean),
         us_watchlist: form.usWl.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean),
         is_mock: isMock,
-        ai_stock_count: form.aiCount,
+        ai_stock_count: Math.min(5, Math.max(3, Math.round(Number(form.aiCount)) || 5)),
         partial_tp_enabled: form.partialTpEn,
         partial_tp_trigger_pct: (parseFloat(form.partialTpTrig) || 5) / 100,
         partial_tp_sell_ratio: (parseFloat(form.partialTpSell) || 30) / 100,
@@ -173,9 +193,9 @@ export function StrategySettings({
         body: JSON.stringify(payload),
       });
       if (data.ok) {
-        setDirty(false);
         setMsg("✅ 저장 완료");
-        onSaved();
+        await Promise.resolve(onSaved());
+        setDirty(false);
         setTimeout(() => setMsg(""), 2500);
       } else {
         setMsg("❌ " + (data.error || "오류"));
@@ -210,12 +230,35 @@ export function StrategySettings({
           </select>
           <button
             type="button"
-            onClick={applyPreset}
+            onClick={applyModeDefaults}
             className="px-3 py-2 rounded-xl text-xs border border-white/10 text-slate-400 hover:text-white hover:border-white/30 transition-all"
           >
-            {isMock ? "모의 권장값 적용" : "실전 권장값 적용"}
+            {isMock ? "모의: 보통 권장값" : "실전: 보통 권장값"}
           </button>
           <span className="text-[11px] text-slate-600">모의·실전 각각 별도 저장</span>
+        </div>
+
+        <div className="rounded-xl border border-indigo-500/25 bg-indigo-500/5 px-3 py-3 space-y-2">
+          <p className="text-xs text-slate-400">
+            <span className="text-indigo-300 font-medium">성향 프리셋</span> — 흔히 쓰는 위험·진입
+            민감도 묶음입니다. 수익을 보장하지 않으며,{" "}
+            <span className="text-slate-500">저장</span>해야 서버에 반영됩니다.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {(["conservative", "balanced", "aggressive"] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => applyStrategyTier(t)}
+                className="px-3 py-2 rounded-lg text-xs font-medium border border-white/10 bg-white/5 text-slate-200 hover:border-indigo-500/50 hover:bg-indigo-500/10"
+              >
+                {STRATEGY_TIER_LABELS[t].title}
+              </button>
+            ))}
+          </div>
+          {tierHint && (
+            <p className="text-[11px] text-slate-500 leading-relaxed border-t border-white/5 pt-2">{tierHint}</p>
+          )}
         </div>
 
         {/* 기본 설정 */}
