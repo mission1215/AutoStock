@@ -1471,6 +1471,9 @@ def _send_telegram(
         return False
 
 
+_telegram_trade_missed_config_logged: bool = False
+
+
 def _notify_telegram_trade(
     uid: str,
     market: str,
@@ -1482,8 +1485,15 @@ def _notify_telegram_trade(
     pnl: float,
     stock_name: str,
 ) -> None:
+    global _telegram_trade_missed_config_logged
     t, c = _telegram_creds()
     if not t or not c:
+        if not _telegram_trade_missed_config_logged:
+            _telegram_trade_missed_config_logged = True
+            logger.warning(
+                "[Telegram] 매매 알림이 나가지 않습니다. Cloud Functions 환경에 "
+                "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID(또는 별칭)를 넣고 재배포하세요."
+            )
         return
     label = "매수" if (side or "").lower() == "buy" else "매도"
     mkt = (market or "KR").upper()
