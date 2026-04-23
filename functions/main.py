@@ -917,37 +917,146 @@ def get_current_price_kr(uid: str, cfg: dict, stock_code: str) -> dict:
     return _with_retry(_call)
 
 
-def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
-    """일봉 FHKST01010400 — 시세(공개)이므로 실서버+실서버 토큰.
+def _kr_ohlcv_fallback_from_inquire_price(uid: str, cfg: dict, stock_code: str) -> list:
+    """FHKST01010400가 빈 `output2`일 때, FHKST01010100(주식현재가)로 최소 5일분·동일 키 형식 합성.
 
-    openapivts(모의)는 output2가 비어 `일봉부족(0)`이 되는 사례가 있어, inquire-price와
-    같이 J→Q로 더 긴 쪽을 택해 반환. KOSPI에 Q(코스닥)로 부르면 INVALID FID 오류 → 스킵.
+    모의 앱키로 실서버 일봉 토큰/응답이 비는 경우가 많아, 당일 시가·고저·누적거래량과
+    전일 종·(가능 시) 전일 고저로 어제 봉을 구성한 뒤, MA5용으로 예전 봉은 전일 종가
+    주변을 소폭만 흔든 값으로 채운다(스코어·K팩터·ATR이 돌 수준).
+    """
+    try:
+        data = get_current_price_kr(uid, cfg, stock_code)
+        out = data.get("output") or {}
+    except Exception:
+        return []
+    if not isinstance(out, dict):
+        return []
+
+    def _f(*keys: str) -> float:
+        for k in keys:
+            v = out.get(k)
+            if v is None or str(v).strip() in ("", "-", "0", "0.00", "0.0"):
+                continue
+            try:
+                x = float(str(v).replace(",", ""))
+            except Exception:
+                continue
+            return x
+        return 0.0
+
+    cur = _f("stck_prpr", "stck_clpr", "antc_cnpr")
+    op = _f("stck_oprc") or cur
+    th = _f("stck_hgpr") or cur
+    tl = _f("stck_lwpr") or cur
+    pcls = _f("prdy_clpr", "stck_prdy_clpr", "bfdy_clpr")
+    if pcls <= 0 and cur > 0:
+        pct = _f("prdy_ctrt")
+        if abs(pct) < 0.0001:
+            pcls = cur
+        else:
+            pcls = cur / (1.0 + pct / 100.0)
+    if cur <= 0 and pcls > 0:
+        cur = pcls
+    if cur <= 0:
+        return []
+    if pcls <= 0:
+        pcls = cur
+    ph = _f("stck_prdy_hgpr", "prdy_hgpr")
+    pl = _f("stck_prdy_lwpr", "prdy_lwpr")
+    if ph <= 0 or pl <= 0 or ph < pl:
+        ph, pl = pcls * 1.012, pcls * 0.988
+    vol0 = int(_f("acml_vol") or 0) or 1
+    pvol = int(_f("acml_vol") or 0) or max(1, vol0 // 2)
+
+    def _row(o: float, h: float, l: float, c: float, v: int) -> dict:
+        return {
+            "stck_oprc": o,
+            "stck_hgpr": h,
+            "stck_lwpr": l,
+            "stck_clpr": c,
+            "acml_vol": str(v),
+        }
+
+    r0 = _row(op, th, tl, cur, vol0)
+    r1 = _row(pcls, ph, pl, pcls, pvol)
+    p2, p3, p4 = pcls * 0.999, pcls * 0.998, pcls * 0.997
+    r2 = _row(p2, p2 * 1.008, p2 * 0.992, p2, pvol)
+    r3 = _row(p3, p3 * 1.008, p3 * 0.992, p3, pvol)
+    r4 = _row(p4, p4 * 1.008, p4 * 0.992, p4, pvol)
+    return [r0, r1, r2, r3, r4]
+
+
+def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
+    """일봉 FHKST01010400. 실서버·모의 VTS·마지막으로 현재가 합성 순으로 충전.
+
+    - 실서버+`get_token_real`: 실전/일부 키에서 `output2` 정상
+    - 모의 VTS+`get_token`: 일부 환경에서만 일봉 있음
+    - 모의 앱키로 실서버 일봉이 비는 경우 다수 → `FHKST01010100`로 합성(전략 동작)
+    - KOSPI+`Q` 등 INVALID FID 는 스킵(기존)
     """
     last_exc: BaseException | None = None
     for attempt in range(4):
         try:
             best: list = []
-            for div in ("J", "Q"):
-                try:
-                    _kis_pace()
-                    resp = http_requests.get(
-                        _base_url(False) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
-                        headers=_headers_kr_real(uid, cfg, "FHKST01010400"),
-                        params={
-                            "FID_COND_MRKT_DIV_CODE": div,
-                            "FID_INPUT_ISCD": stock_code,
-                            "FID_PERIOD_DIV_CODE": "D",
-                            "FID_ORG_ADJ_PRC": "0",
-                        },
-                        timeout=10,
-                    )
-                    ohlcv = _parse(resp, uid, cfg).get("output2", [])
-                except ApiError as e:
-                    if _is_kis_mkt_div_mismatch(e):
-                        continue
-                    raise
-                if len(ohlcv) > len(best):
-                    best = ohlcv
+            try:
+                for div in ("J", "Q"):
+                    try:
+                        _kis_pace()
+                        resp = http_requests.get(
+                            _base_url(False) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
+                            headers=_headers_kr_real(uid, cfg, "FHKST01010400"),
+                            params={
+                                "FID_COND_MRKT_DIV_CODE": div,
+                                "FID_INPUT_ISCD": stock_code,
+                                "FID_PERIOD_DIV_CODE": "D",
+                                "FID_ORG_ADJ_PRC": "0",
+                            },
+                            timeout=10,
+                        )
+                        ohlcv = _parse(resp, uid, cfg).get("output2", [])
+                    except ApiError as e:
+                        if _is_kis_mkt_div_mismatch(e):
+                            continue
+                        raise
+                    if len(ohlcv) > len(best):
+                        best = ohlcv
+            except Exception as e:
+                logger.warning(
+                    "[KR][%s] 일봉 FHKST01010400 실서버: %s", stock_code, e
+                )
+                best = []
+            if len(best) < 2 and cfg.get("is_mock", True):
+                for div in ("J", "Q"):
+                    try:
+                        _kis_pace()
+                        resp = http_requests.get(
+                            _base_url(True) + "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
+                            headers=_headers(uid, cfg, "FHKST01010400"),
+                            params={
+                                "FID_COND_MRKT_DIV_CODE": div,
+                                "FID_INPUT_ISCD": stock_code,
+                                "FID_PERIOD_DIV_CODE": "D",
+                                "FID_ORG_ADJ_PRC": "0",
+                            },
+                            timeout=10,
+                        )
+                        ohlcv = _parse(resp, uid, cfg).get("output2", [])
+                    except ApiError as e:
+                        if _is_kis_mkt_div_mismatch(e):
+                            continue
+                        raise
+                    if len(ohlcv) > len(best):
+                        best = ohlcv
+            if len(best) >= 2:
+                return best
+            syn = _kr_ohlcv_fallback_from_inquire_price(uid, cfg, stock_code)
+            if len(syn) >= 2:
+                logger.info(
+                    "[KR][%s] 일봉 API 부족(len=%d) — 현재가(FHKST01010100)로 합성",
+                    stock_code,
+                    len(best),
+                )
+                return syn
             return best
         except ApiError as e:
             last_exc = e
