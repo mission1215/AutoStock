@@ -2793,12 +2793,12 @@ def _kr_approx_market_cap_won(out: dict) -> float:
         return 0.0
 
 
-# 동적 KR AI 유니버스: 시총 하한(억 원) — 키 미설정 시 기본(초소형 제외)
-DEFAULT_AI_UNIVERSE_KR_MIN_CAP_EOK = 300.0
+# 동적 KR AI 유니버스: 시총 하한(억 원) — 키 미설정 시 기본(중·대형 위주 완화)
+DEFAULT_AI_UNIVERSE_KR_MIN_CAP_EOK = 1000.0
 
 
 def _kr_effective_min_cap_eok(cfg: dict) -> float:
-    """`ai_universe_kr_min_cap_eok` — None/미저장이면 기본 300억, 명시 0이면 필터 해제."""
+    """`ai_universe_kr_min_cap_eok` — None/미저장이면 기본 1000억, 명시 0이면 필터 해제."""
     raw = cfg.get("ai_universe_kr_min_cap_eok")
     if raw is None:
         return DEFAULT_AI_UNIVERSE_KR_MIN_CAP_EOK

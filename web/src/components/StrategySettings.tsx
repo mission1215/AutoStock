@@ -353,13 +353,13 @@ export function StrategySettings({
                 <label className="text-xs text-slate-500 block mb-1">
                   시총 하한 (억 원){" "}
                   <span className="text-slate-600 text-[10px]">
-                    기본 300 · 0 = 필터 끔(초소형 포함)
+                    기본 1000 · 0 = 필터 끔(소형 포함)
                   </span>
                 </label>
                 <input
                   type="number"
                   min={0}
-                  step={50}
+                  step={100}
                   className={inp()}
                   value={form.aiKrMinCapEok}
                   onChange={(e) => patch({ aiKrMinCapEok: e.target.value })}
@@ -381,7 +381,8 @@ export function StrategySettings({
               </div>
             </div>
             <p className="text-[10px] text-slate-500 leading-relaxed">
-              시총은 상장주수 × 현재가 근사값입니다. 초소형 제거에 쓰려면 예: 300 (300억 이상).
+              시총은 상장주수 × 현재가 근사값입니다. 기본 1000억은 중·대형 위주로 완화한 값이며, 테마·소형 포함이
+              필요하면 숫자를 낮추거나 0으로 끄세요.
             </p>
           </div>
         </div>
