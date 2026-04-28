@@ -351,7 +351,10 @@ export function StrategySettings({
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="text-xs text-slate-500 block mb-1">
-                  시총 하한 (억 원) <span className="text-slate-600 text-[10px]">0 = 사용 안 함</span>
+                  시총 하한 (억 원){" "}
+                  <span className="text-slate-600 text-[10px]">
+                    기본 300 · 0 = 필터 끔(초소형 포함)
+                  </span>
                 </label>
                 <input
                   type="number"

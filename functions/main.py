@@ -2793,12 +2793,23 @@ def _kr_approx_market_cap_won(out: dict) -> float:
         return 0.0
 
 
-def _kr_inquire_passes_ai_universe_gates(out: dict, cfg: dict) -> tuple[bool, str]:
-    """KIS 주식현재가(output) 단계에서 동적 AI 유니버스 종목 포함 여부.
+# 동적 KR AI 유니버스: 시총 하한(억 원) — 키 미설정 시 기본(초소형 제외)
+DEFAULT_AI_UNIVERSE_KR_MIN_CAP_EOK = 300.0
 
-    · 임시정지·투자유의·관리·정리매매·비정상 경고 코드 등 차단 (감사 가능한 필드).
-    · `ai_universe_kr_min_cap_eok` > 0 이면 시총(원 근사) 하한 적용 — 0 또는 미설정 시 시총 게이트 없음.
-    """
+
+def _kr_effective_min_cap_eok(cfg: dict) -> float:
+    """`ai_universe_kr_min_cap_eok` — None/미저장이면 기본 300억, 명시 0이면 필터 해제."""
+    raw = cfg.get("ai_universe_kr_min_cap_eok")
+    if raw is None:
+        return DEFAULT_AI_UNIVERSE_KR_MIN_CAP_EOK
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_AI_UNIVERSE_KR_MIN_CAP_EOK
+
+
+def _kr_passes_quality_risk_gates(out: dict) -> tuple[bool, str]:
+    """임시정지·투자유의·관리·정리매매·시장경고 등 (시총 제외)."""
     if not isinstance(out, dict):
         return False, "현재가 output 없음"
 
@@ -2819,20 +2830,34 @@ def _kr_inquire_passes_ai_universe_gates(out: dict, cfg: dict) -> tuple[bool, st
         return False, "관리종목"
 
     mw = str(out.get("mrkt_warn_cls_code") or "").strip()
-    # 전부 '0'이 아닌 문자가 있으면 경고 존재로 간주(코드별 상세는 장외 문서 참고).
     if mw and bool(mw.strip("0")):
         return False, f"시장경고코드({mw})"
 
-    min_eok = float(cfg.get("ai_universe_kr_min_cap_eok") or 0)
-    if min_eok > 0:
-        cap_won = _kr_approx_market_cap_won(out)
-        thr = min_eok * 100_000_000  # 억 원
-        if cap_won <= 0:
-            return False, "시총산출불가"
-        if cap_won < thr:
-            return False, f"시총약소(<{min_eok:.0f}억)"
-
     return True, ""
+
+
+def _kr_passes_market_cap_floor(out: dict, cfg: dict) -> tuple[bool, str]:
+    """시총(원 근사)이 하한 이상인지. 하한 0이면 항상 통과."""
+    min_eok = _kr_effective_min_cap_eok(cfg)
+    if min_eok <= 0:
+        return True, ""
+    if not isinstance(out, dict):
+        return False, "현재가 output 없음"
+    cap_won = _kr_approx_market_cap_won(out)
+    thr = min_eok * 100_000_000
+    if cap_won <= 0:
+        return False, "시총산출불가"
+    if cap_won < thr:
+        return False, f"시총약소(<{min_eok:.0f}억)"
+    return True, ""
+
+
+def _kr_inquire_passes_ai_universe_gates(out: dict, cfg: dict) -> tuple[bool, str]:
+    """품질·리스크 + 시총 하한 (한 번에). 동적 수집에서 품질 옵션 켜진 경우."""
+    ok, w = _kr_passes_quality_risk_gates(out)
+    if not ok:
+        return ok, w
+    return _kr_passes_market_cap_floor(out, cfg)
 
 
 def _cfg_truthy_optional(v: object, default: bool = True) -> bool:
@@ -3820,11 +3845,13 @@ def _collect_kr_stock_data_for_codes(
     codes: list[str],
     *,
     ai_universe_quality_gates: bool = False,
+    ai_universe_dynamic_kr: bool = False,
 ) -> list[dict]:
     result = []
     use_q = ai_universe_quality_gates and _cfg_truthy_optional(
         cfg.get("ai_universe_kr_quality_gates"), True,
     )
+    use_cap_dynamic = ai_universe_dynamic_kr and _kr_effective_min_cap_eok(cfg) > 0
 
     for code in codes:
         try:
@@ -3836,6 +3863,11 @@ def _collect_kr_stock_data_for_codes(
                 gate_ok, gate_why = _kr_inquire_passes_ai_universe_gates(out, cfg)
                 if not gate_ok:
                     _add_log(uid, "INFO", f"[KR데이터]{code} 제외 ({gate_why})")
+                    continue
+            elif use_cap_dynamic:
+                cap_ok, cap_why = _kr_passes_market_cap_floor(out, cfg)
+                if not cap_ok:
+                    _add_log(uid, "INFO", f"[KR데이터]{code} 제외 ({cap_why})")
                     continue
             ohlcv = get_daily_ohlcv_kr(uid, cfg, code)
             current = _kr_price_from_output(out, ohlcv)
@@ -3861,14 +3893,15 @@ def _collect_kr_stock_data(uid: str, cfg: dict) -> list[dict]:
 
 
 def _collect_kr_stock_data_for_ai(uid: str, cfg: dict) -> list[dict]:
-    use_qgates = (
-        _normalized_ai_universe_mode(cfg) == "dynamic"
-        and _cfg_truthy_optional(cfg.get("ai_universe_kr_quality_gates"), True)
+    dynamic_kr = _normalized_ai_universe_mode(cfg) == "dynamic"
+    use_qgates = dynamic_kr and _cfg_truthy_optional(
+        cfg.get("ai_universe_kr_quality_gates"), True,
     )
     return _collect_kr_stock_data_for_codes(
         uid, cfg,
         _resolve_ai_universe_kr(uid, cfg),
         ai_universe_quality_gates=use_qgates,
+        ai_universe_dynamic_kr=dynamic_kr,
     )
 
 

@@ -39,10 +39,10 @@ export type StrategyFormFields = {
   maxSector: string;
 };
 
-/** 국내 동적 풀 고급 기본 — 프리셋 전 tier 동일 */
+/** 국내 동적 풀 고급 기본 — 프리셋 전 tier 동일 (시총 미저장 서버와 동일 300억) */
 const UNIVERSE_FORM_DEFAULTS = {
   aiKrQualityGates: true,
-  aiKrMinCapEok: "0",
+  aiKrMinCapEok: "300",
   maxSector: "2",
 } as const;
 

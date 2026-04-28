@@ -70,7 +70,7 @@ export interface AppConfig {
   ai_universe_mode?: "legacy" | "dynamic";
   /** 동적 유니버스 시 KIS 현재가로 투자유의·관리종목 등 제외 (기본 온·프로파일 저장) */
   ai_universe_kr_quality_gates?: boolean;
-  /** 동적 유니버스 시 시총 하한(억원). 0이면 미사용 — 상장주수×현재가 근사 */
+  /** 동적 유니버스 시 시총 하한(억원). 미저장 시 서버 기본 300억 — 0이면 명시적으로 필터 해제 */
   ai_universe_kr_min_cap_eok?: number;
   /** 같은 섹터 동시 최대 보유 종목 수(전략·AI 매수 분기에 사용) */
   max_positions_per_sector?: number;
