@@ -66,6 +66,14 @@ export interface AppConfig {
   setup_complete?: boolean;
   /** 자동매매·스케줄: kr | us | both (기본 kr) */
   market_scope?: "kr" | "us" | "both";
+  /** KR 스케줄 AI 시세 입력 풀: legacy(감시+고정) | dynamic(KIS 거래량·거래대금 순위, 실패 시 legacy) */
+  ai_universe_mode?: "legacy" | "dynamic";
+  /** 동적 유니버스 시 KIS 현재가로 투자유의·관리종목 등 제외 (기본 온·프로파일 저장) */
+  ai_universe_kr_quality_gates?: boolean;
+  /** 동적 유니버스 시 시총 하한(억원). 0이면 미사용 — 상장주수×현재가 근사 */
+  ai_universe_kr_min_cap_eok?: number;
+  /** 같은 섹터 동시 최대 보유 종목 수(전략·AI 매수 분기에 사용) */
+  max_positions_per_sector?: number;
   /** 분할 익절·추격 방지 등 (백엔드와 동일 키) */
   partial_tp_enabled?: boolean;
   partial_tp_trigger_pct?: number;

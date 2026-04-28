@@ -31,7 +31,20 @@ export type StrategyFormFields = {
   avgDownMax: string;
   avgDownQty: string;
   avgDownGapH: string;
+  /** 동적 KR AI 유니버스 시 KIS 현재가 기반 2차 제외(관리·유의 등) */
+  aiKrQualityGates: boolean;
+  /** 동적 유니버스 시 시총 하한(억원), "0" = 미사용 */
+  aiKrMinCapEok: string;
+  /** 섹터당 최대 보유·추천 분산(전략·AI 공통, 정수 문자열) */
+  maxSector: string;
 };
+
+/** 국내 동적 풀 고급 기본 — 프리셋 전 tier 동일 */
+const UNIVERSE_FORM_DEFAULTS = {
+  aiKrQualityGates: true,
+  aiKrMinCapEok: "0",
+  maxSector: "2",
+} as const;
 
 export const STRATEGY_TIER_LABELS: Record<StrategyTier, { title: string; blurb: string }> = {
   conservative: {
@@ -80,6 +93,7 @@ function base(tier: StrategyTier, isMock: boolean): StrategyFormFields {
         avgDownMax: "1",
         avgDownQty: "25",
         avgDownGapH: "24",
+        ...UNIVERSE_FORM_DEFAULTS,
       };
     }
     if (a) {
@@ -105,6 +119,7 @@ function base(tier: StrategyTier, isMock: boolean): StrategyFormFields {
         avgDownMax: "3",
         avgDownQty: "40",
         avgDownGapH: "12",
+        ...UNIVERSE_FORM_DEFAULTS,
       };
     }
     // balanced
@@ -131,6 +146,7 @@ function base(tier: StrategyTier, isMock: boolean): StrategyFormFields {
         avgDownMax: "2",
         avgDownQty: "35",
         avgDownGapH: "20",
+        ...UNIVERSE_FORM_DEFAULTS,
       };
     }
   }
@@ -159,6 +175,7 @@ function base(tier: StrategyTier, isMock: boolean): StrategyFormFields {
       avgDownMax: "1",
       avgDownQty: "25",
       avgDownGapH: "24",
+      ...UNIVERSE_FORM_DEFAULTS,
     };
   }
   if (a) {
@@ -184,6 +201,7 @@ function base(tier: StrategyTier, isMock: boolean): StrategyFormFields {
       avgDownMax: "3",
       avgDownQty: "40",
       avgDownGapH: "12",
+      ...UNIVERSE_FORM_DEFAULTS,
     };
   }
   // balanced live
@@ -209,6 +227,7 @@ function base(tier: StrategyTier, isMock: boolean): StrategyFormFields {
     avgDownMax: "2",
     avgDownQty: "35",
     avgDownGapH: "20",
+    ...UNIVERSE_FORM_DEFAULTS,
   };
 }
 
@@ -247,6 +266,9 @@ const PRESET_FORM_KEYS: (keyof StrategyFormFields)[] = [
   "avgDownMax",
   "avgDownQty",
   "avgDownGapH",
+  "aiKrQualityGates",
+  "aiKrMinCapEok",
+  "maxSector",
 ];
 
 function formFieldsEqual(

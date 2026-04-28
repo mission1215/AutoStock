@@ -6,6 +6,7 @@ import {
   STRATEGY_TIER_LABELS,
   inferStrategyTier,
   strategyTierLabel,
+  type StrategyFormFields,
   type StrategyTier,
 } from "../config/strategyPresets";
 import {
@@ -13,29 +14,7 @@ import {
   normalizeMarketScope,
 } from "../utils/marketScope";
 
-type StrategyFormState = {
-  k: string;
-  ma: string;
-  stopPct: string;
-  maxPct: string;
-  dailyPct: string;
-  idxGatePct: string;
-  minScoreKr: string;
-  krWl: string;
-  usWl: string;
-  aiCount: number;
-  partialTpEn: boolean;
-  partialTpTrig: string;
-  partialTpSell: string;
-  partialTpTight: boolean;
-  slipMockPct: string;
-  slipLivePct: string;
-  avgDownEn: boolean;
-  avgDownTrig: string;
-  avgDownMax: string;
-  avgDownQty: string;
-  avgDownGapH: string;
-};
+type StrategyFormState = StrategyFormFields;
 
 /** 권장 기본(보통) — 모의/실전 프리셋 */
 const WATCH_DEFAULTS = {
@@ -79,6 +58,17 @@ function configToForm(config: Partial<AppConfig> | undefined): StrategyFormState
     avgDownMax: config.avg_down_max_times != null ? String(config.avg_down_max_times) : base.avgDownMax,
     avgDownQty: config.avg_down_qty_ratio != null ? String(Math.round(config.avg_down_qty_ratio * 100)) : base.avgDownQty,
     avgDownGapH: config.avg_down_min_interval_hours != null ? String(config.avg_down_min_interval_hours) : base.avgDownGapH,
+    aiKrQualityGates: config.ai_universe_kr_quality_gates !== false,
+    aiKrMinCapEok:
+      config.ai_universe_kr_min_cap_eok != null &&
+      Number.isFinite(Number(config.ai_universe_kr_min_cap_eok))
+        ? String(Math.max(0, Number(config.ai_universe_kr_min_cap_eok)))
+        : base.aiKrMinCapEok,
+    maxSector:
+      config.max_positions_per_sector != null &&
+      Number.isFinite(Number(config.max_positions_per_sector))
+        ? String(Math.max(1, Math.min(10, Math.round(Number(config.max_positions_per_sector)))))
+        : base.maxSector,
   };
 }
 
@@ -105,8 +95,17 @@ export function StrategySettings({
   const [saving, setSaving] = useState(false);
   const [tierHint, setTierHint] = useState<string | null>(null);
   const [marketScope, setMarketScope] = useState<MarketScope>("kr");
+  /** KR 스케줄 AI 입력 유니버스 — US 전략에는 영향 없음 */
+  const [aiUniverseMode, setAiUniverseMode] = useState<"legacy" | "dynamic">("legacy");
 
   const profilesStr = useMemo(() => (profiles ? JSON.stringify(profiles) : ""), [profiles]);
+
+  function normalizeAiUniverseMode(raw: unknown): "legacy" | "dynamic" {
+    if (typeof raw !== "string") return "legacy";
+    const x = raw.trim().toLowerCase();
+    if (x === "dynamic" || x === "kis" || x === "rank" || x === "auto") return "dynamic";
+    return "legacy";
+  }
 
   useEffect(() => {
     if (dirty) return;
@@ -116,6 +115,7 @@ export function StrategySettings({
       if (config) {
         setIsMock(config.is_mock !== false);
         setMarketScope(normalizeMarketScope(config.market_scope));
+        setAiUniverseMode(normalizeAiUniverseMode(config.ai_universe_mode));
       }
       return;
     }
@@ -125,6 +125,7 @@ export function StrategySettings({
       setLiveForm({ ...f, ...PRESET_LIVE, krWl: f.krWl, usWl: f.usWl });
       setIsMock(config.is_mock !== false);
       setMarketScope(normalizeMarketScope(config.market_scope));
+      setAiUniverseMode(normalizeAiUniverseMode(config.ai_universe_mode));
     }
   }, [profilesStr, config, dirty]);
 
@@ -175,6 +176,16 @@ export function StrategySettings({
       setMsg("❌ 최대 비중은 1~100 사이로 입력해 주세요.");
       return;
     }
+    const capEok = parseFloat(form.aiKrMinCapEok);
+    if (Number.isNaN(capEok) || capEok < 0) {
+      setMsg("❌ 시총 하한(억)은 0 이상 숫자로 입력해 주세요. (0 = 미사용)");
+      return;
+    }
+    const maxSec = parseInt(form.maxSector, 10);
+    if (Number.isNaN(maxSec) || maxSec < 1 || maxSec > 10) {
+      setMsg("❌ 섹터당 최대 종목 수는 1~10 사이로 입력해 주세요.");
+      return;
+    }
     setSaving(true);
     setMsg("저장 중…");
     try {
@@ -209,6 +220,10 @@ export function StrategySettings({
           return inf === "custom" ? null : inf;
         })(),
         market_scope: marketScope,
+        ai_universe_mode: aiUniverseMode,
+        ai_universe_kr_quality_gates: form.aiKrQualityGates,
+        ai_universe_kr_min_cap_eok: Math.max(0, capEok),
+        max_positions_per_sector: maxSec,
       };
       const data = await apiFetch<{ ok: boolean; error?: string }>("/api/config", {
         method: "POST",
@@ -280,6 +295,92 @@ export function StrategySettings({
             국내 매도 대금이 당일 미국 주식 주문에 바로 쓰이지 않을 수 있습니다(결제
             T+2 등). 미국 가용 달러는 KIS·예수금에서 확인하세요.
           </p>
+          <p className="text-xs text-slate-400 pt-2 border-t border-cyan-500/15">
+            <span className="text-cyan-300 font-medium">🇰🇷 AI 입력 종목 풀</span> — 스케줄 AI가
+            시세를 모을 국내 종목 범위입니다. (미국 AI·수동 주문은 그대로)
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                { id: "legacy" as const, label: "고정 풀 (기본)" },
+                { id: "dynamic" as const, label: "동적 (KIS 거래량·거래대금 순위)" },
+              ] as const
+            ).map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => {
+                  setAiUniverseMode(id);
+                  setDirty(true);
+                }}
+                className={`px-3 py-2 rounded-lg text-xs font-medium border transition-all ${
+                  aiUniverseMode === id
+                    ? "border-cyan-400/70 bg-cyan-600/30 text-cyan-100"
+                    : "border-white/10 bg-white/5 text-slate-300 hover:border-cyan-500/40"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-slate-500 leading-relaxed">
+            동적 모드는 한국투자 Open API 순위(거래량·거래대금)로 최대 20종을 구성하고,
+            감시 종목은 그대로 우선 포함합니다. API 오류·데이터 부족 시 자동으로 고정 풀로
+            돌아갑니다.
+          </p>
+          <div
+            className="mt-3 rounded-lg border border-cyan-500/20 bg-slate-950/40 px-3 py-3 space-y-3"
+            role="group"
+            aria-label="국내 동적 풀 고급 설정"
+          >
+            <p className="text-[11px] text-slate-400">
+              <span className="text-cyan-300/90 font-medium">동적 모드 품질 필터</span> — KIS 현재가 기준
+              (모의/실전 현재 프로필에 저장됩니다. 레거시 풀만 쓸 때는 무시됩니다.)
+            </p>
+            <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+              <input
+                type="checkbox"
+                className="rounded border-white/20"
+                checked={form.aiKrQualityGates}
+                onChange={(e) => {
+                  patch({ aiKrQualityGates: e.target.checked });
+                }}
+              />
+              KIS 2차 필터 (투자유의·관리·정리매매·임시정지·시장경고 등 제외)
+            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs text-slate-500 block mb-1">
+                  시총 하한 (억 원) <span className="text-slate-600 text-[10px]">0 = 사용 안 함</span>
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step={50}
+                  className={inp()}
+                  value={form.aiKrMinCapEok}
+                  onChange={(e) => patch({ aiKrMinCapEok: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 block mb-1">
+                  섹터당 최대 종목 수{" "}
+                  <span className="text-slate-600 text-[10px]">(전략·AI·추천 분산)</span>
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  className={inp()}
+                  value={form.maxSector}
+                  onChange={(e) => patch({ maxSector: e.target.value })}
+                />
+              </div>
+            </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              시총은 상장주수 × 현재가 근사값입니다. 초소형 제거에 쓰려면 예: 300 (300억 이상).
+            </p>
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">

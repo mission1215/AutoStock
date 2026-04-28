@@ -595,6 +595,8 @@ _CONFIG_TOP_KEYS = frozenset({
     "is_mock", "setup_complete", "display_name", "email", "created_at",
     # 자동매매·스케줄 AI·장마감 청산이 대상으로 할 시장: kr | us | both (기본 kr)
     "market_scope",
+    # KR 스케줄 AI 시세 입력 유니버스: legacy(감시+고정풀) | dynamic(KIS 순위반영, 실패 시 legacy)
+    "ai_universe_mode",
 })
 _CONFIG_PROFILE_KEYS = frozenset({
     "app_key", "app_secret", "account_no",
@@ -615,12 +617,16 @@ _CONFIG_PROFILE_KEYS = frozenset({
     "us_skip_buy_first_min", "us_skip_buy_last_min",
     "daily_loss_limit", "kr_index_drop_limit_pct",
     "us_index_drop_limit_pct", "us_index_proxy",
+    "max_positions_per_sector",
     "risk_per_trade_pct",
     "reconcile_enabled", "fill_check_enabled",
     "monday_morning_skip_enabled", "monday_morning_skip_min",
     "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live",
     "bot_enabled",
     "strategy_tier",  # conservative | balanced | aggressive — UI 성향(프리셋) 기록, 전략 엔진은 k_factor 등으로 동작
+    # 동적 AI 유니버스(KR) — KIS 현재가로 2차 필터 시 사용
+    "ai_universe_kr_quality_gates",
+    "ai_universe_kr_min_cap_eok",
 })
 
 
@@ -675,6 +681,8 @@ def get_config(uid: str) -> dict:
         out = dict(raw)
         if "market_scope" not in out:
             out["market_scope"] = "kr"
+        if "ai_universe_mode" not in out:
+            out["ai_universe_mode"] = "legacy"
         return out
     raw = _ensure_profiles_structure(raw)
     mode = "mock" if raw.get("is_mock", True) else "live"
@@ -687,11 +695,13 @@ def get_config(uid: str) -> dict:
             p = {**other_p, **{k: v for k, v in p.items() if v is not None}}
     out = {**p}
     out["is_mock"] = raw.get("is_mock", True)
-    for k in ("setup_complete", "display_name", "email", "created_at", "market_scope"):
+    for k in ("setup_complete", "display_name", "email", "created_at", "market_scope", "ai_universe_mode"):
         if k in raw:
             out[k] = raw[k]
     if "market_scope" not in out:
         out["market_scope"] = "kr"
+    if "ai_universe_mode" not in out:
+        out["ai_universe_mode"] = "legacy"
     return out
 
 
@@ -2731,6 +2741,114 @@ def _sector_ok(code: str, market: str, exposure: dict[str, int], max_per_sector:
     return count < max_per_sector, sector
 
 
+def _sector_diversify_scored_for_recommendations(
+    scored_sorted: list[tuple],
+    cap: int,
+    market: str,
+    exposure: dict[str, int],
+    max_per_sector: int,
+) -> list[tuple]:
+    """스코어 내림차순을 깨지 않지만, 동일 순위 브레이커처럼 **추천 카드(cap)** 를 섹터 과밀 없이 채운다.
+
+    1차: 현재 노출(simulated) 섹터 개수가 max 미만일 때만 스코어대로 채운다.
+    2차: cap 미만이면 섹터 제한 없이 순서 유지 채운다 — 실행 루프의 섹터 스킵을 추천 UI에서 예고.
+    """
+    if market not in ("KR", "US"):
+        return scored_sorted[:cap]
+    sector_map = KR_SECTOR_MAP if market == "KR" else US_SECTOR_MAP
+    exp_sim = exposure.copy()
+    round1: list[tuple] = []
+    round1_seen: set[str] = set()
+    for item in scored_sorted:
+        c = item[0]
+        if c in round1_seen:
+            continue
+        sector = sector_map.get(c, "기타")
+        if exp_sim.get(sector, 0) >= max_per_sector:
+            continue
+        round1.append(item)
+        round1_seen.add(c)
+        exp_sim[sector] = exp_sim.get(sector, 0) + 1
+        if len(round1) >= cap:
+            return round1[:cap]
+
+    for item in scored_sorted:
+        if len(round1) >= cap:
+            break
+        c = item[0]
+        if c in round1_seen:
+            continue
+        round1.append(item)
+        round1_seen.add(c)
+    return round1[:cap]
+
+
+def _kr_approx_market_cap_won(out: dict) -> float:
+    """상장 주수 × 현재가로 시총(원 단위 근사)."""
+    try:
+        st = float(str(out.get("lstn_stcn") or "0").replace(",", ""))
+        pr = float(str(out.get("stck_prpr") or "0").replace(",", ""))
+        return abs(st * pr)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _kr_inquire_passes_ai_universe_gates(out: dict, cfg: dict) -> tuple[bool, str]:
+    """KIS 주식현재가(output) 단계에서 동적 AI 유니버스 종목 포함 여부.
+
+    · 임시정지·투자유의·관리·정리매매·비정상 경고 코드 등 차단 (감사 가능한 필드).
+    · `ai_universe_kr_min_cap_eok` > 0 이면 시총(원 근사) 하한 적용 — 0 또는 미설정 시 시총 게이트 없음.
+    """
+    if not isinstance(out, dict):
+        return False, "현재가 output 없음"
+
+    yset = frozenset(("Y", "1", "YES"))
+
+    def yflag(key: str) -> bool:
+        return str(out.get(key) or "").strip().upper() in yset
+
+    if yflag("temp_stop_yn"):
+        return False, "임시정지(Y)"
+    if yflag("invt_caful_yn"):
+        return False, "투자유의(Y)"
+    if yflag("sltr_yn"):
+        return False, "정리매매(Y)"
+
+    mang = str(out.get("mang_issu_cls_code") or "").strip().upper()
+    if mang in ("Y", "YES", "1"):
+        return False, "관리종목"
+
+    mw = str(out.get("mrkt_warn_cls_code") or "").strip()
+    # 전부 '0'이 아닌 문자가 있으면 경고 존재로 간주(코드별 상세는 장외 문서 참고).
+    if mw and bool(mw.strip("0")):
+        return False, f"시장경고코드({mw})"
+
+    min_eok = float(cfg.get("ai_universe_kr_min_cap_eok") or 0)
+    if min_eok > 0:
+        cap_won = _kr_approx_market_cap_won(out)
+        thr = min_eok * 100_000_000  # 억 원
+        if cap_won <= 0:
+            return False, "시총산출불가"
+        if cap_won < thr:
+            return False, f"시총약소(<{min_eok:.0f}억)"
+
+    return True, ""
+
+
+def _cfg_truthy_optional(v: object, default: bool = True) -> bool:
+    """Firestore/JSON 설정값을 bool 로 — 기본값 default."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    return default
+
+
 def _calc_rsi(closes: list[float], period: int = 14) -> float:
     """Wilder EMA 방식 RSI.
 
@@ -3518,18 +3636,213 @@ def _merge_ai_universe_us(cfg: dict) -> list[str]:
     return out
 
 
-def _collect_kr_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> list[dict]:
+# [국내주식] 순위분석 — 거래량순위 (동일 API, FID_BLNG_CLS_CODE 로 세부 순위 유형 분기)
+# · KIS 공식 샘플(open-trading-api) TR: FHPST01710000, URL: .../quotations/volume-rank
+KR_VOLUME_RANK_PATH = "/uapi/domestic-stock/v1/quotations/volume-rank"
+# · fid_blng_cls_code: "0" 평균거래량 순, "3" 거래금액 순
+KR_RANK_BLNG_VOLUME = "0"
+KR_RANK_BLNG_VALUE = "3"
+
+
+def _kr_volume_rank_params(fid_blng_cls_code: str) -> dict[str, str]:
+    return {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_COND_SCR_DIV_CODE": "20171",
+        "FID_INPUT_ISCD": "0000",
+        "FID_DIV_CLS_CODE": "0",
+        "FID_BLNG_CLS_CODE": fid_blng_cls_code,
+        "FID_TRGT_CLS_CODE": "111111111",
+        "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+        "FID_INPUT_PRICE_1": "0",
+        "FID_INPUT_PRICE_2": "0",
+        "FID_VOL_CNT": "0",
+        "FID_INPUT_DATE_1": "0",
+    }
+
+
+def _rows_from_kis_domestic_output(body: dict) -> list:
+    """순위/목록류 API — output 이 list 이거나 단일 dict 인 경우 처리."""
+    o = body.get("output")
+    if isinstance(o, list):
+        return o
+    if isinstance(o, dict) and o:
+        return [o]
+    # 일부 조회건에서 output 이 비고 output2 등 분기 — 순위분석 통상은 output 리스트
+    o2 = body.get("output2")
+    return o2 if isinstance(o2, list) else []
+
+
+def _kis_kr_codes_from_rank_rows(rows: list) -> list[str]:
+    codes: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_code = row.get("mksc_shrn_iscd") or row.get("stck_shrn_iscd") or row.get("ISCD_SHRN_ISSU")
+        if raw_code is None:
+            continue
+        s = str(raw_code).strip()
+        if s.isdigit() and len(s) <= 6:
+            c = s.zfill(6)
+            codes.append(c)
+    return codes
+
+
+def _kis_fetch_volume_rank_codes(
+    uid: str,
+    cfg: dict,
+    fid_blng_cls_code: str,
+    *,
+    limit: int = 22,
+) -> list[str]:
+    """거래량/거래대금 순위 API → 종목코드 6자리 (최대 limit). 단일 페이지 만으로 통상 충분."""
+    params = dict(_kr_volume_rank_params(fid_blng_cls_code))
+    tr_candidates = [_tr_id(cfg, "FHPST01710000", "VHPST01710000"), "FHPST01710000"]
+    last_exc: BaseException | None = None
+
+    for tr_try in dict.fromkeys(tr_candidates):
+
+        try:
+            def _once():
+                _kis_pace()
+                resp = http_requests.get(
+                    _base_url(cfg.get("is_mock", True)) + KR_VOLUME_RANK_PATH,
+                    headers=_headers(uid, cfg, str(tr_try)),
+                    params=params,
+                    timeout=15,
+                )
+                return _parse(resp, uid, cfg)
+
+            data = _with_retry(_once)
+            rows = _rows_from_kis_domestic_output(data)
+            codes = _kis_kr_codes_from_rank_rows(rows)[: max(1, limit)]
+            if codes:
+                return codes
+            last_exc = ValueError(f"순위 API 종목 코드 없음 (TR={tr_try})")
+        except Exception as e:
+            last_exc = e
+            continue
+
+    if last_exc is not None:
+        raise last_exc
+    raise ApiError("_kis_fetch_volume_rank_codes 실패 — 시도 불가")
+
+
+def _merge_dynamic_kr_rank_lists(vol_codes: list[str], val_codes: list[str]) -> list[str]:
+    """거래량·거래대금 순위를 번갈아 합치면서 중복 제거 (수급·유동성 겹침 활용)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    n = max(len(vol_codes), len(val_codes))
+    for i in range(n):
+        for cand in (
+            vol_codes[i] if i < len(vol_codes) else None,
+            val_codes[i] if i < len(val_codes) else None,
+        ):
+            if not cand:
+                continue
+            if cand in seen:
+                continue
+            seen.add(cand)
+            out.append(cand)
+            if len(out) >= MAX_AI_UNIVERSE_STOCKS:
+                return out
+    return out
+
+
+def _dynamic_ai_universe_kr(uid: str, cfg: dict) -> list[str]:
+    """KIS 거래량·거래금액 순위로 최대 MAX_AI_UNIVERSE_STOCKS 종목. 실패 시 예외 발생 → 호출측 레거시 폴백."""
+    need_per_rank = max(14, MAX_AI_UNIVERSE_STOCKS // 2 + 2)
+    vol_codes = _kis_fetch_volume_rank_codes(uid, cfg, KR_RANK_BLNG_VOLUME, limit=need_per_rank)
+    _kis_pace()
+    val_codes = _kis_fetch_volume_rank_codes(uid, cfg, KR_RANK_BLNG_VALUE, limit=need_per_rank)
+    merged = _merge_dynamic_kr_rank_lists(vol_codes, val_codes)
+    min_ok = max(12, MAX_AI_UNIVERSE_STOCKS // 2)
+    if len(merged) < min_ok:
+        raise ValueError(f"순위 API 종목 부족: {len(merged)}<{min_ok}")
+    return merged
+
+
+def _normalized_ai_universe_mode(cfg: dict) -> str:
+    m = str(cfg.get("ai_universe_mode") or "legacy").strip().lower()
+    if m in ("dynamic", "kis", "rank", "auto"):
+        return "dynamic"
+    return "legacy"
+
+
+def _resolve_ai_universe_kr(uid: str, cfg: dict) -> list[str]:
+    """KR AI 입력 유니버스: 레거시(기본)·동적(KIS 순위). 동적 실패 시 로그 후 레거시."""
+    if _normalized_ai_universe_mode(cfg) != "dynamic":
+        return _merge_ai_universe_kr(cfg)
+    wl_first: list[str] = []
+    seen: set[str] = set()
+    for raw in list(cfg.get("kr_watchlist", [])):
+        s = str(raw).strip()
+        if not s.isdigit():
+            continue
+        c = s.zfill(6)
+        if c in seen:
+            continue
+        seen.add(c)
+        wl_first.append(c)
+        if len(wl_first) >= MAX_AI_UNIVERSE_STOCKS:
+            return wl_first
+    remaining = MAX_AI_UNIVERSE_STOCKS - len(wl_first)
+    try:
+        dyn_codes = _dynamic_ai_universe_kr(uid, cfg)
+    except Exception as e:
+        _add_log(
+            uid, "WARNING",
+            f"[AI유니버스] 동적(KIS 순위) 조회 실패 — 레거시 풀로 폴백: {e}",
+        )
+        return _merge_ai_universe_kr(cfg)
+    for c in dyn_codes:
+        if c in seen:
+            continue
+        seen.add(c)
+        wl_first.append(c)
+        if len(wl_first) >= MAX_AI_UNIVERSE_STOCKS:
+            break
+    if len(wl_first) >= 8:
+        _add_log(
+            uid, "INFO",
+            f"[AI유니버스] 동적(KIS 거래량·거래대금 순위) 적용 ({len(wl_first)}종목)",
+        )
+        return wl_first[:MAX_AI_UNIVERSE_STOCKS]
+    _add_log(
+        uid, "WARNING",
+        "[AI유니버스] 동적 결과가 부족 — 레거시 풀로 폴백",
+    )
+    return _merge_ai_universe_kr(cfg)
+
+
+def _collect_kr_stock_data_for_codes(
+    uid: str,
+    cfg: dict,
+    codes: list[str],
+    *,
+    ai_universe_quality_gates: bool = False,
+) -> list[dict]:
     result = []
+    use_q = ai_universe_quality_gates and _cfg_truthy_optional(
+        cfg.get("ai_universe_kr_quality_gates"), True,
+    )
+
     for code in codes:
         try:
             price_data = get_current_price_kr(uid, cfg, code)
             out = price_data.get("output", {})
             if not isinstance(out, dict):
                 out = {}
+            if use_q:
+                gate_ok, gate_why = _kr_inquire_passes_ai_universe_gates(out, cfg)
+                if not gate_ok:
+                    _add_log(uid, "INFO", f"[KR데이터]{code} 제외 ({gate_why})")
+                    continue
             ohlcv = get_daily_ohlcv_kr(uid, cfg, code)
             current = _kr_price_from_output(out, ohlcv)
             result.append({
-                "code": code, "current_price": current,
+                "code": code,
+                "sector_hint": KR_SECTOR_MAP.get(code, "기타"),
+                "current_price": current,
                 "change_rate": out.get("prdy_ctrt", "0"),
                 "volume": out.get("acml_vol", "0"),
                 "recent_ohlcv": [
@@ -3548,7 +3861,15 @@ def _collect_kr_stock_data(uid: str, cfg: dict) -> list[dict]:
 
 
 def _collect_kr_stock_data_for_ai(uid: str, cfg: dict) -> list[dict]:
-    return _collect_kr_stock_data_for_codes(uid, cfg, _merge_ai_universe_kr(cfg))
+    use_qgates = (
+        _normalized_ai_universe_mode(cfg) == "dynamic"
+        and _cfg_truthy_optional(cfg.get("ai_universe_kr_quality_gates"), True)
+    )
+    return _collect_kr_stock_data_for_codes(
+        uid, cfg,
+        _resolve_ai_universe_kr(uid, cfg),
+        ai_universe_quality_gates=use_qgates,
+    )
 
 
 def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> list[dict]:
@@ -3561,7 +3882,9 @@ def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> l
             ohlcv      = get_daily_ohlcv_us(uid, cfg, code)
             current    = _us_price_from_output(out, ohlcv) if isinstance(out, dict) else 0.0
             result.append({
-                "code": code, "current_price": current,
+                "code": code,
+                "sector_hint": US_SECTOR_MAP.get(str(code).strip().upper(), "기타"),
+                "current_price": current,
                 "change_rate": out.get("rate", out.get("diff", "0")),
                 "volume": out.get("tvol", out.get("pvol", "0")),
                 "recent_ohlcv": [
@@ -3998,20 +4321,21 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
 You are a top-tier sell-side quant and short-term momentum specialist for US equities (NASDAQ/NYSE). Your task is to rank symbols from the PROVIDED DATA ONLY for the highest probability of favorable short-term (same session ~ 2 trading days) price action.
 
 [Input Data — authoritative]
-The JSON below is the ONLY universe you may recommend from. Each row has: code (ticker), current_price, change_rate (%), volume, recent_ohlcv (up to 5 recent bars: date, open, high, low, close, volume when available).
+The JSON below is the ONLY universe you may recommend from. Each row has: code (ticker), sector_hint (coarse bucket label supplied by server—use only these labels when mentioning sectors), current_price, change_rate (%), volume, recent_ohlcv (up to 5 recent bars: date, open, high, low, close, volume when available).
 Session context: {session_label}
 
 {data_json}
 
 [Strict rules]
 - You MUST ONLY output tickers that appear in the JSON "code" field above. Never invent or guess tickers. Uppercase tickers as in the data.
+- Reasons must cite only numbers present in the JSON; do NOT assert today’s unseen macro news, earnings beats/misses, or headlines unless they are visibly encoded in OHLC/volume behavior.
 {us_cand_line}
 - Output MUST be a single JSON object, no markdown, no code fences, no commentary before or after the JSON.
 
 [Selection criteria — apply in order of importance]
 1) Liquidity / participation: favor names with strong volume vs peers in the same list (relative activity within this universe).
 2) Trend / momentum from OHLCV: avoid names that are clearly in a sharp breakdown; prefer stabilization, higher lows, or breakout-like structure using the bars provided.
-3) Theme / narrative (inferred only from symbol context + price/volume behavior in the data — do not claim external news).
+3) Narrative wording: infer only from price/volume/OHLCV within the JSON (and sector_hint label if present), not imaginary headlines.
 4) Session fit: align with a typical intraday/swing setup appropriate for {session_label} (e.g., avoid chasing extreme exhaustion spikes unless data supports it).
 
 [Output schema — exact keys]
@@ -4029,7 +4353,7 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
 당신은 월스트리트급 헤지펀드 출신 수석 퀀트 애널리스트이자, 한국 주식(KOSPI/KOSDAQ) 단기 모멘텀·수급 관점의 권위자입니다. 목표는 아래 [Input Data]만을 근거로, 단기(당일~2거래일) 상승 확률이 상대적으로 높은 종목을 고르는 것입니다.
 
 [Input Data — 유일한 근거]
-아래 JSON은 우리 서비스가 KIS API로 수집한 실데이터입니다. 각 행: code(종목코드), current_price, change_rate(전일대비%), volume(누적거래량 문자열), recent_ohlcv(최근 최대 5일: date, open, high, low, close).
+아래 JSON은 우리 서비스가 KIS API로 수집한 실데이터입니다. 각 행: code(종목코드), sector_hint(업종 힌트·서버가 부여한 라벨만 사용), current_price, change_rate(전일대비%), volume(누적거래량 문자열), recent_ohlcv(최근 최대 5일: date, open, high, low, close).
 세션: {session_label}
 
 {data_json}
@@ -4037,18 +4361,20 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
 [절대 규칙]
 - 추천 종목의 code는 반드시 위 JSON에 존재하는 종목코드만 사용하세요. 목록에 없는 코드·임의 종목·비상장명을 넣지 마세요. 6자리 숫자 형식을 데이터와 동일하게 맞추세요.
 {kr_cand_line}
+- reason(한국어 요약)에는 **위 JSON에 있는 수치만** 근거로 쓸 수 있습니다. 확인할 수 없는 **당일 외부 뉴스·정책·공시 원문·헤드라인 내용을 사실처럼 언급하지 마세요**(특히 "~보도에 따르면" 등 금지).
+- sector_hint가 있으면 **해당 라벨 안에서만** 섹터 표현을 보조하세요 — JSON에 없는 섹터를 창작하지 마세요.
 - 응답은 JSON 하나만. 마크다운·코드블록·앞뒤 설명 금지.
 
 [선정 기준 — 아래 4가지를 엄격히 반영]
 1) 거래대금/거래량: 동일 유니버스 안에서 누적거래량·가격 변동을 함께 볼 때 수급·관심이 상대적으로 큰 종목을 우선합니다.
 2) 과거 데이터·추세: recent_ohlcv로 최근 하락만 반복하는 형태보다, 지지·되돌림 후 재상승 시도, 또는 변동성 수축 후 방향성이 나오는 패턴을 선호합니다(데이터로 설명 가능할 때만).
-3) 인기·테마: 외부 뉴스를 사실로 단정하지 말고, 종목명·코드·섹터 연상이 가능할 때만 "테마"를 이유에 언급하세요.
+3) 테마·모멘텀 언급: **JSON 안의 가격·거래량 패턴**으로 설명 가능할 때만 간단히 서술하고, 외부 이벤트는 **추측이지만**라는 전제 없이 단정하지 마세요.
 4) 시장·세션 부합: {session_label} 기준으로 과도한 이미 급등·유동성 극소 등은 피합니다.
 
 [출력 형식 — 키 이름 고정]
 {{
   "candidates": [
-    {{"code": "종목코드", "reason": "한국어 1~2문장, 위 데이터 근거만"}},
+    {{"code": "종목코드", "reason": "한국어 1~2문장, 위 JSON 숫자·OHLCV·sector_hint만 근거"}},
     ...
   ]
 }}
@@ -4135,7 +4461,7 @@ def _run_ai_session_impl(
 ):
     _add_log(uid, "INFO", f"[AI {session}][{market}] 이중 필터링 시작")
 
-    # ── 시장별 데이터 수집 (Gemini 입력 유니버스: 감시목록 + 대표 풀, 최대 MAX_AI_UNIVERSE_STOCKS) ──
+    # ── 시장별 데이터 수집 (Gemini 입력 유니버스: KR은 legacy|dynamic, US는 감시+고정 풀) ──
     try:
         if market == "US":
             stock_data = _collect_us_stock_data_for_ai(uid, cfg)
@@ -4146,7 +4472,10 @@ def _run_ai_session_impl(
     except Exception as e:
         _add_log(uid, "ERROR", f"[AI][{market}] 데이터 수집 오류: {e}"); return
 
-    _add_log(uid, "INFO", f"[AI][{market}] Gemini 입력 유니버스 {len(stock_data)}종목 수집")
+    _kr_u_hint = ""
+    if market != "US":
+        _kr_u_hint = f" ai_universe_mode={cfg.get('ai_universe_mode', 'legacy')}"
+    _add_log(uid, "INFO", f"[AI][{market}] Gemini 입력 유니버스 {len(stock_data)}종목 수집{_kr_u_hint}")
 
     reasons_map: dict[str, str] = {}
     try:
@@ -4272,7 +4601,19 @@ def _run_ai_session_impl(
             **prices, "detail": detail,
         }
 
-    top_stocks = scored[:cap]
+    _max_sector_rec = int(cfg.get("max_positions_per_sector", 2))
+    sector_exposure_rec = _get_sector_exposure(uid, market)
+    top_stocks = _sector_diversify_scored_for_recommendations(
+        scored, cap, market, sector_exposure_rec, _max_sector_rec,
+    )
+    _pure_top_codes = [t[0] for t in scored[: min(cap, len(scored))]]
+    _div_codes = [t[0] for t in top_stocks[: len(_pure_top_codes)]]
+    if _pure_top_codes and _div_codes and _pure_top_codes != _div_codes:
+        _add_log(
+            uid, "INFO",
+            f"[AI][{market}] 추천 노출 순서를 섹터 다변화로 조정 "
+            f"(max_positions_per_sector={_max_sector_rec})",
+        )
 
     if n_buy == 0:
         # 포트폴리오 상한 도달: 추천 카드만 저장하고 매수 없이 종료
@@ -4338,6 +4679,15 @@ def _run_ai_session_impl(
                 f"[AI][US][{code}] 점수 미달({rec['score']}/{min_score_us_ai}, AI전용 기준) — 건너뜀",
             )
             _skip("US점수")
+            continue
+        min_score_ai_kr = int(cfg.get("min_score_kr", 40))
+        if market == "KR" and rec["score"] < min_score_ai_kr:
+            _add_log(
+                uid,
+                "INFO",
+                f"[AI][KR][{code}] 점수 미달({rec['score']}/{min_score_ai_kr}, 전략 min_score_kr 동일) — 건너뜀",
+            )
+            _skip("KR점수")
             continue
         # 섹터 노출 한도 체크
         sec_ok, sector = _sector_ok(code, market, sector_exposure, max_per_sector)
@@ -6040,10 +6390,22 @@ def route_config():
                 "reconcile_enabled", "fill_check_enabled",
                 "monday_morning_skip_enabled", "monday_morning_skip_min",
                 "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live",
-                "strategy_tier", "market_scope"}
+                "strategy_tier", "market_scope", "ai_universe_mode",
+                "max_positions_per_sector",
+                "ai_universe_kr_quality_gates", "ai_universe_kr_min_cap_eok"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400
+    if "ai_universe_mode" in updates:
+        m = updates["ai_universe_mode"]
+        if isinstance(m, str):
+            x = m.strip().lower()
+            if x in ("dynamic", "kis", "rank", "auto"):
+                updates["ai_universe_mode"] = "dynamic"
+            else:
+                updates["ai_universe_mode"] = "legacy"
+        else:
+            updates["ai_universe_mode"] = "legacy"
     if "market_scope" in updates:
         ms = updates["market_scope"]
         if isinstance(ms, str):
@@ -6062,6 +6424,12 @@ def route_config():
         st = updates["strategy_tier"]
         if st is not None and st not in ("conservative", "balanced", "aggressive"):
             return jsonify({"ok": False, "error": "strategy_tier 는 conservative|balanced|aggressive 이거나 null"}), 400
+    if "ai_universe_kr_min_cap_eok" in updates:
+        try:
+            mn = float(updates["ai_universe_kr_min_cap_eok"])
+            updates["ai_universe_kr_min_cap_eok"] = max(0.0, mn)
+        except (TypeError, ValueError):
+            updates["ai_universe_kr_min_cap_eok"] = 0.0
     save_config(uid, updates)
     _add_log(uid, "INFO", f"설정 변경: {list(updates.keys())}")
     return jsonify({"ok": True, "updated": updates})
