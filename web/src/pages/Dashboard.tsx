@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { apiFetch } from "../api/client";
 import type { StatusResponse, TradeRow, LogEntry } from "../types";
 
@@ -22,6 +22,7 @@ import {
 import { Sparkline } from "../components/Sparkline";
 import { tvSymbol } from "../utils/tradingViewSymbol";
 import { formatKst } from "../utils/formatKst";
+import { normalizeMarketScope, type MarketScope } from "../utils/marketScope";
 
 const POLL_MS = 20000;
 
@@ -29,11 +30,15 @@ export function Dashboard({
   idToken,
   currentMarket,
   setMarket,
+  statusBootstrap = null,
 }: {
   idToken: string;
   currentMarket: "KR" | "US";
   setMarket: (m: "KR" | "US") => void;
+  /** App 부트에서 이미 가져온 /api/status — 첫 티크에서 loadStatus() 생략 */
+  statusBootstrap?: StatusResponse | null;
 }) {
+  const prevIdToken = useRef<string | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -80,16 +85,25 @@ export function Dashboard({
   }, [idToken]);
 
   useEffect(() => {
-    loadStatus();
+    const idTokenBumped =
+      prevIdToken.current !== null && prevIdToken.current !== idToken;
     loadTrades();
     loadLogs();
+    if (statusBootstrap?.ok && !idTokenBumped) {
+      setStatus(statusBootstrap);
+      setErr("");
+      setLoading(false);
+    } else {
+      loadStatus();
+    }
+    prevIdToken.current = idToken;
     const t = setInterval(() => {
       loadStatus();
       loadTrades();
       loadLogs();
     }, POLL_MS);
     return () => clearInterval(t);
-  }, [loadStatus, loadTrades, loadLogs]);
+  }, [idToken, loadStatus, loadTrades, loadLogs, statusBootstrap]);
 
   async function botControl(action: "start" | "stop" | "resume") {
     const labels = { start: "시작", stop: "중지", resume: "매매 재개" };
@@ -117,9 +131,15 @@ export function Dashboard({
   }
 
   const cfg = status?.config;
+  const marketScope: MarketScope = normalizeMarketScope(cfg?.market_scope);
   const botState = status?.state;
   /** Firestore에 없으면 기본 켜짐 */
   const botOn = botState?.bot_enabled !== false;
+
+  useEffect(() => {
+    if (marketScope === "kr") setMarket("KR");
+    else if (marketScope === "us") setMarket("US");
+  }, [marketScope, setMarket]);
   const wl =
     currentMarket === "KR"
       ? cfg?.kr_watchlist || []
@@ -131,6 +151,35 @@ export function Dashboard({
   const positionsKr = status?.positions_kr || {};
   const positionsUs = status?.positions_us || {};
   const bal = status?.balance as Record<string, string> | undefined;
+
+  const sumUnrealizedPnl = (pos: Record<string, { pnl?: number }>) =>
+    Object.values(pos).reduce((a, p) => a + (p.pnl ?? 0), 0);
+  const unrealizedTotalKr = sumUnrealizedPnl(positionsKr);
+  const unrealizedTotalUs = sumUnrealizedPnl(positionsUs);
+
+  const chartMode: "kr" | "us" | "both" =
+    marketScope === "both"
+      ? currentMarket === "KR"
+        ? "kr"
+        : "us"
+      : marketScope;
+  const equityFilter: "KR" | "US" =
+    marketScope === "kr"
+      ? "KR"
+      : marketScope === "us"
+        ? "US"
+        : currentMarket;
+
+  const tradesView = useMemo(() => {
+    if (marketScope === "both") return trades;
+    return trades.filter(
+      (t) => (t.market || "KR").toUpperCase() === (marketScope === "kr" ? "KR" : "US"),
+    );
+  }, [trades, marketScope]);
+  const dailyGate = status?.risk_gates?.daily_pnl;
+  const dailyRealized = dailyGate?.realized_pnl;
+  const dailyStartEq = dailyGate?.start_equity;
+  const dailyRatioPct = dailyGate?.ratio_pct;
 
   if (loading && !status) {
     return (
@@ -158,34 +207,43 @@ export function Dashboard({
                 : ""}
             </p>
           </div>
-          <div
-            className="flex w-full sm:w-auto rounded-xl bg-slate-950/80 p-1 border border-white/[0.08] shadow-inner self-stretch sm:self-auto"
-            role="group"
-            aria-label="시장 선택"
-          >
-            <button
-              type="button"
-              onClick={() => setMarket("KR")}
-              className={`tap-target min-h-11 flex-1 sm:flex-initial rounded-lg px-4 py-2.5 text-sm font-medium transition-colors ${
-                currentMarket === "KR"
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
+          {marketScope === "both" ? (
+            <div
+              className="flex w-full sm:w-auto rounded-xl bg-slate-950/80 p-1 border border-white/[0.08] shadow-inner self-stretch sm:self-auto"
+              role="group"
+              aria-label="시장 선택"
             >
-              한국
-            </button>
-            <button
-              type="button"
-              onClick={() => setMarket("US")}
-              className={`tap-target min-h-11 flex-1 sm:flex-initial rounded-lg px-4 py-2.5 text-sm font-medium transition-colors ${
-                currentMarket === "US"
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
+              <button
+                type="button"
+                onClick={() => setMarket("KR")}
+                className={`tap-target min-h-11 flex-1 sm:flex-initial rounded-lg px-4 py-2.5 text-sm font-medium transition-colors ${
+                  currentMarket === "KR"
+                    ? "bg-blue-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                한국
+              </button>
+              <button
+                type="button"
+                onClick={() => setMarket("US")}
+                className={`tap-target min-h-11 flex-1 sm:flex-initial rounded-lg px-4 py-2.5 text-sm font-medium transition-colors ${
+                  currentMarket === "US"
+                    ? "bg-blue-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                미국
+              </button>
+            </div>
+          ) : (
+            <div
+              className="rounded-xl border border-white/10 bg-slate-950/80 px-4 py-2.5 text-sm text-slate-200"
+              aria-label="시장(설정: 단일)"
             >
-              미국
-            </button>
-          </div>
+              {marketScope === "kr" ? "🇰🇷 국내장 전용" : "🇺🇸 미국장 전용"}
+            </div>
+          )}
         </div>
       </header>
 
@@ -203,7 +261,10 @@ export function Dashboard({
         <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500 mb-3">
           계좌 요약
         </h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        <div
+          className={`grid grid-cols-1 sm:grid-cols-2 gap-3 ${marketScope === "both" ? "lg:grid-cols-3" : "lg:grid-cols-3"}`}
+        >
+          {marketScope !== "us" && (
           <div className="rounded-2xl border border-white/[0.07] bg-gradient-to-b from-white/[0.05] to-transparent px-4 py-3.5">
             <p className="text-[11px] text-slate-500">총 평가</p>
             <p className="text-lg font-semibold text-white tabular-nums mt-1">
@@ -212,21 +273,81 @@ export function Dashboard({
                 : "—"}
             </p>
           </div>
+          )}
+          {marketScope !== "us" && (
           <div className="rounded-2xl border border-white/[0.07] bg-gradient-to-b from-emerald-500/[0.07] to-transparent px-4 py-3.5">
-            <p className="text-[11px] text-slate-500">주문가능</p>
+            <p className="text-[11px] text-slate-500">주문가능 (원)</p>
             <p className="text-lg font-semibold text-emerald-400 tabular-nums mt-1">
               {bal?.available_cash
                 ? `${Number(bal.available_cash).toLocaleString()}원`
                 : "—"}
             </p>
           </div>
+          )}
+          {marketScope !== "us" && (
           <div className="rounded-2xl border border-white/[0.07] bg-gradient-to-b from-white/[0.04] to-transparent px-4 py-3.5">
-            <p className="text-[11px] text-slate-500">주식 평가</p>
+            <p className="text-[11px] text-slate-500">주식 평가 (원)</p>
             <p className="text-lg font-semibold text-slate-200 tabular-nums mt-1">
               {bal?.stock_value
                 ? `${Number(bal.stock_value).toLocaleString()}원`
                 : "—"}
             </p>
+          </div>
+          )}
+          {marketScope === "us" && (
+            <div className="rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3.5 sm:col-span-2 lg:col-span-3">
+              <p className="text-[11px] text-amber-200/90">원화 잔고·총평가</p>
+              <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                상단 KIS 응답은 동일 연좌의 <span className="text-slate-400">국내(원)</span> 기준입니다. 미국
+                주문가능(USD)은 앱/HTS에서 확인하세요. 국내 매도 대금은 결제일 이후
+                달러 매수에 반영되는 경우가 많습니다.
+              </p>
+            </div>
+          )}
+          {marketScope !== "us" && (
+          <div className="rounded-2xl border border-white/[0.07] bg-gradient-to-b from-cyan-500/[0.06] to-transparent px-4 py-3.5">
+            <p className="text-[11px] text-slate-500">보유 총 손익 (미실현, KR)</p>
+            <p
+              className={`text-lg font-semibold tabular-nums mt-1 ${unrealizedTotalKr >= 0 ? "text-emerald-400" : "text-red-400"}`}
+            >
+              {unrealizedTotalKr >= 0 ? "+" : "−"}
+              {Math.abs(unrealizedTotalKr).toLocaleString()}원
+            </p>
+          </div>
+          )}
+          {marketScope !== "kr" && (
+          <div className="rounded-2xl border border-white/[0.07] bg-gradient-to-b from-violet-500/[0.06] to-transparent px-4 py-3.5">
+            <p className="text-[11px] text-slate-500">보유 총 손익 (미실현, US)</p>
+            <p
+              className={`text-lg font-semibold tabular-nums mt-1 ${unrealizedTotalUs >= 0 ? "text-emerald-400" : "text-red-400"}`}
+            >
+              {unrealizedTotalUs >= 0 ? "+" : "−"}$
+              {Math.abs(unrealizedTotalUs).toFixed(2)}
+            </p>
+          </div>
+          )}
+          <div className="rounded-2xl border border-white/[0.07] bg-gradient-to-b from-amber-500/[0.07] to-transparent px-4 py-3.5">
+            <p className="text-[11px] text-slate-500">일간 실현 (봇·당일)</p>
+            <p
+              className={`text-lg font-semibold tabular-nums mt-1 ${(dailyRealized ?? 0) >= 0 ? "text-amber-200" : "text-red-300"}`}
+            >
+              {status?.risk_gates?.error
+                ? "—"
+                : typeof dailyRealized === "number"
+                  ? `${dailyRealized >= 0 ? "+" : "−"}${Math.abs(dailyRealized).toLocaleString(undefined, { maximumFractionDigits: 0 })}원`
+                  : "—"}
+            </p>
+            {(dailyStartEq ?? 0) > 0 && typeof dailyRatioPct === "number" && (
+              <p className="text-[10px] text-slate-500 mt-0.5 tabular-nums">
+                아침 총자산 대비 {(dailyRatioPct >= 0 ? "+" : "")}
+                {dailyRatioPct}%
+              </p>
+            )}
+            {(dailyStartEq ?? 0) <= 0 && typeof dailyRealized === "number" && !status?.risk_gates?.error && (
+              <p className="text-[10px] text-slate-600 mt-0.5">
+                일간 %는 장 시작·총자산 스냅샷이 있을 때만 표시됩니다.
+              </p>
+            )}
           </div>
         </div>
       </section>
@@ -240,21 +361,28 @@ export function Dashboard({
           <div className="mb-3">
             <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
               누적 실현손익
+              {marketScope === "both" && (
+                <span className="text-slate-600 font-normal"> · {currentMarket}</span>
+              )}
             </h2>
-            <p className="text-[10px] text-slate-600 mt-0.5">매도 체결 기준</p>
+            <p className="text-[10px] text-slate-600 mt-0.5">매도 체결 기준(선택 시장)</p>
           </div>
-          <EquityChart trades={trades} />
+          <EquityChart trades={trades} marketFilter={equityFilter} />
         </div>
         <div className="glass rounded-2xl p-4 min-w-0">
           <div className="mb-3">
             <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
               보유 비중
+              {marketScope === "both" && (
+                <span className="text-slate-600 font-normal"> · {currentMarket}</span>
+              )}
             </h2>
-            <p className="text-[10px] text-slate-600 mt-0.5">종목별 평가액</p>
+            <p className="text-[10px] text-slate-600 mt-0.5">선택 시장·종목별 평가액</p>
           </div>
           <PositionMixChart
             positionsKr={positionsKr}
             positionsUs={positionsUs}
+            mode={chartMode}
           />
         </div>
       </section>
@@ -376,6 +504,7 @@ export function Dashboard({
             idToken={idToken}
             positionsKr={positionsKr}
             positionsUs={positionsUs}
+            marketScope={marketScope}
             onChange={() => {
               void loadStatus();
               void loadTrades();
@@ -569,6 +698,7 @@ export function Dashboard({
             idToken={idToken}
             positionsKr={positionsKr}
             positionsUs={positionsUs}
+            marketScope={marketScope}
             onOrderSuccess={() => {
               void loadStatus();
               void loadTrades();
@@ -590,14 +720,19 @@ export function Dashboard({
           <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
             매매 이력
           </h2>
-          <p className="text-[10px] text-slate-600 mt-1">최근 30건</p>
+          <p className="text-[10px] text-slate-600 mt-1">
+            최근 30건
+            {marketScope !== "both" && (
+              <span className="text-slate-500"> · {marketScope === "kr" ? "국내" : "미국"}만 표시</span>
+            )}
+          </p>
         </div>
-        {trades.length === 0 ? (
+        {tradesView.length === 0 ? (
           <p className="text-center py-10 text-slate-600 text-sm">이력 없음</p>
         ) : (
           <>
             <div className="md:hidden divide-y divide-white/5 border-t border-white/5">
-              {trades.slice(0, 30).map((t, i) => (
+              {tradesView.slice(0, 30).map((t, i) => (
                 <div key={i} className="px-4 py-3.5 space-y-2">
                   <div className="flex justify-between items-start gap-3">
                     <div className="min-w-0">
@@ -650,7 +785,7 @@ export function Dashboard({
                   </tr>
                 </thead>
                 <tbody>
-                  {trades.slice(0, 30).map((t, i) => (
+                  {tradesView.slice(0, 30).map((t, i) => (
                     <tr key={i} className="border-b border-white/5 hover:bg-white/[0.03]">
                       <td className="px-4 py-2.5 text-xs text-slate-500 whitespace-nowrap">
                         {formatKst(t.timestamp)}

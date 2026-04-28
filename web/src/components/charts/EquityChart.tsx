@@ -10,8 +10,12 @@ import {
 import type { TradeRow } from "../../types";
 import { formatKstShort } from "../../utils/formatKst";
 
-function buildSeries(trades: TradeRow[]) {
-  const sorted = [...trades].sort(
+function buildSeries(trades: TradeRow[], marketFilter: "KR" | "US" | null) {
+  const filtered =
+    marketFilter == null
+      ? trades
+      : trades.filter((t) => (t.market || "KR").toUpperCase() === marketFilter);
+  const sorted = [...filtered].sort(
     (a, b) =>
       new Date(a.timestamp || 0).getTime() -
       new Date(b.timestamp || 0).getTime(),
@@ -28,8 +32,15 @@ function buildSeries(trades: TradeRow[]) {
   return rows;
 }
 
-export function EquityChart({ trades }: { trades: TradeRow[] }) {
-  const data = buildSeries(trades);
+export function EquityChart({
+  trades,
+  marketFilter = null,
+}: {
+  trades: TradeRow[];
+  /** 국내만/미국만 누적손익 — both 모드·단일 시장 뷰용 */
+  marketFilter?: "KR" | "US" | null;
+}) {
+  const data = buildSeries(trades, marketFilter);
   if (data.length < 2) {
     return (
       <p className="text-slate-500 text-sm py-8 text-center">

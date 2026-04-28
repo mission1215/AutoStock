@@ -12,6 +12,26 @@ export interface ModeProfiles {
   live?: AppConfig;
 }
 
+/** GET /api/status → risk_gates (대시보드 배너·일간손익) */
+export interface DailyPnlGate {
+  ok?: boolean;
+  reason?: string;
+  ratio_pct?: number;
+  target_pct?: number;
+  loss_limit_pct?: number;
+  realized_pnl?: number;
+  start_equity?: number;
+  peak_equity?: number;
+}
+
+export interface StatusRiskGates {
+  error?: string;
+  now_kst?: string;
+  now_et?: string;
+  daily_pnl?: DailyPnlGate;
+  [key: string]: unknown;
+}
+
 export interface StatusResponse {
   ok: boolean;
   setup_required?: boolean;
@@ -27,9 +47,13 @@ export interface StatusResponse {
   updated_at?: string;
   kis_error?: string | null;
   error?: string;
+  risk_gates?: StatusRiskGates;
 }
 
 export interface AppConfig {
+  /** KIS API 설정 시 서버에 저장 (조회 API에서는 마스크 없이도 일부 민감 — UI에서 가림) */
+  account_no?: string;
+  display_name?: string;
   kr_watchlist?: string[];
   us_watchlist?: string[];
   ai_stock_count?: number;
@@ -40,6 +64,8 @@ export interface AppConfig {
   daily_profit_target?: number;
   is_mock?: boolean;
   setup_complete?: boolean;
+  /** 자동매매·스케줄: kr | us | both (기본 kr) */
+  market_scope?: "kr" | "us" | "both";
   /** 분할 익절·추격 방지 등 (백엔드와 동일 키) */
   partial_tp_enabled?: boolean;
   partial_tp_trigger_pct?: number;
@@ -54,6 +80,8 @@ export interface AppConfig {
   avg_down_max_times?: number;
   avg_down_qty_ratio?: number;
   avg_down_min_interval_hours?: number;
+  /** 보수/보통/적극 프리셋 — 마지막으로 저장한 성향(표시용). 전략 수치는 k_factor 등과 함께 병합 저장 */
+  strategy_tier?: "conservative" | "balanced" | "aggressive" | null;
 }
 
 export interface PositionKr {

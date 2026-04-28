@@ -3,6 +3,7 @@ import { apiFetch } from "../api/client";
 import type { PositionKr, PositionUs } from "../types";
 import { TradingViewAdvancedChart } from "./TradingViewEmbed";
 import { tvSymbol } from "../utils/tradingViewSymbol";
+import type { MarketScope } from "../utils/marketScope";
 
 function inferMarket(code: string): "KR" | "US" {
   const c = code.trim().toUpperCase();
@@ -14,11 +15,13 @@ export function ManualTradingPanel({
   positionsKr,
   positionsUs,
   onOrderSuccess,
+  marketScope = "kr",
 }: {
   idToken: string;
   positionsKr: Record<string, PositionKr>;
   positionsUs: Record<string, PositionUs>;
   onOrderSuccess: () => void;
+  marketScope?: MarketScope;
 }) {
   const [code, setCode] = useState("");
   const [qty, setQty] = useState("");
@@ -170,16 +173,20 @@ export function ManualTradingPanel({
   }
 
   const posList: { code: string; market: "KR" | "US"; p: PositionKr | PositionUs }[] = [
-    ...Object.entries(positionsKr).map(([code, p]) => ({
-      code,
-      market: "KR" as const,
-      p,
-    })),
-    ...Object.entries(positionsUs).map(([code, p]) => ({
-      code,
-      market: "US" as const,
-      p,
-    })),
+    ...(marketScope !== "us"
+      ? Object.entries(positionsKr).map(([code, p]) => ({
+          code,
+          market: "KR" as const,
+          p,
+        }))
+      : []),
+    ...(marketScope !== "kr"
+      ? Object.entries(positionsUs).map(([code, p]) => ({
+          code,
+          market: "US" as const,
+          p,
+        }))
+      : []),
   ];
 
   const chartMarket: "KR" | "US" =

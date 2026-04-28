@@ -9,6 +9,9 @@ AutoStock Firebase Functions — 멀티유저 KIS 자동매매 시스템 (한국
 
 ▣ HTTP API (/api/*):
   POST /api/setup           — 최초 설정 (KIS 키 저장)
+  POST /api/account/withdraw — 탈퇴: Firestore `users/{uid}` 전부 삭제 + Firebase Auth 계정 삭제
+  POST /api/credentials     — KIS app_key/secret/계좌 (현재 모의·실전 프로필 1곳만, OAuth 캐시 무효화)
+  POST /api/credentials/dual — mock·실전 키·계좌를 한 번에 저장 (프로필 매핑, 토글 시 get_config이 알아서 선택)
   GET  /api/status          — 대시보드 전체 상태
   POST /api/order           — 수동 매수/매도 (KR/US)
   POST /api/bot             — 봇 시작/중지
@@ -111,6 +114,24 @@ if _env_path.is_file():
                 os.environ.setdefault(k.strip(), v.strip().strip("'\""))
         logger.info("Loaded .env (manual parse, no python-dotenv)")
 
+# KIS OpenAPI: 모의투자(VTS) / 실전(REST) — 도메인·앱키·TR 이 한 세트로 맞아야
+#  - 모의: KIS_VTS_BASE_URL
+#  - 실전: KIS_REAL_BASE_URL
+#  ※ 국내(KR) `domestic-stock` / TTTC*·FHKST* TR 은 이 파일 내 기존 `_headers`·`_tr_id` 경로이며
+#     아래 US_TR_* 상수·해외 엔드포인트 `overseas-*` 와는 완전히 분리됨(교차 참조 없음).
+KIS_VTS_BASE_URL = "https://openapivts.koreainvestment.com:29443"
+KIS_REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
+
+# ── KIS 해외(미국) 주문·잔고·체결 — 모의/실전 TR (국내 TR 과 분리) ──
+#    모의투자(is_mock) 시에만 V* / VTTP* + VTS 도메인. 실전 US 는 J* + REAL 도메인.
+US_MOCK_BUY_TR = "VTTT1002U"
+US_MOCK_SELL_TR = "VTTT1001U"
+US_MOCK_BALANCE_TR = "VTTP3106R"
+US_MOCK_INQUIRE_CCNL_TR = "VTTT0001L"
+US_LIVE_BUY_TR = "JTTT1002U"
+US_LIVE_SELL_TR = "JTTT1001U"
+US_LIVE_BALANCE_TR = "JTTT3012R"
+US_LIVE_INQUIRE_CCNL_TR = "JTTT3001R"
 # KIS OpenAPI: 초당 거래(조회·주문) 건수 제한 — HTTP 500 "초당 거래건수를 초과하였습니다"
 # 주문·주문가능까지 같은 간격으로 묶이므로 0.2 미만이면 AI 연속 매수에서 자주 걸림
 KIS_MIN_INTERVAL_SEC = 0.26
@@ -143,6 +164,17 @@ _ohlcv_cache: dict[str, dict] = {}   # key: "uid:market:code"  value: {data, ts}
 _PRICE_TTL  = 60   # 초
 _BALANCE_TTL = 30  # 초
 _OHLCV_TTL = 300   # 초 (일봉은 초단위로 자주 바뀌지 않음)
+
+
+def _evict_caches_for_uid(uid: str) -> None:
+    """users/{uid} 데이터 삭제 후 동일 인스턴스의 인메모리 KIS·잔고 캐시를 비운다."""
+    pfx = f"{uid}:"
+    for m in (_price_cache, _ohlcv_cache):
+        for k in list(m.keys()):
+            if k.startswith(pfx):
+                m.pop(k, None)
+    _balance_cache.pop(uid, None)
+
 
 def _cached_price(uid: str, cfg: dict, code: str, market: str) -> dict:
     """현재가를 인메모리 캐시에서 반환. 만료 시 KIS API 재조회.
@@ -330,6 +362,19 @@ US_SECTOR_MAP: dict[str, str] = {
 }
 
 
+def _safe_float(raw: Any, default: float = 0.0) -> float:
+    """KIS API 숫자 필드 — `''`, '-', 콤마 혼입 시 `float` 예외 방지."""
+    if raw is None:
+        return default
+    s = str(raw).strip().replace(",", "")
+    if not s or s in ("-", ".", "--"):
+        return default
+    try:
+        return float(s)
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
 def _stock_name(api_name: str, code: str, market: str = "KR") -> str:
     """표시용 종목명. 우선순위: (1) API에서 준 공식명 (2) 이번 인스턴스 캐시 (3) 정적 폴백 (4) 티커.
 
@@ -355,17 +400,13 @@ def _us_price_from_output(out: dict, ohlcv: list | None = None) -> float:
         raw = out.get(key)
         if raw is None:
             continue
-        try:
-            val = float(str(raw).replace(",", ""))
-            if val > 0:
-                return val
-        except Exception:
-            continue
+        val = _safe_float(raw, 0.0)
+        if val > 0:
+            return val
     if ohlcv:
-        try:
-            return float(str(ohlcv[0].get("clos", 0)).replace(",", ""))
-        except Exception:
-            return 0.0
+        c0 = ohlcv[0] if ohlcv else None
+        if isinstance(c0, dict):
+            return _safe_float(c0.get("clos", c0.get("stck_clpr", 0)), 0.0)
     return 0.0
 
 
@@ -402,10 +443,7 @@ def _us_closes_from_ohlcv(ohlcv: list) -> list[float]:
         if not isinstance(r, dict):
             continue
         raw = r.get("clos", r.get("stck_clpr", 0))
-        try:
-            v = float(str(raw).replace(",", "").strip() or 0)
-        except Exception:
-            continue
+        v = _safe_float(raw, 0.0)
         if v > 0:
             newest_first.append(v)
     return list(reversed(newest_first))
@@ -553,7 +591,11 @@ def verify_token(req) -> str:
 
 # Firestore config/settings: { is_mock, setup_complete, profiles: { mock: {...}, live: {...} } }
 # 레거시(평면 1문서)는 get_config 시 그대로 읽고, save_config 시 profiles 로 이관.
-_CONFIG_TOP_KEYS = frozenset({"is_mock", "setup_complete", "display_name", "email", "created_at"})
+_CONFIG_TOP_KEYS = frozenset({
+    "is_mock", "setup_complete", "display_name", "email", "created_at",
+    # 자동매매·스케줄 AI·장마감 청산이 대상으로 할 시장: kr | us | both (기본 kr)
+    "market_scope",
+})
 _CONFIG_PROFILE_KEYS = frozenset({
     "app_key", "app_secret", "account_no",
     "kr_watchlist", "us_watchlist", "k_factor", "ma_period",
@@ -578,6 +620,7 @@ _CONFIG_PROFILE_KEYS = frozenset({
     "monday_morning_skip_enabled", "monday_morning_skip_min",
     "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live",
     "bot_enabled",
+    "strategy_tier",  # conservative | balanced | aggressive — UI 성향(프리셋) 기록, 전략 엔진은 k_factor 등으로 동작
 })
 
 
@@ -629,7 +672,10 @@ def get_config(uid: str) -> dict:
     if not raw:
         return {}
     if "profiles" not in raw or not isinstance(raw.get("profiles"), dict):
-        return raw
+        out = dict(raw)
+        if "market_scope" not in out:
+            out["market_scope"] = "kr"
+        return out
     raw = _ensure_profiles_structure(raw)
     mode = "mock" if raw.get("is_mock", True) else "live"
     p = raw["profiles"].get(mode) or {}
@@ -641,9 +687,11 @@ def get_config(uid: str) -> dict:
             p = {**other_p, **{k: v for k, v in p.items() if v is not None}}
     out = {**p}
     out["is_mock"] = raw.get("is_mock", True)
-    for k in ("setup_complete", "display_name", "email", "created_at"):
+    for k in ("setup_complete", "display_name", "email", "created_at", "market_scope"):
         if k in raw:
             out[k] = raw[k]
+    if "market_scope" not in out:
+        out["market_scope"] = "kr"
     return out
 
 
@@ -684,10 +732,40 @@ def save_config(uid: str, data: dict):
     _ensure_user_root_doc(uid)
 
 
+def save_dual_credentials(uid: str, mock: dict, live: dict) -> None:
+    """mock / live 프로필 각각에 KIS app_key, app_secret, account_no 반영.
+
+    요청에서 항목을 비우면(또는 공백만) **기존 Firestore 값 유지**. 병합 후 세 항목이
+    모두 채워져 있어야 한다.
+    """
+    cred_keys = ("app_key", "app_secret", "account_no")
+    ref = _uref(uid).collection("config").document("settings")
+    snap = ref.get()
+    raw = _ensure_profiles_structure(snap.to_dict() if snap.exists else {})
+    profiles = raw.get("profiles") or {"mock": {}, "live": {}}
+    for mode, inc in (("mock", mock or {}), ("live", live or {})):
+        ex = dict(profiles.get(mode) or {})
+        d = dict(inc)
+        for k in cred_keys:
+            v = d.get(k)
+            if v is not None and str(v).strip() != "":
+                ex[k] = str(v).strip()
+        if not all(str(ex.get(k) or "").strip() for k in cred_keys):
+            raise ValueError(
+                f"{mode} 프로필: app_key, app_secret, account_no 가 모두 필요합니다. "
+                "이미 저장된 값이 있으면 바꾸지 않을 칸은 비워 두세요."
+            )
+        profiles[mode] = ex
+    raw["profiles"] = profiles
+    for k in list(raw.keys()):
+        if k in _CONFIG_PROFILE_KEYS:
+            del raw[k]
+    ref.set(raw)
+    _ensure_user_root_doc(uid)
+
+
 def _base_url(is_mock: bool) -> str:
-    if is_mock:
-        return "https://openapivts.koreainvestment.com:29443"
-    return "https://openapi.koreainvestment.com:9443"
+    return KIS_VTS_BASE_URL if is_mock else KIS_REAL_BASE_URL
 
 
 def _account_prefix(account_no: str) -> str:
@@ -696,6 +774,29 @@ def _account_prefix(account_no: str) -> str:
 
 def _account_suffix(account_no: str) -> str:
     return account_no.split("-")[1] if "-" in account_no else "01"
+
+
+def _market_scope_normalized(cfg: dict) -> str:
+    """자동매매·스케줄이 다룰 시장 범위: kr | us | both (미설정·알 수 없는 값 → kr)."""
+    raw = cfg.get("market_scope")
+    if not isinstance(raw, str):
+        return "kr"
+    s = raw.strip().lower()
+    if s in ("kr", "korea", "domestic", "ko"):
+        return "kr"
+    if s in ("us", "usa", "us_only"):
+        return "us"
+    if s in ("both", "all", "every"):
+        return "both"
+    return "kr"
+
+
+def _scope_allows_kr(cfg: dict) -> bool:
+    return _market_scope_normalized(cfg) in ("kr", "both")
+
+
+def _scope_allows_us(cfg: dict) -> bool:
+    return _market_scope_normalized(cfg) in ("us", "both")
 
 
 # ══════════════════════════════════════════════════════════
@@ -750,6 +851,12 @@ def _issue_token(uid: str, cfg: dict) -> str:
 
 def invalidate_token(uid: str):
     _uref(uid).collection("state").document("token").delete()
+
+
+def _invalidate_kis_tokens(uid: str) -> None:
+    """앱키·시크릿·계좌 변경 후 저장된 KIS OAuth 토큰을 제거(다음 요청에서 재발급)."""
+    invalidate_token(uid)
+    _uref(uid).collection("state").document("token_real").delete()
 
 
 def get_token_real(uid: str, cfg: dict) -> str:
@@ -816,10 +923,20 @@ def _headers_kr_real(uid: str, cfg: dict, tr_id: str) -> dict:
 # ══════════════════════════════════════════════════════════
 
 class ApiError(Exception):
-    def __init__(self, msg: str, rt_cd: str = "", msg_cd: str = "") -> None:
+    """KIS API 오류. `kis_msg1` = 응답 JSON `msg1` (없으면 빈 문자열)."""
+
+    def __init__(
+        self,
+        msg: str,
+        rt_cd: str = "",
+        msg_cd: str = "",
+        *,
+        kis_msg1: str = "",
+    ) -> None:
         super().__init__(msg)
-        self.rt_cd = rt_cd
-        self.msg_cd = msg_cd
+        self.rt_cd = str(rt_cd) if rt_cd is not None else ""
+        self.msg_cd = str(msg_cd) if msg_cd is not None else ""
+        self.kis_msg1 = kis_msg1
 
 
 def _is_kis_mkt_div_mismatch(e: ApiError) -> bool:
@@ -830,6 +947,7 @@ def _is_kis_mkt_div_mismatch(e: ApiError) -> bool:
 
 
 def _headers(uid: str, cfg: dict, tr_id: str) -> dict:
+    """국내(KR) `domestic-stock` 등 — 해외(US) 주문/잔고는 `_headers_us` + `US_MOCK_*` / `US_LIVE_*` TR 사용."""
     return {
         "Content-Type": "application/json; charset=utf-8",
         "authorization": f"Bearer {get_token(uid, cfg)}",
@@ -840,42 +958,81 @@ def _headers(uid: str, cfg: dict, tr_id: str) -> dict:
     }
 
 
+def _format_kis_error_summary(rt_cd, msg_cd, msg1) -> str:
+    m1 = str(msg1) if msg1 is not None else ""
+    mcd = str(msg_cd) if msg_cd is not None else ""
+    return f"rt_cd={rt_cd!s} msg_cd={mcd} msg1={m1!s}"
+
+
 def _parse(resp: http_requests.Response, uid: str, cfg: dict) -> dict:
     if resp.status_code == 401:
         invalidate_token(uid)
-        raise ApiError("HTTP 401 — 토큰 만료", rt_cd="401")
+        raise ApiError("HTTP 401 — 토큰 만료", rt_cd="401", kis_msg1="")
     if resp.status_code >= 400:
         try:
             data = resp.json()
         except ValueError:
-            raise ApiError(f"KIS HTTP {resp.status_code}: {resp.text[:600]}") from None
+            txt = (resp.text or "")[:800]
+            raise ApiError(
+                f"KIS HTTP {resp.status_code} (body non-JSON): {txt!s}",
+                rt_cd=str(resp.status_code),
+                kis_msg1=txt,
+            ) from None
         rt_cd = str(data.get("rt_cd", ""))
-        msg_cd = data.get("msg_cd", "")
-        msg1 = data.get("msg1", str(data))
+        msg_cd = str(data.get("msg_cd", "") or "")
+        msg1 = str(data.get("msg1", "") or data)
         if msg_cd in ("EGW00123", "EGW00121"):
             invalidate_token(uid)
-            raise ApiError(f"토큰 만료: {msg_cd}", rt_cd=rt_cd, msg_cd=msg_cd)
-        raise ApiError(f"KIS HTTP {resp.status_code}: {msg1}", rt_cd=rt_cd, msg_cd=msg_cd)
+            raise ApiError(
+                f"토큰 만료: {msg_cd} | {_format_kis_error_summary(rt_cd, msg_cd, msg1)}",
+                rt_cd=rt_cd, msg_cd=msg_cd, kis_msg1=msg1,
+            )
+        raise ApiError(
+            f"KIS HTTP {resp.status_code} | {_format_kis_error_summary(rt_cd, msg_cd, msg1)}",
+            rt_cd=rt_cd, msg_cd=msg_cd, kis_msg1=msg1,
+        )
     data = resp.json()
-    rt_cd = data.get("rt_cd", "")
-    msg_cd = data.get("msg_cd", "")
+    rt_cd = str(data.get("rt_cd", "") or "")
+    msg_cd = str(data.get("msg_cd", "") or "")
     if msg_cd in ("EGW00123", "EGW00121"):
         invalidate_token(uid)
-        raise ApiError(f"토큰 만료: {msg_cd}", rt_cd=rt_cd, msg_cd=msg_cd)
+        m1t = str(data.get("msg1", "") or "")
+        raise ApiError(
+            f"토큰 만료: {msg_cd} | {_format_kis_error_summary(rt_cd, msg_cd, m1t)}",
+            rt_cd=rt_cd, msg_cd=msg_cd, kis_msg1=m1t,
+        )
     if rt_cd != "0":
-        raise ApiError(data.get("msg1", "API 오류"), rt_cd=rt_cd, msg_cd=msg_cd)
+        m1b = str(data.get("msg1", "") or "API 오류")
+        raise ApiError(
+            f"KIS business 오류 | {_format_kis_error_summary(rt_cd, msg_cd, m1b)}",
+            rt_cd=rt_cd, msg_cd=msg_cd, kis_msg1=m1b,
+        )
     return data
 
 
 def _tr_id(cfg: dict, real_id: str, mock_id: str) -> str:
+    """국내(KR) 전용: 실전 T* / 모의 V* (TTTC·VTTC 등). 해외(US) TR 은 _us_tr_*_id 사용."""
     return mock_id if cfg.get("is_mock", True) else real_id
 
 
-def _us_tr_id(cfg: dict, j_tr_id: str) -> str:
-    """해외주식 TR_ID — 모의투자는 J→V (예: JTTT3012R→VTTT3012R). 한투 API 관례."""
-    if cfg.get("is_mock", True) and j_tr_id and j_tr_id[:1] == "J":
-        return "V" + j_tr_id[1:]
-    return j_tr_id
+def _us_tr_order_id(cfg: dict, side: str) -> str:
+    """해외(미국) 매수/매도 주문 TR — 국내 TR 과 무관. 모의: V* , 실전: J* + REAL 도메인."""
+    is_mock = bool(cfg.get("is_mock", True))
+    if side == "buy":
+        return US_MOCK_BUY_TR if is_mock else US_LIVE_BUY_TR
+    if side == "sell":
+        return US_MOCK_SELL_TR if is_mock else US_LIVE_SELL_TR
+    raise ValueError(f"US order side must be buy/sell, got {side!r}")
+
+
+def _us_balance_tr_id(cfg: dict) -> str:
+    """해외 잔고 inquire-balance. 모의: VTTP3106R + VTS, 실전: JTTT3012R + REAL."""
+    return US_MOCK_BALANCE_TR if cfg.get("is_mock", True) else US_LIVE_BALANCE_TR
+
+
+def _us_inquire_ccnl_tr_id(cfg: dict) -> str:
+    """해외 체결 inquire-ccnl. 모의: VTTT0001L, 실전: JTTT3001R."""
+    return US_MOCK_INQUIRE_CCNL_TR if cfg.get("is_mock", True) else US_LIVE_INQUIRE_CCNL_TR
 
 
 def _with_retry(func, *args, retries: int = 3, **kwargs):
@@ -1237,10 +1394,11 @@ def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
 
 
 def get_balance_us(uid: str, cfg: dict) -> dict:
-    """미국 주식 잔고 — 모의: VTS + VTTT3012R, 실전: JTTT3012R."""
+    """미국 주식 잔고 — 모의: VTS + VTTP3106R, 실전: JTTT3012R. 응답·필드는 API 버전에 따라 변동."""
+    tr_id = _us_balance_tr_id(cfg)
+
     def _call():
         _kis_pace()
-        tr_id = _us_tr_id(cfg, "JTTT3012R")
         resp = http_requests.get(
             _base_url(cfg.get("is_mock", True)) + "/uapi/overseas-stock/v1/trading/inquire-balance",
             headers=_headers_us(uid, cfg, tr_id),
@@ -1254,12 +1412,45 @@ def get_balance_us(uid: str, cfg: dict) -> dict:
         )
         return _parse(resp, uid, cfg)
 
-    return _with_retry(_call, retries=4)
+    try:
+        # 블랙아웃·장외에서 잔고만 반복 실패해도 5회 재시도는 낭비 → 2회
+        return _with_retry(_call, retries=2)
+    except ApiError as e:
+        _add_log(
+            uid, "ERROR",
+            f"[US] 잔고 조회 실패 | tr_id={tr_id} | {e!s} | "
+            f"kis_msg1={e.kis_msg1!r}",
+        )
+        raise
 
 
-def place_order_us(uid: str, cfg: dict, stock_code: str, side: str, quantity: int, price: float = 0) -> dict:
-    """미국 주식 매수/매도 — 모의: VTTT1002U/VTTT1006U + VTS."""
-    tr_id = _us_tr_id(cfg, "JTTT1002U" if side == "buy" else "JTTT1006U")
+def place_order_us(
+    uid: str,
+    cfg: dict,
+    stock_code: str,
+    side: str,
+    quantity: int,
+    price: float = 0,
+    *,
+    bypass_us_buy_window: bool = False,
+) -> dict:
+    """미국 주식 매수/매도 — 모의: VTTT1002U / VTTT1001U + VTS(모의 TR은 J→V 변환).
+    `bypass_us_buy_window=True` 인 경우(물타기·수동주문) 마감전 블랙아웃을 적용하지 않는다.
+    """
+    if side == "buy" and not bypass_us_buy_window:
+        buy_ok, buy_reason = _us_buy_window_ok(cfg)
+        if not buy_ok:
+            _add_log(
+                uid, "INFO",
+                f"[US] 매수 주문 생략(시간대 블랙아웃) — {buy_reason} — KIS 호출·재시도 없음",
+            )
+            raise ApiError(
+                f"US buy blocked (time window): {buy_reason}",
+                rt_cd="0",
+                msg_cd="US_BUY_WINDOW",
+                kis_msg1="",
+            )
+    tr_id = _us_tr_order_id(cfg, side)
     ord_dvsn = "00" if price > 0 else "01"  # 00=지정가, 01=시장가
     body = {
         "CANO": _account_prefix(cfg["account_no"]),
@@ -1444,16 +1635,23 @@ def _add_log(uid: str, level: str, message: str):
 
 
 def _telegram_creds() -> tuple[str, str]:
-    """trend_new_bot 등과 동일 봇: Firebase/Cloud에 같은 값만 넣으면 됨. 별칭 키 지원."""
+    """BotFather 토큰 + chat_id. autoShorts·기타 봇과 동일 봇을 쓰면 같은 값. 별칭 다수.
+
+    권장: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+    그 외: TELEGRAM_TOKEN, TG_BOT_TOKEN, BOT_TOKEN(일부 스크립트) /
+           TELEGRAM_CHAT, TG_CHAT_ID, CHAT_ID
+    """
     token = (
         (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
         or (os.environ.get("TELEGRAM_TOKEN") or "").strip()
         or (os.environ.get("TG_BOT_TOKEN") or "").strip()
+        or (os.environ.get("BOT_TOKEN") or "").strip()
     )
     chat_id = (
         (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
         or (os.environ.get("TELEGRAM_CHAT") or "").strip()
         or (os.environ.get("TG_CHAT_ID") or "").strip()
+        or (os.environ.get("CHAT_ID") or "").strip()
     )
     return token, chat_id
 
@@ -1464,33 +1662,54 @@ def _send_telegram(
     parse_mode: str | None = "HTML",
     log_if_unconfigured: bool = True,
 ) -> bool:
-    """텔레그램 봇 전송. parse_mode=None 이면 일반 텍스트(종목명 특수문자 이슈 회피)."""
+    """텔레그램 Bot API sendMessage. parse_mode=None 이면 일반 텍스트(이모지·한글 안전)."""
     token, chat_id = _telegram_creds()
     if not token or not chat_id:
         if log_if_unconfigured:
             logger.warning(
-                "[Telegram] 봇 미설정 — TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID(또는 TELEGRAM_TOKEN+TG_CHAT_ID 별칭)"
+                "[Telegram] 봇 미설정 — TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID "
+                "또는 BOT_TOKEN+CHAT_ID 등(.env · Cloud 환경변수)"
             )
         return False
-    try:
-        payload: dict = {"chat_id": chat_id, "text": text}
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        resp = http_requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json=payload,
-            timeout=10,
-        )
-        if resp.status_code != 200:
+    if len(text) > 4090:
+        text = text[:4087] + "\n…"
+
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    thread = (os.environ.get("TELEGRAM_MESSAGE_THREAD_ID") or os.environ.get("TELEGRAM_TOPIC_ID") or "").strip()
+    if thread:
+        try:
+            payload["message_thread_id"] = int(thread)
+        except ValueError:
+            pass
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for attempt in range(3):
+        try:
+            resp = http_requests.post(url, json=payload, timeout=15)
+            if resp.status_code == 200:
+                return True
+            if resp.status_code == 429 and attempt < 2:
+                ra = int(resp.headers.get("Retry-After", "1") or 1)
+                time_module.sleep(min(max(ra, 1), 10))
+                continue
+            if resp.status_code >= 500 and attempt < 2:
+                time_module.sleep(0.4 * (attempt + 1))
+                continue
             logger.error(
                 "[Telegram] sendMessage HTTP %s: %s",
                 resp.status_code,
                 (resp.text or "")[:500],
             )
-        return resp.status_code == 200
-    except Exception as e:
-        logger.error("[Telegram] 전송 실패: %s", e)
-        return False
+            return False
+        except Exception as e:
+            if attempt < 2:
+                time_module.sleep(0.3 * (attempt + 1))
+                continue
+            logger.error("[Telegram] 전송 실패: %s", e)
+            return False
+    return False
 
 
 _telegram_trade_missed_config_logged: bool = False
@@ -1513,8 +1732,9 @@ def _notify_telegram_trade(
         if not _telegram_trade_missed_config_logged:
             _telegram_trade_missed_config_logged = True
             logger.warning(
-                "[Telegram] 매매 알림이 나가지 않습니다. Cloud Functions 환경에 "
-                "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID(또는 별칭)를 넣고 재배포하세요."
+                "[Telegram] 매매 알림이 나가지 않습니다. functions/.env 또는 Cloud에 "
+                "TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID(또는 BOT_TOKEN+CHAT_ID) 설정 후 "
+                "재배포하세요. autoShorts와 동일 봇이면 같은 값."
             )
         return
     label = "매수" if (side or "").lower() == "buy" else "매도"
@@ -1554,19 +1774,47 @@ def _get_total_equity_kr(uid: str, cfg: dict) -> float:
     return 0.0
 
 
+def _get_us_cash_from_balance_row(row: dict) -> float:
+    """output2(또는 요약) 첫 행에서 가용·예수에 가까운 USD 값 탐색."""
+    if not isinstance(row, dict):
+        return 0.0
+    for key in (
+        "frcr_dncl_amt_2", "frcr_gnrl_ord_psbl_amt", "ord_psbl_frcr_amt",
+        "nrcvb_buy_amt", "frcr_use_psbl_amt_1", "thdt_rcvb_amt",
+    ):
+        v = _safe_float(row.get(key), 0.0)
+        if v > 0:
+            return v
+    return _safe_float(row.get("frcr_dncl_amt_2", 0), 0.0)
+
+
 def _get_available_cash_us(uid: str, cfg: dict) -> float:
-    """미국 주식 매수 가능 USD 잔고 조회.
-    KIS US 잔고 API output2[0].frcr_dncl_amt_2 필드 사용.
-    조회 실패 또는 0원이면 0.0 반환 (호출 측에서 max_us_qty 폴백 처리).
+    """미국 주식 매수 가능 USD. 잔고 output2(또는 output1) 요약에서 추출.
+    조회 API 실패 시 0.0 + 구체적 로그 (호출 측 `max_us_qty` 폴백).
     """
     try:
         bal = get_balance_us(uid, cfg)
-        summary = bal.get("output2", [{}])
-        if summary:
-            raw = summary[0].get("frcr_dncl_amt_2", "0")
-            val = float(str(raw).replace(",", "") or 0)
+        summary = bal.get("output2")
+        if not summary and bal.get("output1"):
+            summary = bal.get("output1")
+        if isinstance(summary, dict):
+            summary = [summary]
+        if summary and isinstance(summary[0], dict):
+            val = _get_us_cash_from_balance_row(summary[0])
             if val > 0:
                 return val
+            if summary[0].get("frcr_dncl_amt_2") in ("", None, "-", "--"):
+                _add_log(
+                    uid, "WARNING",
+                    "[US] USD 잔고 필드가 비어 있음 — output2[0] 키 "
+                    f"{list(summary[0].keys())[:20]}",
+                )
+    except ApiError as e:
+        _add_log(
+            uid, "ERROR",
+            f"USD 잔고 조회 실패(ApiError) | {e!s} | "
+            f"rt_cd={e.rt_cd!s} msg_cd={e.msg_cd!s} kis_msg1={e.kis_msg1!r}",
+        )
     except Exception as e:
         _add_log(uid, "ERROR", f"USD 잔고 조회 실패: {e}")
     return 0.0
@@ -1854,7 +2102,7 @@ def inquire_order_fill_kr(uid: str, cfg: dict, order_no: str) -> dict | None:
             tot_ccld = int(str(row.get("tot_ccld_qty", "0")).replace(",", "") or 0)
             ord_qty = int(str(row.get("ord_qty", "0")).replace(",", "") or 0)
             avg_raw = row.get("avg_prvs") or row.get("ccld_avg_pric") or "0"
-            avg = float(str(avg_raw).replace(",", "") or 0)
+            avg = _safe_float(avg_raw, 0.0)
         except Exception:
             continue
         return {
@@ -1870,7 +2118,7 @@ def inquire_order_fill_us(uid: str, cfg: dict, order_no: str) -> dict | None:
     """미국 주문체결조회 — order_no 와 일치하는 항목 반환 (없으면 None).
 
     KIS API: /uapi/overseas-stock/v1/trading/inquire-ccnl
-       TR_ID: JTTT3001R / 모의 VTTT3001R
+       TR_ID: JTTT3001R(실전) / VTTT0001L(모의) — ` _us_inquire_ccnl_tr_id`
     평균 체결가 필드 우선순위: ft_ccld_unpr3 → avg_prvs → ovrs_ord_unpr.
 
     반환 dict 키:
@@ -1879,7 +2127,7 @@ def inquire_order_fill_us(uid: str, cfg: dict, order_no: str) -> dict | None:
     if not order_no or order_no in ("N/A", "0"):
         return None
     today = _today_kst_yyyymmdd()
-    tr_id = _us_tr_id(cfg, "JTTT3001R")
+    tr_id = _us_inquire_ccnl_tr_id(cfg)
 
     def _call():
         _kis_pace()
@@ -1902,7 +2150,15 @@ def inquire_order_fill_us(uid: str, cfg: dict, order_no: str) -> dict | None:
 
     try:
         data = _with_retry(_call, retries=2)
-    except Exception:
+    except ApiError as e:
+        _add_log(
+            uid, "WARNING",
+            f"[US] 체결조회 API 실패 | tr_id={tr_id!s} | {e!s} | "
+            f"rt_cd={e.rt_cd!s} msg_cd={e.msg_cd!s} kis_msg1={e.kis_msg1!r}",
+        )
+        return None
+    except Exception as e:
+        _add_log(uid, "WARNING", f"[US] 체결조회 실패: {e}")
         return None
     rows = data.get("output") or []
     if isinstance(rows, dict):
@@ -1923,7 +2179,7 @@ def inquire_order_fill_us(uid: str, cfg: dict, order_no: str) -> dict | None:
                 or row.get("ovrs_ord_unpr")
                 or "0"
             )
-            avg = float(str(avg_raw).replace(",", "") or 0)
+            avg = _safe_float(avg_raw, 0.0)
         except Exception:
             continue
         return {
@@ -1971,7 +2227,7 @@ def _log_sell_fill(
         return None
     if not info:
         return None
-    avg = float(info.get("avg_prvs") or 0)
+    avg = _safe_float(info.get("avg_prvs"), 0.0)
     tot = int(info.get("tot_ccld_qty") or 0)
     if avg <= 0 or tot <= 0:
         return info
@@ -2198,11 +2454,11 @@ def _get_us_index_change_pct(uid: str, cfg: dict, symbol: str = "SPY") -> float:
         # 우선순위: rate(%), 그다음 (last-base)/base
         raw = out.get("rate")
         if raw is None:
-            last = float(out.get("last", 0) or 0)
-            base = float(out.get("base", 0) or 0)
+            last = _us_price_from_output(out, None)
+            base = _safe_float(out.get("base"), 0.0)
             chg = ((last - base) / base * 100) if base > 0 else 0.0
         else:
-            chg = float(str(raw).replace(",", "") or 0)
+            chg = _safe_float(raw, 0.0)
     except Exception:
         chg = 0.0
     _US_INDEX_CACHE[cache_key] = (chg, now_ts)
@@ -2829,6 +3085,8 @@ def merge_position_after_avg_down(
 
 def run_strategy_cycle_kr(uid: str, cfg: dict):
     state = get_bot_state(uid)
+    if not _scope_allows_kr(cfg):
+        return
     now_min = datetime.now(KST).minute
     if not state.get("bot_enabled", True):
         if now_min % 10 == 0:
@@ -3299,9 +3557,9 @@ def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> l
     for code in codes:
         try:
             price_data = get_current_price_us(uid, cfg, code)
-            out        = price_data.get("output", {})
-            current    = float(out.get("last", 0))
+            out        = price_data.get("output", {}) or {}
             ohlcv      = get_daily_ohlcv_us(uid, cfg, code)
+            current    = _us_price_from_output(out, ohlcv) if isinstance(out, dict) else 0.0
             result.append({
                 "code": code, "current_price": current,
                 "change_rate": out.get("rate", out.get("diff", "0")),
@@ -3842,6 +4100,12 @@ def run_ai_session(
     market: str = "KR",
     add_buy_count: int | None = None,
 ):
+    if market == "US" and not _scope_allows_us(cfg):
+        _add_log(uid, "INFO", f"[AI {session}][US] 시장 범위 설정(국내만) — 스케줄 AI 건너뜀")
+        return
+    if market == "KR" and not _scope_allows_kr(cfg):
+        _add_log(uid, "INFO", f"[AI {session}][KR] 시장 범위 설정(미국만) — 스케줄 AI 건너뜀")
+        return
     state = get_bot_state(uid)
     if not state.get("bot_enabled", True):
         _add_log(uid, "INFO", f"[AI {session}] 봇 비활성 — 건너뜀")
@@ -3942,9 +4206,9 @@ def _run_ai_session_impl(
         try:
             if market == "US":
                 data    = get_current_price_us(uid, cfg, code)
-                out     = data["output"]
-                current = float(out.get("last", out.get("stck_prpr", 0)))
+                out     = data.get("output") or {}
                 ohlcv   = get_daily_ohlcv_us(uid, cfg, code)
+                current = _us_price_from_output(out, ohlcv) if isinstance(out, dict) else 0.0
                 score_result = score_us_stock_algorithm(current, ohlcv, cfg)
             else:
                 data    = get_current_price_kr(uid, cfg, code)
@@ -4094,7 +4358,11 @@ def _run_ai_session_impl(
         try:
             if market == "US":
                 data    = get_current_price_us(uid, cfg, code)
-                current = float(data["output"].get("last", 0))
+                out_ai  = data.get("output") or {}
+                ohlcv_p = get_daily_ohlcv_us(uid, cfg, code)
+                current = _us_price_from_output(
+                    out_ai, ohlcv_p,
+                ) if isinstance(out_ai, dict) else 0.0
                 if current <= 0:
                     _add_log(uid, "WARNING", f"[AI][US][{code}] 현재가 0 — 매수 건너뜀")
                     _skip("시세0")
@@ -4105,7 +4373,7 @@ def _run_ai_session_impl(
                 if available_usd > 0:
                     qty_raw, qty_reason = _risk_based_qty(
                         available_usd, available_usd, current,
-                        float(rec.get("stop_loss") or 0), cfg,
+                        _safe_float(rec.get("stop_loss"), 0.0), cfg,
                     )
                     qty = max(1, min(qty_raw, max_us_qty)) if qty_raw > 0 else 1
                 else:
@@ -4119,7 +4387,7 @@ def _run_ai_session_impl(
                              target_sell_price=float(rec["sell_price"]),
                              source=f"AI_{session}(점수{rec['score']})",
                              stock_name=sname,
-                             stop_loss_price=float(rec.get("stop_loss") or 0))
+                             stop_loss_price=_safe_float(rec.get("stop_loss"), 0.0))
                 add_trade(uid, "US", code, "buy", current, qty, f"AI_{session}_US", 0.0, stock_name=sname)
                 _add_log(uid, "INFO",
                          f"[AI][US][{code}] 매수 | {qty}주@${current:.2f} 주문={order_no} 사이징({qty_reason})")
@@ -4160,6 +4428,13 @@ def _run_ai_session_impl(
             executed.append(code)
             # 섹터 노출 카운트 업데이트 (루프 내 중복 매수 방지)
             sector_exposure[sector] = sector_exposure.get(sector, 0) + 1
+        except ApiError as e:
+            if getattr(e, "msg_cd", None) == "US_BUY_WINDOW":
+                _add_log(uid, "INFO", f"[AI][{market}][{code}] {e!s}")
+                _skip("시간대")
+            else:
+                _add_log(uid, "ERROR", f"[AI][{code}] 매수 오류: {e}")
+                _skip("주문오류")
         except Exception as e:
             _add_log(uid, "ERROR", f"[AI][{code}] 매수 오류: {e}")
             _skip("주문오류")
@@ -4200,6 +4475,8 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
       1. 보유 포지션: 목표가 도달 → 익절, 손절가 이탈 → 손절
       2. 신규 매수: US 알고리즘 70점 이상인 종목만 매수
     """
+    if not _scope_allows_us(cfg):
+        return
     state = get_bot_state(uid)
     if not state.get("bot_enabled", True): return
     if state.get("trading_halted", False): return
@@ -4212,7 +4489,8 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
         try:
             data        = get_current_price_us(uid, cfg, code)
             ohlcv_pos_u = get_daily_ohlcv_us(uid, cfg, code)
-            current     = float(data["output"].get("last", 0))
+            _out_u = data.get("output") or {}
+            current     = _us_price_from_output(_out_u, ohlcv_pos_u) if isinstance(_out_u, dict) else 0.0
             if current <= 0:
                 continue
             buy_avg = float(pos["buy_price"])
@@ -4412,7 +4690,9 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                         skip_reason = "락획득실패"
                     else:
                         try:
-                            res = place_order_us(uid, cfg, code, "buy", int(add_qty), 0)
+                            res = place_order_us(
+                                uid, cfg, code, "buy", int(add_qty), 0, bypass_us_buy_window=True,
+                            )
                             order_no = res.get("output", {}).get("ODNO", "N/A")
                             merge_position_after_avg_down(uid, "US", code, current, int(add_qty), ohlcv_pos_u, cfg)
                             add_trade(uid, "US", code, "buy", current, int(add_qty), "물타기", stock_name=sn)
@@ -4448,11 +4728,11 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
             continue
         try:
             data    = get_current_price_us(uid, cfg, code)
-            out     = data["output"]
-            current = float(out.get("last", 0))
+            ohlcv   = get_daily_ohlcv_us(uid, cfg, code)
+            out     = data.get("output") or {}
+            current = _us_price_from_output(out, ohlcv) if isinstance(out, dict) else 0.0
             if current <= 0:
                 continue
-            ohlcv        = get_daily_ohlcv_us(uid, cfg, code)
             score_result = score_us_stock_algorithm(current, ohlcv, cfg)
             score        = score_result["score"]
             min_score    = int(cfg.get("min_score_us", 55))
@@ -4465,9 +4745,15 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
 
             # K팩터 진입 슬리피지 필터 (US)
             if len(ohlcv) >= 2:
-                opens_us   = [float(r.get("open", r.get("stck_oprc", 0))) for r in ohlcv]
-                highs_us   = [float(r.get("high", r.get("stck_hgpr", 0))) for r in ohlcv]
-                lows_us    = [float(r.get("low",  r.get("stck_lwpr", 0))) for r in ohlcv]
+                opens_us   = [
+                    _safe_float(r.get("open", r.get("stck_oprc", 0)), 0.0) for r in ohlcv
+                ]
+                highs_us   = [
+                    _safe_float(r.get("high", r.get("stck_hgpr", 0)), 0.0) for r in ohlcv
+                ]
+                lows_us    = [
+                    _safe_float(r.get("low",  r.get("stck_lwpr", 0)), 0.0) for r in ohlcv
+                ]
                 today_open = opens_us[0] if opens_us else current
                 k_us       = cfg.get("k_factor", 0.3)
                 target_us  = today_open + k_us * (highs_us[1] - lows_us[1])
@@ -4488,7 +4774,7 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
             equity_usd = available_usd  # USD 자기자본 추정값(가용 잔고로 근사)
             qty_raw, qty_reason = _risk_based_qty(
                 equity_usd, available_usd, current,
-                float(prices.get("stop_loss") or 0), cfg,
+                _safe_float(prices.get("stop_loss"), 0.0), cfg,
             )
             max_us_qty = int(cfg.get("max_us_qty", 5))
             if available_usd <= 0:
@@ -4509,6 +4795,11 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                      f"[US][{code}] 매수 | {qty}주@${current:.2f} "
                      f"목표=${prices['sell_price']:.2f} 손절=${prices['stop_loss']:.2f} "
                      f"점수={score_result['score']} 주문={order_no} 사이징({qty_reason})")
+        except ApiError as e:
+            if getattr(e, "msg_cd", None) == "US_BUY_WINDOW":
+                _add_log(uid, "INFO", f"[US][{code}] {e!s}")
+            else:
+                _add_log(uid, "ERROR", f"[US][{code}] 매수 체크 오류: {e}")
         except Exception as e:
             _add_log(uid, "ERROR", f"[US][{code}] 매수 체크 오류: {e}")
 
@@ -4684,6 +4975,8 @@ def scheduled_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
     각 매도는 _log_sell_fill 로 슬리피지 기록.
     """
     for uid, cfg in _get_all_users():
+        if not _scope_allows_kr(cfg):
+            continue
         positions = get_positions(uid, "KR")
         for code, pos in list(positions.items()):
             try:
@@ -4877,11 +5170,15 @@ def scheduled_us_ai_late(event: scheduler_fn.ScheduledEvent) -> None:
 def scheduled_us_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
     """미국 장 마감 10분 전 포지션 전량 청산 (ET 15:50)"""
     for uid, cfg in _get_all_users():
+        if not _scope_allows_us(cfg):
+            continue
         positions = get_positions(uid, "US")
         for code, pos in list(positions.items()):
             try:
                 data    = get_current_price_us(uid, cfg, code)
-                current = float(data["output"].get("last", 0))
+                ohlcv_c = get_daily_ohlcv_us(uid, cfg, code)
+                _o = data.get("output") or {}
+                current = _us_price_from_output(_o, ohlcv_c) if isinstance(_o, dict) else 0.0
                 qty     = pos["quantity"]
                 res = place_order_us(uid, cfg, code, "sell", qty, 0)
                 order_no = (res.get("output") or {}).get("ODNO", "N/A")
@@ -4943,18 +5240,18 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
 
     users_block = "\n".join(user_lines) if user_lines else "  (등록 유저 없음)"
 
+    # HTML 쓰지 않음(동적 uid/오류문에 < 등이 있으면 sendMessage 400)
     text = (
-        f"<b>[AutoStock 모니터링]</b> "
-        f"{now_kst.strftime('%H:%M')} KST / {now_et.strftime('%H:%M')} ET\n"
+        f"[AutoStock 모니터링] {now_kst.strftime('%H:%M')} KST / {now_et.strftime('%H:%M')} ET\n"
         f"\n"
-        f"🖥 Firebase API: 정상 (Cloud Functions 내부 실행)\n"
+        f"🖥 Cloud Functions (Firebase API 경유)\n"
         f"{market_line}\n"
         f"\n"
-        f"<b>유저 상태</b>\n{users_block}\n"
+        f"유저:\n{users_block}\n"
         f"\n"
-        f"⏰ 다음 체크: 1시간 후"
+        f"⏰ 다음: 1시간 후"
     )
-    _send_telegram(text)
+    _send_telegram(text, parse_mode=None, log_if_unconfigured=True)
 
 
 # ══════════════════════════════════════════════════════════
@@ -5097,24 +5394,140 @@ def _compute_risk_gates(uid: str, cfg: dict, state: dict) -> dict:
     }
 
 
+@flask_app.route("/api/account/withdraw", methods=["POST"])
+def route_account_withdraw():
+    """회원 탈퇴: Firestore `users/{uid}` 전부 삭제 후 Firebase Auth 사용자 삭제.
+
+    - `_add_log` 는 쓰지 않는다(로그 쓰기가 user 트리를 다시 만듦).
+    - 클라이언트는 응답 후 `signOut` 으로 로컬 세션을 정리한다.
+    """
+    uid, err = _require_auth()
+    if err:
+        return err
+    try:
+        db = get_db()
+        n = int(db.recursive_delete(_uref(uid)) or 0)
+        _evict_caches_for_uid(uid)
+        logger.info("account/withdraw: uid=%s… firestore deleted docs≈%s", uid[:8], n)
+        try:
+            fb_auth.delete_user(uid)
+            logger.info("account/withdraw: firebase auth user deleted uid=%s…", uid[:8])
+        except Exception as auth_e:
+            err_l = str(auth_e).lower()
+            if "not found" in err_l or "user_not_found" in err_l:
+                logger.warning("account/withdraw: auth user already missing uid=%s… %s", uid[:8], auth_e)
+            else:
+                raise
+    except Exception as e:
+        logger.exception("route_account_withdraw")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({
+        "ok": True,
+        "message": "탈퇴 처리되었습니다. 연동·거래·로그 데이터와 로그인 계정이 제거되었습니다.",
+    })
+
+
+@flask_app.route("/api/credentials", methods=["POST"])
+def route_credentials():
+    """현재 모드 프로필만 갱신. 보낸 항목만 덮어쓰고, 비운 항목은 기존 값 유지.
+
+    모의·실전 둘 다 바꾸려면 `/api/credentials/dual` 권장.
+    """
+    uid, err = _require_auth()
+    if err:
+        return err
+    body = request.get_json() or {}
+    cred_keys = ("app_key", "app_secret", "account_no")
+    raw = get_config_raw(uid)
+    if not raw.get("setup_complete"):
+        return jsonify({"ok": False, "error": "초기 연동(설정)이 완료되지 않았습니다."}), 400
+    raw = _ensure_profiles_structure(dict(raw))
+    is_m = raw.get("is_mock", True)
+    if isinstance(is_m, str):
+        is_m = str(is_m).lower() not in ("false", "0", "no", "")
+    mode = "mock" if is_m else "live"
+    prof = dict((raw.get("profiles") or {}).get(mode) or {})
+    for k in cred_keys:
+        v = body.get(k)
+        if v is not None and str(v).strip() != "":
+            prof[k] = str(v).strip()
+    if not all(str(prof.get(k) or "").strip() for k in cred_keys):
+        return jsonify({
+            "ok": False,
+            "error": "세 항목이 모두 필요합니다. 바꾸지 않을 항목은 비워 두면 기존 값이 유지됩니다.",
+        }), 400
+    try:
+        save_config(uid, {k: prof[k] for k in cred_keys})
+        _invalidate_kis_tokens(uid)
+        _evict_caches_for_uid(uid)
+    except Exception as e:
+        logger.exception("route_credentials")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    mode = "모의" if get_config_raw(uid).get("is_mock", True) else "실전"
+    _add_log(uid, "INFO", f"KIS 연동 정보(앱키·시크릿·계좌) 갱신 | 현재 모드={mode}")
+    return jsonify({
+        "ok": True,
+        "message": f"저장되었습니다.({mode} 프로필) 변경한 항목만 반영됐고, 캐시 토큰을 비웠으니 잠시 후 시세·주문이 갱신됩니다.",
+    })
+
+
+@flask_app.route("/api/credentials/dual", methods=["POST"])
+def route_credentials_dual():
+    """KIS mock / live 키·계좌를 각각 저장. 빈 문자열이면 해당 칸은 기존 값 유지. 토글은 `get_config`가 매핑."""
+    uid, err = _require_auth()
+    if err:
+        return err
+    body = request.get_json() or {}
+    m, l = body.get("mock"), body.get("live")
+    if not isinstance(m, dict) or not isinstance(l, dict):
+        return jsonify({"ok": False, "error": "mock, live 객체가 필요합니다 (각 app_key, app_secret, account_no)."}), 400
+    raw = get_config_raw(uid)
+    if not raw.get("setup_complete"):
+        return jsonify({"ok": False, "error": "초기 연동(설정)이 완료되지 않았습니다."}), 400
+    try:
+        save_dual_credentials(uid, m, l)
+        _invalidate_kis_tokens(uid)
+        _evict_caches_for_uid(uid)
+    except ValueError as ve:
+        return jsonify({"ok": False, "error": str(ve)}), 400
+    except Exception as e:
+        logger.exception("route_credentials_dual")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    _add_log(uid, "INFO", "KIS 연동 정보 갱신 | 모의·실전 프로필 각각 app_key/secret/계좌")
+    return jsonify({
+        "ok": True,
+        "message": "모의·실전 프로필에 반영했습니다. (비운 칸은 기존 값 유지) 토큰 캐시를 비웠으니 잠시 후 시세·주문이 갱신됩니다.",
+    })
+
+
 @flask_app.route("/api/setup", methods=["POST"])
 def route_setup():
-    """최초 설정 — KIS API 키 + 계좌번호 저장"""
+    """최초 설정 — KIS API 키 + 계좌번호 저장.
+    - `mock`+`live`에 각 app_key, app_secret, account_no 를 주면 모의·실전에 각각 저장(권장).
+    - 옛 형식: 최상위 app_key, app_secret, account_no + is_mock 한 벌(양쪽에 동일 복제).
+    """
     uid, err = _require_auth()
     if err: return err
     body = request.get_json() or {}
-    required = ["app_key", "app_secret", "account_no"]
-    for f in required:
-        if not body.get(f):
-            return jsonify({"ok": False, "error": f"{f} 필수"}), 400
+
+    m = body.get("mock")
+    l = body.get("live")
+    _cred = ("app_key", "app_secret", "account_no")
+    def _creds_filled(d) -> bool:
+        return isinstance(d, dict) and all(str((d or {}).get(k) or "").strip() for k in _cred)
+    use_dual = _creds_filled(m) and _creds_filled(l)
+
+    if not use_dual:
+        required = ("app_key", "app_secret", "account_no")
+        for f in required:
+            if not body.get(f):
+                return jsonify({"ok": False, "error": f"{f} 필수 (또는 mock, live 를 모두 채우세요)."}), 400
+
     is_m = body.get("is_mock", True)
     if isinstance(is_m, str):
         is_m = str(is_m).lower() not in ("false", "0", "no", "")
+
     cfg_flat = {
-        "app_key": body["app_key"].strip(),
-        "app_secret": body["app_secret"].strip(),
-        "account_no": body["account_no"].strip(),
-        "is_mock": is_m,
         "kr_watchlist": body.get("kr_watchlist", ["005930", "000660", "035420", "035720", "051910"]),
         "us_watchlist": body.get("us_watchlist", ["AAPL", "NVDA", "TSLA", "MSFT", "GOOGL"]),
         "k_factor": float(body.get("k_factor", 0.5)),
@@ -5133,27 +5546,45 @@ def route_setup():
         "setup_complete": True,
         "created_at": datetime.now(KST).isoformat(),
     }
+    if not use_dual:
+        cfg_flat["is_mock"] = is_m
+        cfg_flat["app_key"] = body["app_key"].strip()
+        cfg_flat["app_secret"] = body["app_secret"].strip()
+        cfg_flat["account_no"] = body["account_no"].strip()
+
     prof = {k: cfg_flat[k] for k in _CONFIG_PROFILE_KEYS if k in cfg_flat}
     mode = "mock" if is_m else "live"
     other = "live" if mode == "mock" else "mock"
-    # 두 프로필 모두 자격증명 포함: 모드 전환 시 _get_all_users 드롭 방지
-    seed_other = dict(prof)
-    doc_out = {
-        "is_mock": is_m,
-        "setup_complete": True,
-        "display_name": cfg_flat.get("display_name", ""),
-        "email": cfg_flat.get("email", ""),
-        "created_at": cfg_flat.get("created_at", ""),
-        "profiles": {
-            mode: prof,
-            other: seed_other,
-        },
-    }
+
+    if use_dual:
+        prof_m = {**prof, **{k: str(m[k]).strip() for k in _cred}}
+        prof_l = {**prof, **{k: str(l[k]).strip() for k in _cred}}
+        doc_out = {
+            "is_mock": is_m,
+            "setup_complete": True,
+            "display_name": cfg_flat.get("display_name", ""),
+            "email": cfg_flat.get("email", ""),
+            "created_at": cfg_flat.get("created_at", ""),
+            "profiles": {"mock": prof_m, "live": prof_l},
+        }
+    else:
+        seed_other = dict(prof)
+        doc_out = {
+            "is_mock": is_m,
+            "setup_complete": True,
+            "display_name": cfg_flat.get("display_name", ""),
+            "email": cfg_flat.get("email", ""),
+            "created_at": cfg_flat.get("created_at", ""),
+            "profiles": {mode: prof, other: seed_other},
+        }
     _uref(uid).collection("config").document("settings").set(doc_out)
     _ensure_user_root_doc(uid)
     update_bot_state(uid, {"bot_enabled": True, "trading_halted": False,
                             "is_market_open": False, "realized_pnl": 0.0})
-    _add_log(uid, "INFO", f"계정 설정 완료 | 모드={'모의' if is_m else '실전'} (프로필 분리 저장)")
+    if use_dual:
+        _add_log(uid, "INFO", f"계정 설정 완료 | 모의·실전 키 각각 저장, 현재 토글={'모의' if is_m else '실전'}")
+    else:
+        _add_log(uid, "INFO", f"계정 설정 완료 | 모드={'모의' if is_m else '실전'} (프로필 동일 복제)")
     return jsonify({"ok": True, "message": "설정 완료"})
 
 
@@ -5502,16 +5933,18 @@ def route_order():
                 })
         else:
             data = get_current_price_us(uid, cfg, stock_code)
-            out = data["output"]
-            current = float(out.get("last", out.get("stck_prpr", 0)))
+            ohlcv_m = get_daily_ohlcv_us(uid, cfg, stock_code)
+            out = data.get("output") or {}
+            current = _us_price_from_output(out, ohlcv_m) if isinstance(out, dict) else 0.0
             sname = _stock_name("", stock_code, "US")
             if side == "buy":
                 if quantity <= 0:
                     return jsonify({"ok": False, "error": "미국 주식은 수량을 직접 입력해주세요"}), 400
-                result = place_order_us(uid, cfg, stock_code, "buy", quantity, price)
+                result = place_order_us(
+                    uid, cfg, stock_code, "buy", quantity, price, bypass_us_buy_window=True,
+                )
                 order_no = result.get("output", {}).get("ODNO", "N/A")
-                ohlcv_us_m = get_daily_ohlcv_us(uid, cfg, stock_code)
-                prices_manual_us = calculate_optimal_prices_us(current, ohlcv_us_m, cfg)
+                prices_manual_us = calculate_optimal_prices_us(current, ohlcv_m, cfg)
                 register_buy(
                     uid, "US", stock_code, current, quantity,
                     cfg.get("stop_loss_ratio", 0.03),
@@ -5606,10 +6039,29 @@ def route_config():
                 "risk_per_trade_pct",
                 "reconcile_enabled", "fill_check_enabled",
                 "monday_morning_skip_enabled", "monday_morning_skip_min",
-                "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live"}
+                "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live",
+                "strategy_tier", "market_scope"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400
+    if "market_scope" in updates:
+        ms = updates["market_scope"]
+        if isinstance(ms, str):
+            m = ms.strip().lower()
+            if m in ("kr", "korea", "domestic", "ko"):
+                updates["market_scope"] = "kr"
+            elif m in ("us", "usa", "us_only"):
+                updates["market_scope"] = "us"
+            elif m in ("both", "all", "every"):
+                updates["market_scope"] = "both"
+            else:
+                updates["market_scope"] = "kr"
+        else:
+            updates["market_scope"] = "kr"
+    if "strategy_tier" in updates:
+        st = updates["strategy_tier"]
+        if st is not None and st not in ("conservative", "balanced", "aggressive"):
+            return jsonify({"ok": False, "error": "strategy_tier 는 conservative|balanced|aggressive 이거나 null"}), 400
     save_config(uid, updates)
     _add_log(uid, "INFO", f"설정 변경: {list(updates.keys())}")
     return jsonify({"ok": True, "updated": updates})
@@ -5702,8 +6154,9 @@ def route_quote():
             name = _stock_name(out.get("hts_kor_isnm", ""), code, "KR")
         else:
             data = get_current_price_us(uid, cfg, code)
-            out = data["output"]
-            price = float(out.get("last", out.get("stck_prpr", 0)) or 0)
+            ohlcv_uq = get_daily_ohlcv_us(uid, cfg, code)
+            out = data.get("output") or {}
+            price = _us_price_from_output(out, ohlcv_uq) if isinstance(out, dict) else 0.0
             name = _stock_name("", code, "US")
         return jsonify({
             "ok": True,

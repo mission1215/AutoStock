@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { apiFetch } from "../api/client";
 
+const inp = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-white";
+
 export function SetupForm({
   idToken,
   onDone,
@@ -8,9 +10,12 @@ export function SetupForm({
   idToken: string;
   onDone: () => void;
 }) {
-  const [appKey, setAppKey] = useState("");
-  const [appSecret, setAppSecret] = useState("");
-  const [accountNo, setAccountNo] = useState("");
+  const [mKey, setMKey] = useState("");
+  const [mSec, setMSec] = useState("");
+  const [mAcc, setMAcc] = useState("");
+  const [lKey, setLKey] = useState("");
+  const [lSec, setLSec] = useState("");
+  const [lAcc, setLAcc] = useState("");
   const [isMock, setIsMock] = useState(true);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
@@ -24,9 +29,16 @@ export function SetupForm({
         method: "POST",
         idToken,
         body: JSON.stringify({
-          app_key: appKey,
-          app_secret: appSecret,
-          account_no: accountNo,
+          mock: {
+            app_key: mKey.trim(),
+            app_secret: mSec.trim(),
+            account_no: mAcc.trim(),
+          },
+          live: {
+            app_key: lKey.trim(),
+            app_secret: lSec.trim(),
+            account_no: lAcc.trim(),
+          },
           is_mock: isMock,
         }),
       });
@@ -43,45 +55,61 @@ export function SetupForm({
   }
 
   return (
-    <div className="mx-auto max-w-md px-4 py-12">
+    <div className="mx-auto max-w-lg px-4 py-10">
       <h1 className="text-xl font-bold text-white mb-2">KIS 연동</h1>
       <p className="text-sm text-slate-400 mb-6">
-        한국투자증권 Open API 앱키·시크릿·계좌번호를 입력하세요.
+        모의투자(VTS)와 실전은 <strong className="text-slate-300">앱·계좌가 다를 수 있으니</strong> 각각
+        입력합니다. 처음에 쓸 모드만 아래에서 고르면 됩니다.
       </p>
-      <form onSubmit={submit} className="space-y-4 glass rounded-2xl p-6">
-        <div>
-          <label className="text-xs text-slate-500 block mb-1">App Key</label>
-          <input
-            className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-white"
-            value={appKey}
-            onChange={(e) => setAppKey(e.target.value)}
-            autoComplete="off"
-            required
-          />
+      <form onSubmit={submit} className="space-y-4">
+        <div className="glass rounded-2xl p-4 space-y-3 border border-amber-500/15">
+          <h2 className="text-xs font-semibold text-amber-200/90 uppercase tracking-wider">모의투자</h2>
+          <div>
+            <label className="text-xs text-slate-500 block mb-1">App Key</label>
+            <input className={inp} value={mKey} onChange={(e) => setMKey(e.target.value)} autoComplete="off" required />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 block mb-1">App Secret</label>
+            <input
+              type="password"
+              className={inp}
+              value={mSec}
+              onChange={(e) => setMSec(e.target.value)}
+              required
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 block mb-1">계좌번호 (모의)</label>
+            <input className={inp} value={mAcc} onChange={(e) => setMAcc(e.target.value)} required />
+          </div>
         </div>
-        <div>
-          <label className="text-xs text-slate-500 block mb-1">App Secret</label>
-          <input
-            type="password"
-            className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-white"
-            value={appSecret}
-            onChange={(e) => setAppSecret(e.target.value)}
-            required
-          />
+
+        <div className="glass rounded-2xl p-4 space-y-3 border border-emerald-500/15">
+          <h2 className="text-xs font-semibold text-emerald-200/90 uppercase tracking-wider">실전투자</h2>
+          <div>
+            <label className="text-xs text-slate-500 block mb-1">App Key</label>
+            <input className={inp} value={lKey} onChange={(e) => setLKey(e.target.value)} autoComplete="off" required />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 block mb-1">App Secret</label>
+            <input
+              type="password"
+              className={inp}
+              value={lSec}
+              onChange={(e) => setLSec(e.target.value)}
+              required
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 block mb-1">계좌번호 (실전)</label>
+            <input className={inp} value={lAcc} onChange={(e) => setLAcc(e.target.value)} required />
+          </div>
         </div>
-        <div>
-          <label className="text-xs text-slate-500 block mb-1">계좌번호 (8-2 또는 붙여넣기)</label>
-          <input
-            className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-white"
-            value={accountNo}
-            onChange={(e) => setAccountNo(e.target.value)}
-            required
-          />
-        </div>
-        <div>
-          <label className="text-xs text-slate-500 block mb-1">모드</label>
+
+        <div className="glass rounded-2xl p-4">
+          <label className="text-xs text-slate-500 block mb-1">지금 쓸 모드 (나중에 전략 설정에서 토글)</label>
           <select
-            className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-white"
+            className={inp}
             value={isMock ? "mock" : "real"}
             onChange={(e) => setIsMock(e.target.value === "mock")}
           >
@@ -89,6 +117,7 @@ export function SetupForm({
             <option value="real">실전투자</option>
           </select>
         </div>
+
         {err && <p className="text-sm text-red-400">{err}</p>}
         <button
           type="submit"

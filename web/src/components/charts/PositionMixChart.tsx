@@ -13,11 +13,15 @@ const COLORS = ["#3b82f6", "#8b5cf6", "#22c55e", "#f59e0b", "#ef4444", "#06b6d4"
 export function PositionMixChart({
   positionsKr,
   positionsUs,
+  mode = "both",
 }: {
   positionsKr: Record<string, PositionKr>;
   positionsUs: Record<string, PositionUs>;
+  /** kr | us | both — 단일 시장 뷰일 때 비중을 해당 시장만 */
+  mode?: "kr" | "us" | "both";
 }) {
   const slices: { name: string; value: number }[] = [];
+  if (mode !== "us")
   for (const [code, p] of Object.entries(positionsKr)) {
     const q = p.quantity ?? 0;
     const price = p.current_price ?? p.buy_price ?? 0;
@@ -29,6 +33,7 @@ export function PositionMixChart({
       });
     }
   }
+  if (mode !== "kr")
   for (const [code, p] of Object.entries(positionsUs)) {
     const q = p.quantity ?? 0;
     const price = p.current_price ?? p.buy_price ?? 0;

@@ -4,8 +4,14 @@ import type { AppConfig, ModeProfiles } from "../types";
 import {
   getStrategyPreset,
   STRATEGY_TIER_LABELS,
+  inferStrategyTier,
+  strategyTierLabel,
   type StrategyTier,
 } from "../config/strategyPresets";
+import {
+  type MarketScope,
+  normalizeMarketScope,
+} from "../utils/marketScope";
 
 type StrategyFormState = {
   k: string;
@@ -98,6 +104,7 @@ export function StrategySettings({
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
   const [tierHint, setTierHint] = useState<string | null>(null);
+  const [marketScope, setMarketScope] = useState<MarketScope>("kr");
 
   const profilesStr = useMemo(() => (profiles ? JSON.stringify(profiles) : ""), [profiles]);
 
@@ -106,7 +113,10 @@ export function StrategySettings({
     if (profiles?.mock != null && profiles?.live != null) {
       setMockForm(configToForm({ ...profiles.mock, is_mock: true }));
       setLiveForm(configToForm({ ...profiles.live, is_mock: false }));
-      if (config) setIsMock(config.is_mock !== false);
+      if (config) {
+        setIsMock(config.is_mock !== false);
+        setMarketScope(normalizeMarketScope(config.market_scope));
+      }
       return;
     }
     if (config) {
@@ -114,10 +124,18 @@ export function StrategySettings({
       setMockForm(f);
       setLiveForm({ ...f, ...PRESET_LIVE, krWl: f.krWl, usWl: f.usWl });
       setIsMock(config.is_mock !== false);
+      setMarketScope(normalizeMarketScope(config.market_scope));
     }
   }, [profilesStr, config, dirty]);
 
   const form = isMock ? mockForm : liveForm;
+
+  const currentProfile = (isMock ? profiles?.mock : profiles?.live) as AppConfig | undefined;
+  const savedStrategyTier = currentProfile?.strategy_tier;
+  const inferredStrategyTier = useMemo(
+    () => inferStrategyTier(form, isMock),
+    [isMock, mockForm, liveForm],
+  );
 
   function patch(p: Partial<StrategyFormState>) {
     setDirty(true);
@@ -186,6 +204,11 @@ export function StrategySettings({
         avg_down_max_times: parseInt(form.avgDownMax, 10) || 2,
         avg_down_qty_ratio: (parseFloat(form.avgDownQty) || 35) / 100,
         avg_down_min_interval_hours: parseFloat(form.avgDownGapH) || 20,
+        strategy_tier: (() => {
+          const inf = inferStrategyTier(form, isMock);
+          return inf === "custom" ? null : inf;
+        })(),
+        market_scope: marketScope,
       };
       const data = await apiFetch<{ ok: boolean; error?: string }>("/api/config", {
         method: "POST",
@@ -219,6 +242,46 @@ export function StrategySettings({
 
       <div className="p-4 sm:p-5 space-y-6">
         {/* 모드 선택 + 기본값 버튼 */}
+        <div
+          className="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-3 py-3 space-y-2"
+          role="group"
+          aria-label="자동매매 시장 범위"
+        >
+          <p className="text-xs text-slate-400">
+            <span className="text-cyan-300 font-medium">시장 범위</span> — 스케줄 자동매매·스케줄 AI·장마감
+            자동 청산이 대상으로 할 시장입니다. (수동 주문·대시보드 조회는 제한 없음)
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                { id: "both" as const, label: "🇰🇷+🇺🇸 국내+미국" },
+                { id: "kr" as const, label: "🇰🇷 국내만" },
+                { id: "us" as const, label: "🇺🇸 미국만" },
+              ] as const
+            ).map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => {
+                  setMarketScope(id);
+                  setDirty(true);
+                }}
+                className={`px-3 py-2 rounded-lg text-xs font-medium border transition-all ${
+                  marketScope === id
+                    ? "border-cyan-400/70 bg-cyan-600/30 text-cyan-100"
+                    : "border-white/10 bg-white/5 text-slate-300 hover:border-cyan-500/40"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-slate-500 leading-relaxed">
+            국내 매도 대금이 당일 미국 주식 주문에 바로 쓰이지 않을 수 있습니다(결제
+            T+2 등). 미국 가용 달러는 KIS·예수금에서 확인하세요.
+          </p>
+        </div>
+
         <div className="flex flex-wrap items-center gap-3">
           <select
             className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
@@ -238,23 +301,73 @@ export function StrategySettings({
           <span className="text-[11px] text-slate-600">모의·실전 각각 별도 저장</span>
         </div>
 
-        <div className="rounded-xl border border-indigo-500/25 bg-indigo-500/5 px-3 py-3 space-y-2">
+        <div
+          className="rounded-xl border border-indigo-500/25 bg-indigo-500/5 px-3 py-3 space-y-2"
+          role="group"
+          aria-label="성향 프리셋"
+        >
           <p className="text-xs text-slate-400">
             <span className="text-indigo-300 font-medium">성향 프리셋</span> — 흔히 쓰는 위험·진입
             민감도 묶음입니다. 수익을 보장하지 않으며,{" "}
             <span className="text-slate-500">저장</span>해야 서버에 반영됩니다.
           </p>
-          <div className="flex flex-wrap gap-2">
-            {(["conservative", "balanced", "aggressive"] as const).map((t) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => applyStrategyTier(t)}
-                className="px-3 py-2 rounded-lg text-xs font-medium border border-white/10 bg-white/5 text-slate-200 hover:border-indigo-500/50 hover:bg-indigo-500/10"
-              >
-                {STRATEGY_TIER_LABELS[t].title}
-              </button>
-            ))}
+          <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="사전 정의된 성향">
+            {(["conservative", "balanced", "aggressive"] as const).map((t) => {
+              const isActive = inferredStrategyTier === t;
+              return (
+                <button
+                  key={t}
+                  type="button"
+                  role="radio"
+                  aria-checked={isActive}
+                  aria-label={STRATEGY_TIER_LABELS[t].title}
+                  onClick={() => applyStrategyTier(t)}
+                  className={`px-3 py-2 rounded-lg text-xs font-medium border transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60 ${
+                    isActive
+                      ? "border-indigo-400/80 bg-indigo-600/35 text-indigo-100 shadow-[0_0_0_1px_rgba(129,140,248,.35)]"
+                      : "border-white/10 bg-white/5 text-slate-200 hover:border-indigo-500/50 hover:bg-indigo-500/10"
+                  }`}
+                >
+                  {STRATEGY_TIER_LABELS[t].title}
+                </button>
+              );
+            })}
+          </div>
+          <div className="rounded-lg bg-slate-950/40 border border-white/[0.06] px-2.5 py-2 space-y-1.5 text-[11px] leading-relaxed text-slate-400">
+            <p>
+              <span className="text-slate-500">이 모드(모의/실전)에 마지막으로 저장됨</span>{" "}
+              {savedStrategyTier && savedStrategyTier in STRATEGY_TIER_LABELS ? (
+                <span className="font-semibold text-emerald-200/90">
+                  {STRATEGY_TIER_LABELS[savedStrategyTier as StrategyTier].title}
+                </span>
+              ) : (
+                <span className="text-slate-500">— (아직 없음, 저장 시 기록)</span>
+              )}
+              {dirty && (
+                <span className="text-amber-300/80 ml-1.5">· 미저장 변경 있음</span>
+              )}
+            </p>
+            <p>
+              <span className="text-slate-500">현재 입력·수치가 맞는 프리셋</span>{" "}
+              {inferredStrategyTier === "custom" ? (
+                <span className="font-medium text-amber-200/80">사용자 지정 (프리셋과 정확히 일치 않음)</span>
+              ) : (
+                <span className="font-semibold text-indigo-200/90">
+                  {STRATEGY_TIER_LABELS[inferredStrategyTier].title}
+                </span>
+              )}
+            </p>
+            {savedStrategyTier &&
+            ["conservative", "balanced", "aggressive"].includes(savedStrategyTier) &&
+            inferredStrategyTier !== "custom" &&
+            savedStrategyTier !== inferredStrategyTier && (
+              <p className="text-amber-200/80">
+                ↑ 저장 기록({strategyTierLabel(savedStrategyTier as StrategyTier).title})과
+                지금 수치(
+                {strategyTierLabel(inferredStrategyTier as StrategyTier).title})이 다릅니다.
+                {dirty ? " 저장하면 아래에 맞춰 갱신됩니다." : " 숫자를 손댄 뒤 저장하거나, 프리셋을 다시 누르세요."}
+              </p>
+            )}
           </div>
           {tierHint && (
             <p className="text-[11px] text-slate-500 leading-relaxed border-t border-white/5 pt-2">{tierHint}</p>

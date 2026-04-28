@@ -1,6 +1,7 @@
 import { apiFetch } from "../api/client";
 import type { PositionKr, PositionUs } from "../types";
 import { tvSymbol } from "../utils/tradingViewSymbol";
+import type { MarketScope } from "../utils/marketScope";
 
 function fmtPrice(mkt: "KR" | "US", v: number | undefined) {
   if (v == null || Number.isNaN(v)) return "—";
@@ -12,23 +13,30 @@ export function HoldingsPanel({
   positionsKr,
   positionsUs,
   onChange,
+  marketScope = "kr",
 }: {
   idToken: string;
   positionsKr: Record<string, PositionKr>;
   positionsUs: Record<string, PositionUs>;
   onChange: () => void;
+  /** 국내만/미국만일 때 해당 시장 포지션만 표시 */
+  marketScope?: MarketScope;
 }) {
   const rows: { code: string; market: "KR" | "US"; p: PositionKr | PositionUs }[] = [
-    ...Object.entries(positionsKr).map(([code, p]) => ({
-      code,
-      market: "KR" as const,
-      p,
-    })),
-    ...Object.entries(positionsUs).map(([code, p]) => ({
-      code,
-      market: "US" as const,
-      p,
-    })),
+    ...(marketScope !== "us"
+      ? Object.entries(positionsKr).map(([code, p]) => ({
+          code,
+          market: "KR" as const,
+          p,
+        }))
+      : []),
+    ...(marketScope !== "kr"
+      ? Object.entries(positionsUs).map(([code, p]) => ({
+          code,
+          market: "US" as const,
+          p,
+        }))
+      : []),
   ];
 
   async function quickSell(sym: string, market: "KR" | "US") {
@@ -101,6 +109,17 @@ export function HoldingsPanel({
               mkt === "US"
                 ? `$${Math.abs(pnl).toFixed(2)}`
                 : `${Math.abs(pnl).toLocaleString()}원`;
+            const qty = Math.max(0, Number(p.quantity ?? 0));
+            const valueAt =
+              cur > 0 && qty > 0
+                ? mkt === "US"
+                  ? (cur * qty).toFixed(2)
+                  : Math.round(cur * qty).toLocaleString()
+                : null;
+            const qtyLabel =
+              qty > 0
+                ? `${qty.toLocaleString("ko-KR", { maximumFractionDigits: 4 })}주`
+                : "—";
 
             return (
               <div
@@ -136,6 +155,25 @@ export function HoldingsPanel({
                             )}
                           </div>
                         </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[11px]">
+                        <span className="text-slate-500">
+                          수량{" "}
+                          <span className="text-slate-300 tabular-nums">
+                            {qtyLabel}
+                          </span>
+                        </span>
+                        <span className="text-slate-500">
+                          평가{" "}
+                          <span className="text-slate-200 tabular-nums">
+                            {valueAt != null
+                              ? mkt === "US"
+                                ? `$${valueAt}`
+                                : `${valueAt}원`
+                              : "—"}
+                          </span>
+                        </span>
                       </div>
 
                       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[11px]">

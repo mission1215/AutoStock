@@ -224,3 +224,67 @@ export function getStrategyPreset(
     usWl: keepWatchlists.usWl || s.usWl,
   };
 }
+
+const PRESET_FORM_KEYS: (keyof StrategyFormFields)[] = [
+  "k",
+  "ma",
+  "stopPct",
+  "maxPct",
+  "dailyPct",
+  "idxGatePct",
+  "minScoreKr",
+  "krWl",
+  "usWl",
+  "aiCount",
+  "partialTpEn",
+  "partialTpTrig",
+  "partialTpSell",
+  "partialTpTight",
+  "slipMockPct",
+  "slipLivePct",
+  "avgDownEn",
+  "avgDownTrig",
+  "avgDownMax",
+  "avgDownQty",
+  "avgDownGapH",
+];
+
+function formFieldsEqual(
+  a: StrategyFormFields,
+  b: StrategyFormFields,
+): boolean {
+  for (const k of PRESET_FORM_KEYS) {
+    const va = a[k];
+    const vb = b[k];
+    if (typeof va === "boolean" && typeof vb === "boolean") {
+      if (va !== vb) return false;
+    } else {
+      if (String(va ?? "").trim() !== String(vb ?? "").trim()) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 현재 폼이 어느 프리셋과 정확히 일치하는지 (감시종목 포함). 없으면 `custom`.
+ */
+export function inferStrategyTier(
+  form: StrategyFormFields,
+  isMock: boolean,
+): StrategyTier | "custom" {
+  for (const t of (["conservative", "balanced", "aggressive"] as const)) {
+    const p = getStrategyPreset(t, isMock, { krWl: form.krWl, usWl: form.usWl });
+    if (formFieldsEqual(p, form)) return t;
+  }
+  return "custom";
+}
+
+export function strategyTierLabel(
+  tier: StrategyTier | "custom",
+): { title: string; sub: string } {
+  if (tier === "custom") {
+    return { title: "사용자 지정", sub: "프리셋과 다른 수치" };
+  }
+  const x = STRATEGY_TIER_LABELS[tier];
+  return { title: x.title, sub: x.blurb };
+}
