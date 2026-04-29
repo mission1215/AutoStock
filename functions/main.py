@@ -597,6 +597,8 @@ _CONFIG_TOP_KEYS = frozenset({
     "market_scope",
     # KR 스케줄 AI 시세 입력 유니버스: legacy(감시+고정풀) | dynamic(KIS 순위반영, 실패 시 legacy)
     "ai_universe_mode",
+    # 텔레그램: 서버에 TELEGRAM_BOT_TOKEN 한 벌만 두고, chat_id 는 유저별 (미설정 시 env CHAT_ID 폴백)
+    "telegram_enabled", "telegram_chat_id", "telegram_message_thread_id",
 })
 _CONFIG_PROFILE_KEYS = frozenset({
     "app_key", "app_secret", "account_no",
@@ -695,7 +697,11 @@ def get_config(uid: str) -> dict:
             p = {**other_p, **{k: v for k, v in p.items() if v is not None}}
     out = {**p}
     out["is_mock"] = raw.get("is_mock", True)
-    for k in ("setup_complete", "display_name", "email", "created_at", "market_scope", "ai_universe_mode"):
+    for k in (
+        "setup_complete", "display_name", "email", "created_at",
+        "market_scope", "ai_universe_mode",
+        "telegram_enabled", "telegram_chat_id", "telegram_message_thread_id",
+    ):
         if k in raw:
             out[k] = raw[k]
     if "market_scope" not in out:
@@ -1655,41 +1661,80 @@ def _add_log(uid: str, level: str, message: str):
     logger.info("[%s][%s] %s", uid[:8], level, message)
 
 
-def _telegram_creds() -> tuple[str, str]:
-    """BotFather 토큰 + chat_id. autoShorts·기타 봇과 동일 봇을 쓰면 같은 값. 별칭 다수.
-
-    권장: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
-    그 외: TELEGRAM_TOKEN, TG_BOT_TOKEN, BOT_TOKEN(일부 스크립트) /
-           TELEGRAM_CHAT, TG_CHAT_ID, CHAT_ID
-    """
-    token = (
+def _telegram_bot_token() -> str:
+    """서버 단일 봇(BotFather 토큰). 유저별로 두지 않음."""
+    return (
         (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
         or (os.environ.get("TELEGRAM_TOKEN") or "").strip()
         or (os.environ.get("TG_BOT_TOKEN") or "").strip()
         or (os.environ.get("BOT_TOKEN") or "").strip()
     )
+
+
+def _telegram_env_chat_and_thread() -> tuple[str, str]:
+    """레거시·관리자용: 환경변수의 chat_id + 포럼 스레드 ID."""
     chat_id = (
         (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
         or (os.environ.get("TELEGRAM_CHAT") or "").strip()
         or (os.environ.get("TG_CHAT_ID") or "").strip()
         or (os.environ.get("CHAT_ID") or "").strip()
     )
-    return token, chat_id
+    thread = (
+        (os.environ.get("TELEGRAM_MESSAGE_THREAD_ID") or os.environ.get("TELEGRAM_TOPIC_ID") or "")
+        .strip()
+    )
+    return chat_id, thread
+
+
+def _telegram_creds() -> tuple[str, str]:
+    """(token, chat_id) — chat 은 env 만 (유저별 라우팅은 _send_telegram 의 uid 사용)."""
+    return _telegram_bot_token(), _telegram_env_chat_and_thread()[0]
+
+
+def _telegram_resolve_dest(
+    uid: str | None,
+    *,
+    force_env_only: bool = False,
+) -> tuple[str, str]:
+    """(chat_id, message_thread_id 문자열). 비어 있으면 전송 불가."""
+    env_chat, env_thread = _telegram_env_chat_and_thread()
+    if force_env_only:
+        return env_chat, env_thread
+    if uid is not None:
+        raw = get_config_raw(uid)
+        u_on = raw.get("telegram_enabled", False)
+        if isinstance(u_on, str):
+            u_on = str(u_on).lower() not in ("false", "0", "", "no")
+        u_on = bool(u_on)
+        u_chat = str(raw.get("telegram_chat_id") or "").strip()
+        u_thr = str(raw.get("telegram_message_thread_id") or "").strip()
+        if u_on and u_chat:
+            return u_chat, u_thr
+    return env_chat, env_thread
 
 
 def _send_telegram(
     text: str,
     *,
+    uid: str | None = None,
+    force_env_only: bool = False,
     parse_mode: str | None = "HTML",
     log_if_unconfigured: bool = True,
 ) -> bool:
-    """텔레그램 Bot API sendMessage. parse_mode=None 이면 일반 텍스트(이모지·한글 안전)."""
-    token, chat_id = _telegram_creds()
+    """텔레그램 Bot API sendMessage.
+
+    - uid 가 있으면: 해당 유저가 `telegram_enabled`+`telegram_chat_id` 를 쓴 경우 그 채팅으로,
+      아니면 env 의 CHAT_ID 로 폴백(기존 동작).
+    - force_env_only=True: 스케줄 전체 요약 등 관리용 브로드캐스트만 env 로.
+    parse_mode=None 이면 일반 텍스트(이모지·한글 안전).
+    """
+    token = _telegram_bot_token()
+    chat_id, thread = _telegram_resolve_dest(uid, force_env_only=force_env_only)
     if not token or not chat_id:
         if log_if_unconfigured:
             logger.warning(
-                "[Telegram] 봇 미설정 — TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID "
-                "또는 BOT_TOKEN+CHAT_ID 등(.env · Cloud 환경변수)"
+                "[Telegram] 미설정 — 서버에 TELEGRAM_BOT_TOKEN, "
+                "그리고 유저 chat_id(설정) 또는 TELEGRAM_CHAT_ID(env)"
             )
         return False
     if len(text) > 4090:
@@ -1698,7 +1743,6 @@ def _send_telegram(
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
-    thread = (os.environ.get("TELEGRAM_MESSAGE_THREAD_ID") or os.environ.get("TELEGRAM_TOPIC_ID") or "").strip()
     if thread:
         try:
             payload["message_thread_id"] = int(thread)
@@ -1748,16 +1792,6 @@ def _notify_telegram_trade(
     stock_name: str,
 ) -> None:
     global _telegram_trade_missed_config_logged
-    t, c = _telegram_creds()
-    if not t or not c:
-        if not _telegram_trade_missed_config_logged:
-            _telegram_trade_missed_config_logged = True
-            logger.warning(
-                "[Telegram] 매매 알림이 나가지 않습니다. functions/.env 또는 Cloud에 "
-                "TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID(또는 BOT_TOKEN+CHAT_ID) 설정 후 "
-                "재배포하세요. autoShorts와 동일 봇이면 같은 값."
-            )
-        return
     label = "매수" if (side or "").lower() == "buy" else "매도"
     mkt = (market or "KR").upper()
     name = (stock_name or "").strip() or stock_code
@@ -1766,7 +1800,7 @@ def _notify_telegram_trade(
     else:
         pr = f"${float(price):.2f}"
     lines = [
-        f"📌 [AutoStock] {label} ({mkt})  uid={uid[:8]}…",
+        f"📌 [AutoStock] {label} ({mkt})",
         f"종목: {stock_code}  {name}",
         f"수량: {quantity}  /  가격: {pr}",
         f"사유: {reason or '-'}",
@@ -1776,7 +1810,13 @@ def _notify_telegram_trade(
             lines.append(f"손익: {float(pnl):+,.0f}원")
         else:
             lines.append(f"손익: ${float(pnl):+.2f}")
-    _send_telegram("\n".join(lines), parse_mode=None, log_if_unconfigured=False)
+    ok = _send_telegram("\n".join(lines), uid=uid, parse_mode=None, log_if_unconfigured=False)
+    if not ok and not _telegram_trade_missed_config_logged:
+        _telegram_trade_missed_config_logged = True
+        logger.warning(
+            "[Telegram] 매매 알림 실패(미설정). 유저별: 설정에서 텔레그램 켜기+chat_id, "
+            "또는 서버 env 에 TELEGRAM_CHAT_ID(폴백)."
+        )
 
 
 # ══════════════════════════════════════════════════════════
@@ -5646,7 +5686,41 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
         f"\n"
         f"⏰ 다음: 1시간 후"
     )
-    _send_telegram(text, parse_mode=None, log_if_unconfigured=True)
+    sent = False
+    g_chat, _ = _telegram_env_chat_and_thread()
+    if g_chat:
+        sent = _send_telegram(text, force_env_only=True, parse_mode=None, log_if_unconfigured=False) or sent
+
+    for uid, cfg in _get_all_users():
+        raw = get_config_raw(uid)
+        te = raw.get("telegram_enabled", False)
+        if isinstance(te, str):
+            te = te.strip().lower() not in ("false", "0", "", "no")
+        if not te:
+            continue
+        if not str(raw.get("telegram_chat_id") or "").strip():
+            continue
+        try:
+            state = get_bot_state(uid)
+            bot_on = "ON" if state.get("bot_enabled", True) else "OFF"
+            halted = " ⚠️정지" if state.get("trading_halted") else ""
+            mock = " [모의]" if cfg.get("is_mock", True) else " [실전]"
+            pnl = state.get("realized_pnl", 0)
+            pnl_str = f"{float(pnl or 0):+,.0f}원"
+            personal = (
+                f"[AutoStock 모니터링·내 계정] {now_kst.strftime('%H:%M')} KST\n"
+                f"봇:{bot_on}{halted}{mock}\n실현손익:{pnl_str}"
+            )
+            if _send_telegram(personal, uid=uid, parse_mode=None, log_if_unconfigured=False):
+                sent = True
+        except Exception:
+            continue
+
+    if not sent:
+        logger.warning(
+            "[Telegram] 모니터링 미발송 — TELEGRAM_CHAT_ID(env) 또는 "
+            "설정에서 유저별 텔레그램(chat_id) 을 켜 주세요."
+        )
 
 
 # ══════════════════════════════════════════════════════════
@@ -6437,10 +6511,46 @@ def route_config():
                 "max_entry_slip_pct", "max_entry_slip_pct_mock", "max_entry_slip_pct_live",
                 "strategy_tier", "market_scope", "ai_universe_mode",
                 "max_positions_per_sector",
-                "ai_universe_kr_quality_gates", "ai_universe_kr_min_cap_eok"}
+                "ai_universe_kr_quality_gates", "ai_universe_kr_min_cap_eok",
+                "telegram_enabled", "telegram_chat_id", "telegram_message_thread_id"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400
+
+    if "telegram_chat_id" in updates and updates["telegram_chat_id"] is not None:
+        updates["telegram_chat_id"] = str(updates["telegram_chat_id"]).strip()
+    if "telegram_message_thread_id" in updates and updates["telegram_message_thread_id"] is not None:
+        updates["telegram_message_thread_id"] = str(updates["telegram_message_thread_id"]).strip()
+    if "telegram_enabled" in updates:
+        te = updates["telegram_enabled"]
+        if isinstance(te, str):
+            updates["telegram_enabled"] = te.strip().lower() not in ("false", "0", "", "no")
+        else:
+            updates["telegram_enabled"] = bool(te)
+
+    if any(
+        k in updates
+        for k in ("telegram_enabled", "telegram_chat_id", "telegram_message_thread_id")
+    ):
+        raw0 = get_config_raw(uid)
+        def _truthy(v) -> bool:
+            if isinstance(v, str):
+                return v.strip().lower() not in ("false", "0", "", "no")
+            return bool(v)
+        t_en = (
+            _truthy(updates["telegram_enabled"])
+            if "telegram_enabled" in updates
+            else _truthy(raw0.get("telegram_enabled", False))
+        )
+        t_chat = (
+            updates["telegram_chat_id"]
+            if "telegram_chat_id" in updates
+            else str(raw0.get("telegram_chat_id") or "").strip()
+        )
+        if t_en and not t_chat:
+            return jsonify(
+                {"ok": False, "error": "텔레그램 알림을 켜려면 chat_id를 입력하세요."},
+            ), 400
     if "ai_universe_mode" in updates:
         m = updates["ai_universe_mode"]
         if isinstance(m, str):

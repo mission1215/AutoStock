@@ -97,8 +97,19 @@ export function StrategySettings({
   const [marketScope, setMarketScope] = useState<MarketScope>("kr");
   /** KR 스케줄 AI 입력 유니버스 — US 전략에는 영향 없음 */
   const [aiUniverseMode, setAiUniverseMode] = useState<"legacy" | "dynamic">("legacy");
+  /** 계정 공통 — Firestore 최상위 저장(모의/실전과 무관) */
+  const [tgEn, setTgEn] = useState(false);
+  const [tgChat, setTgChat] = useState("");
+  const [tgThread, setTgThread] = useState("");
 
   const profilesStr = useMemo(() => (profiles ? JSON.stringify(profiles) : ""), [profiles]);
+
+  function syncTelegramFromConfig(c: AppConfig | undefined) {
+    if (!c) return;
+    setTgEn(c.telegram_enabled === true);
+    setTgChat((c.telegram_chat_id != null ? String(c.telegram_chat_id) : "").trim());
+    setTgThread((c.telegram_message_thread_id != null ? String(c.telegram_message_thread_id) : "").trim());
+  }
 
   function normalizeAiUniverseMode(raw: unknown): "legacy" | "dynamic" {
     if (typeof raw !== "string") return "legacy";
@@ -116,6 +127,7 @@ export function StrategySettings({
         setIsMock(config.is_mock !== false);
         setMarketScope(normalizeMarketScope(config.market_scope));
         setAiUniverseMode(normalizeAiUniverseMode(config.ai_universe_mode));
+        syncTelegramFromConfig(config);
       }
       return;
     }
@@ -126,6 +138,7 @@ export function StrategySettings({
       setIsMock(config.is_mock !== false);
       setMarketScope(normalizeMarketScope(config.market_scope));
       setAiUniverseMode(normalizeAiUniverseMode(config.ai_universe_mode));
+      syncTelegramFromConfig(config);
     }
   }, [profilesStr, config, dirty]);
 
@@ -186,6 +199,10 @@ export function StrategySettings({
       setMsg("❌ 섹터당 최대 종목 수는 1~10 사이로 입력해 주세요.");
       return;
     }
+    if (tgEn && !tgChat.trim()) {
+      setMsg("❌ 텔레그램 알림을 켠 경우 chat_id를 입력해 주세요.");
+      return;
+    }
     setSaving(true);
     setMsg("저장 중…");
     try {
@@ -224,6 +241,9 @@ export function StrategySettings({
         ai_universe_kr_quality_gates: form.aiKrQualityGates,
         ai_universe_kr_min_cap_eok: Math.max(0, capEok),
         max_positions_per_sector: maxSec,
+        telegram_enabled: tgEn,
+        telegram_chat_id: tgChat.trim(),
+        telegram_message_thread_id: tgThread.trim(),
       };
       const data = await apiFetch<{ ok: boolean; error?: string }>("/api/config", {
         method: "POST",
@@ -581,6 +601,57 @@ export function StrategySettings({
             <div>
               <label className="text-xs text-slate-500 block mb-1">물타기 최소 간격 (h)</label>
               <input type="number" min={1} className={inp()} value={form.avgDownGapH} onChange={(e) => patch({ avgDownGapH: e.target.value })} />
+            </div>
+          </div>
+        </div>
+
+        {/* 텔레그램(계정별 chat_id — 봇 토큰은 서버 .env) */}
+        <div className="mt-4 rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-3 py-3 space-y-3">
+          <p className="text-xs text-slate-400">
+            <span className="text-emerald-300 font-medium">Telegram 알림</span> — 매매·정각 요약을 받을
+            채팅입니다. 봇을 열고 대화한 뒤 본인의 숫자{" "}
+            <span className="text-slate-300">chat_id</span>를 입력하세요. (포럼 그룹이면 토픽 ID도)
+          </p>
+          <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+            <input
+              type="checkbox"
+              className="rounded border-white/20"
+              checked={tgEn}
+              onChange={(e) => {
+                setDirty(true);
+                setTgEn(e.target.checked);
+              }}
+            />
+            텔레그램 알림 사용
+          </label>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-slate-500 block mb-1">chat_id</label>
+              <input
+                className={inp()}
+                value={tgChat}
+                onChange={(e) => {
+                  setDirty(true);
+                  setTgChat(e.target.value);
+                }}
+                placeholder="예: 123456789 또는 -100xxxxxxxxxx"
+                disabled={!tgEn}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 block mb-1">
+                토픽 ID <span className="text-slate-600">(선택, 포럼 그룹)</span>
+              </label>
+              <input
+                className={inp()}
+                value={tgThread}
+                onChange={(e) => {
+                  setDirty(true);
+                  setTgThread(e.target.value);
+                }}
+                placeholder="비우면 기본 채팅"
+                disabled={!tgEn}
+              />
             </div>
           </div>
         </div>
