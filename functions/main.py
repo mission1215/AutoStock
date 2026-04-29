@@ -1923,8 +1923,8 @@ def _get_available_cash_us(uid: str, cfg: dict) -> float:
 #   3) `scheduled_reconcile_kr/_us` (30분 주기)가 이를 호출한다.
 #
 # 안전 원칙:
-#   - 자동 삭제/수량 down-update 만 수행. 외부 매수로 보이는 케이스는
-#     평단·손절 정보가 없어 자동 등록하지 않고 INFO 로그만 남긴다.
+#   - 자동 삭제/수량 down-update·KIS-only 국내 종목 Firestore 자동 등록(평단 있을 때).
+#   - 등록 시 목표/손절은 `calculate_optimal_prices`(일봉+ATR)로 산출 — API 실패 시 비율 폴백.
 #   - Reconcile로 만들어지는 trades 레코드의 PnL은 0 — 실제 체결가가 미상이라
 #     장부의 일관성을 깨지 않기 위함.
 # ══════════════════════════════════════════════════════════════════════════
@@ -2002,10 +2002,12 @@ def reconcile_positions(uid: str, cfg: dict, market: str) -> dict:
           → 외부 부분 매도 추정.
             quantity = M 으로 update + 거래기록(reason="외부부분매도_보정", pnl=0) + WARNING.
       - Firestore(qty=N) ∧ KIS(qty=M) ∧ M>N
-          → 외부 추가 매수 추정.
-            평단/손절 정보가 없으므로 Firestore 자동 갱신하지 않음 — INFO 로그만.
-      - KIS만 보유 (Firestore 미등록)
-          → 자동 등록하지 않음 — INFO 로그만.
+          → 외부 추가 매수로 추정.
+            평단·증가분이 불명확해 Firestore 수량 자동 갱신은 하지 않음 — INFO 로그만.
+      - KIS만 보유 (Firestore 미등록), 국내(KR)이고 KIS 평단가 있음
+          → Firestore 자동 등록 + `calculate_optimal_prices`(일봉)로 목표가·손절가 설정.
+            (일봉/API 실패 시 `stop_loss_ratio`·+8% 목표 폴백)
+      - KIS만 보유·평단 불명(국내) / 미국(US)은 미등록 유지 — INFO 로그만.
 
     PnL을 0으로 기록하는 이유:
       외부 청산의 실제 체결가를 알 수 없어 임의의 손익을 잡으면 realized_pnl /
@@ -2083,23 +2085,46 @@ def reconcile_positions(uid: str, cfg: dict, market: str) -> dict:
         avg_price = float(detail.get("avg_price", 0) or 0)
         sname = detail.get("stock_name", "") or _stock_name("", code, market)
         if avg_price > 0:
-            # 수동 매수: Firestore에 등록 (target/stop 미설정 → 봇이 장마감 청산만 담당)
+            ohlcv_rx: list = []
+            try:
+                ohlcv_rx = get_daily_ohlcv_kr(uid, cfg, code)
+            except Exception as e:
+                _add_log(
+                    uid, "WARNING",
+                    f"[reconcile][KR][{code}] 일봉 조회 실패(ATR·목표 폴백): {e}",
+                )
+            try:
+                pr_rx = calculate_optimal_prices(avg_price, ohlcv_rx or [], cfg)
+                tgt = float(pr_rx.get("sell_price") or 0)
+                slp = float(pr_rx.get("stop_loss") or 0)
+            except Exception as e:
+                _add_log(uid, "WARNING", f"[reconcile][KR][{code}] 목표/손절 계산 실패: {e}")
+                tgt, slp = 0.0, 0.0
+            if slp <= 0:
+                slp = avg_price * (1 - float(cfg.get("stop_loss_ratio", 0.03)))
+            if tgt <= 0:
+                tgt = avg_price * 1.08
             _uref(uid).collection(f"positions_{market}").document(code).set({
                 "stock_code": code,
                 "stock_name": sname,
+                "market": "KR",
                 "buy_price": avg_price,
                 "quantity": kis_qty,
-                "target_sell_price": 0,
-                "stop_loss_price": 0,
+                "target_sell_price": tgt,
+                "stop_loss_price": slp,
                 "source": "수동",
                 "entry_time": datetime.now(KST),
                 "partial_tp_done": False,
                 "breakeven_applied": False,
+                "avg_down_count": 0,
+                "highest_price": avg_price,
             })
             add_trade(uid, market, code, "buy", avg_price, kis_qty, "수동매수_자동등록", 0.0, stock_name=sname)
-            _add_log(uid, "INFO",
+            _add_log(
+                uid, "INFO",
                 f"[reconcile][{market}][{code}] 수동매수 감지 → Firestore 등록 | "
-                f"{kis_qty}주@{avg_price:,.0f} ({sname})")
+                f"{kis_qty}주@{avg_price:,.0f} ({sname}) 목표={tgt:,.0f} 손절={slp:,.0f}",
+            )
         else:
             _add_log(uid, "INFO",
                 f"[reconcile][{market}][{code}] KIS {kis_qty}주 보유, 평단가 조회 불가 — 수동 확인 필요")
