@@ -394,6 +394,33 @@ def _stock_name(api_name: str, code: str, market: str = "KR") -> str:
     return US_STOCK_NAMES.get(code, code)
 
 
+def _kr_isnm_from_output(out: dict) -> str:
+    """주식현재가(inquire-price) 등 output dict 에서 한글 종목명 후보를 순서대로 추출.
+
+    KIS 필드명이 TR·버전에 따라 섞여 있어 다중 키를 보며, 순수 숫자(코드 착각)는 제외한다.
+    """
+    if not isinstance(out, dict):
+        return ""
+    for key in (
+        "hts_kor_isnm",
+        "prdt_name",
+        "prdt_abrv_name",
+        "bstp_kor_isnm",
+        "hts_avpr_abrv_item_nm",
+    ):
+        v = out.get(key)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s or s in ("-", ".", "--", "#N/A"):
+            continue
+        # 종목코드만 실린 경우 스킵 (이름 아님)
+        if s.isdigit() and len(s) <= 10:
+            continue
+        return s
+    return ""
+
+
 def _us_price_from_output(out: dict, ohlcv: list | None = None) -> float:
     """미국 현재가 필드 변동 대응 + 실패 시 최근 종가 fallback."""
     for key in ("last", "stck_prpr", "ovrs_nmix_prpr", "ovrs_now_pric", "clos"):
@@ -1094,7 +1121,9 @@ def get_current_price_kr(uid: str, cfg: dict, stock_code: str) -> dict:
             try:
                 data = _fetch(div)
                 out = data.get("output") or {}
-                if isinstance(out, dict) and _kr_price_from_output(out, None) > 0:
+                if not isinstance(out, dict) or _kr_price_from_output(out, None) <= 0:
+                    continue
+                if _kr_isnm_from_output(out):
                     return data
                 last_ok = data
             except ApiError:
@@ -3612,7 +3641,7 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                         result = place_order_kr(uid, cfg, code, "buy", qty, 0)
                         order_no = result.get("output", {}).get("ODNO", "N/A")
                         out = data.get("output") or {}
-                        sname = _stock_name(out.get("hts_kor_isnm", "") if isinstance(out, dict) else "", code, "KR")
+                        sname = _stock_name(_kr_isnm_from_output(out) if isinstance(out, dict) else "", code, "KR")
                         register_buy(
                             uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.03),
                             float(prices_kr["sell_price"]), "자동", sname,
@@ -6081,9 +6110,21 @@ def route_status():
 
         balance_data: dict[str, Any] = {}
         balance_prices_kr: dict[str, int] = {}
+        kr_balance_names: dict[str, str] = {}
         kis_error: str = ""
         try:
             bal = _cached_balance(uid, cfg)
+            for row in bal.get("output1") or []:
+                if not isinstance(row, dict):
+                    continue
+                pd = str(row.get("pdno", "")).strip()
+                if not pd:
+                    continue
+                if pd.isdigit() and len(pd) <= 6:
+                    pd = pd.zfill(6)
+                pnm = str(row.get("prdt_name", "") or "").strip()
+                if pd and pnm and not (pnm.isdigit() and len(pnm) <= 10):
+                    kr_balance_names[pd] = pnm
             balance_prices_kr = _kr_holdings_prpr_by_code(bal)
             summary = bal.get("output2", [{}])
             if summary:
@@ -6117,7 +6158,9 @@ def route_status():
                         current = _kr_price_from_output(out, ohlcv_kr)
                         if current <= 0:
                             current = balance_prices_kr.get(code, 0)
-                        sname = _stock_name(out.get("hts_kor_isnm", ""), code, "KR")
+                        api_nm = _kr_isnm_from_output(out)
+                        bal_nm = kr_balance_names.get(code, "")
+                        sname = _stock_name((api_nm or bal_nm), code, "KR")
                         change_rate = out.get("prdy_ctrt", "0")
                     else:
                         data = _cached_price(uid, cfg, code, "US")
@@ -6130,8 +6173,13 @@ def route_status():
                     pnl = (current - bp) * qty
                     pnl_ratio = ((current - bp) / bp * 100) if bp else 0.0
                     psn = (pos.get("stock_name") or "").strip()
-                    # Firestore·AI가 티커만 넣은 경우(066570) 등 → 시세/맵 기준 이름
-                    if not psn or psn == code:
+                    code_f = code.zfill(6) if code.isdigit() and len(code) <= 6 else code
+                    psn_bad = (
+                        not psn
+                        or psn == code
+                        or (psn.isdigit() and len(psn) <= 6 and psn.zfill(6) == code_f)
+                    )
+                    if psn_bad:
                         disp_name = sname
                     else:
                         disp_name = psn
@@ -6199,7 +6247,7 @@ def route_status():
                         cur_wl = balance_prices_kr.get(code, 0)
                     entry: dict[str, Any] = {
                         "current_price": cur_wl,
-                        "stock_name": _stock_name(out.get("hts_kor_isnm", ""), code, "KR"),
+                        "stock_name": _stock_name(_kr_isnm_from_output(out), code, "KR"),
                         "change_rate": out.get("prdy_ctrt", "0"),
                     }
                     if len(ohlcv) >= 2:
@@ -6347,8 +6395,10 @@ def route_order():
             current = _kr_price_from_api_data(data, ohlcv_o)
             if current <= 0:
                 return jsonify({"ok": False, "error": "현재가를 조회할 수 없습니다. 종목코드와 시장 구분을 확인해 주세요."}), 400
-            out_o = data.get("output") or {}
-            sname = _stock_name(out_o.get("hts_kor_isnm", ""), stock_code, "KR") if isinstance(out_o, dict) else _stock_name("", stock_code, "KR")
+            out_o = data.get("output")
+            if not isinstance(out_o, dict):
+                out_o = {}
+            sname = _stock_name(_kr_isnm_from_output(out_o), stock_code, "KR")
             if side == "buy":
                 if quantity <= 0:
                     available = get_available_cash_kr(uid, cfg, stock_code)
@@ -6674,7 +6724,7 @@ def route_quote():
             price = _kr_price_from_output(out, ohlcv_q)
             if price <= 0:
                 return jsonify({"ok": False, "error": "시세를 조회할 수 없습니다"}), 400
-            name = _stock_name(out.get("hts_kor_isnm", ""), code, "KR")
+            name = _stock_name(_kr_isnm_from_output(out), code, "KR")
         else:
             data = get_current_price_us(uid, cfg, code)
             ohlcv_uq = get_daily_ohlcv_us(uid, cfg, code)

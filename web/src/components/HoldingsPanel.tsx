@@ -121,6 +121,21 @@ export function HoldingsPanel({
                 ? `${qty.toLocaleString("ko-KR", { maximumFractionDigits: 4 })}주`
                 : "—";
 
+            const nmRaw = (p.stock_name || "").trim();
+            const code6 =
+              mkt === "KR" && /^\d{1,6}$/.test(code)
+                ? code.padStart(6, "0")
+                : code;
+            const nmIsTickerOnly =
+              !nmRaw ||
+              nmRaw === code ||
+              (mkt === "KR" &&
+                /^\d{1,6}$/.test(nmRaw) &&
+                nmRaw.padStart(6, "0") === code6);
+            const titleName = nmIsTickerOnly ? code : nmRaw;
+            const showCodeSub =
+              (!nmIsTickerOnly && mkt === "KR") || (mkt === "US" && !nmIsTickerOnly);
+
             return (
               <div
                 key={mkt + code}
@@ -137,10 +152,10 @@ export function HoldingsPanel({
                       <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
                         <div className="min-w-0 flex-1">
                           <div className="text-sm sm:text-[15px] font-semibold text-white leading-snug truncate">
-                            {p.stock_name || code}
+                            {titleName}
                           </div>
                           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5">
-                            {(p.stock_name || "").trim() ? (
+                            {showCodeSub ? (
                               <span className="font-mono text-[11px] text-slate-500 tabular-nums">
                                 {code}
                               </span>
