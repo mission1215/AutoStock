@@ -842,6 +842,15 @@ def _scope_allows_us(cfg: dict) -> bool:
     return _market_scope_normalized(cfg) in ("us", "both")
 
 
+def _all_users_kr_scope_only(users: list[tuple[str, dict]]) -> bool:
+    return bool(users) and all(_market_scope_normalized(c) == "kr" for _, c in users)
+
+
+def _telegram_monitoring_skip_kr_only_off_market(cfg: dict) -> bool:
+    """국내장만 유저: 평일 09:00~15:30 KST 외(심야·주말·장마감 후)는 시간별 모니터링 미발송."""
+    return _market_scope_normalized(cfg) == "kr" and not _is_kr_market_open()
+
+
 # ══════════════════════════════════════════════════════════
 # 토큰 관리 (per-user)
 # ══════════════════════════════════════════════════════════
@@ -5697,6 +5706,9 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
     now_et  = now_kst.astimezone(ET)
     is_weekend = now_kst.weekday() >= 5
 
+    users_for_monitor = list(_get_all_users())
+    kr_only_all_off_market = _all_users_kr_scope_only(users_for_monitor) and not _is_kr_market_open()
+
     kr_open = _is_kr_market_open()
     us_open = _is_us_market_open()
 
@@ -5715,7 +5727,7 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
         market_line = " | ".join(parts)
 
     user_lines = []
-    for uid, cfg in _get_all_users():
+    for uid, cfg in users_for_monitor:
         try:
             state = get_bot_state(uid)
             bot_on = "ON" if state.get("bot_enabled", True) else "OFF"
@@ -5742,10 +5754,13 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
     )
     sent = False
     g_chat, _ = _telegram_env_chat_and_thread()
-    if g_chat:
+    # 등록 유저가 전원 국내장만이면 마감~익일 개장 전까지 env 브로드캐스트도 생략 (매시간 알림 방지)
+    if g_chat and not kr_only_all_off_market:
         sent = _send_telegram(text, force_env_only=True, parse_mode=None, log_if_unconfigured=False) or sent
 
-    for uid, cfg in _get_all_users():
+    for uid, cfg in users_for_monitor:
+        if _telegram_monitoring_skip_kr_only_off_market(cfg):
+            continue
         raw = get_config_raw(uid)
         te = raw.get("telegram_enabled", False)
         if isinstance(te, str):
@@ -5770,7 +5785,7 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
         except Exception:
             continue
 
-    if not sent:
+    if not sent and not kr_only_all_off_market:
         logger.warning(
             "[Telegram] 모니터링 미발송 — TELEGRAM_CHAT_ID(env) 또는 "
             "설정에서 유저별 텔레그램(chat_id) 을 켜 주세요."
