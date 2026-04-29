@@ -134,7 +134,7 @@ US_LIVE_BALANCE_TR = "JTTT3012R"
 US_LIVE_INQUIRE_CCNL_TR = "JTTT3001R"
 # KIS OpenAPI: 초당 거래(조회·주문) 건수 제한 — HTTP 500 "초당 거래건수를 초과하였습니다"
 # 주문·주문가능까지 같은 간격으로 묶이므로 0.2 미만이면 AI 연속 매수에서 자주 걸림
-KIS_MIN_INTERVAL_SEC = 0.26
+KIS_MIN_INTERVAL_SEC = 0.34
 _kis_last_http_ts: float = 0.0
 
 
@@ -1203,6 +1203,15 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
                         raise
                     if len(ohlcv) > len(best):
                         best = ohlcv
+                    if len(best) >= 120:
+                        break
+            except ApiError as e:
+                if _is_kis_tps_exceeded(e):
+                    raise
+                logger.warning(
+                    "[KR][%s] 일봉 FHKST01010400 실서버: %s", stock_code, e
+                )
+                best = []
             except Exception as e:
                 logger.warning(
                     "[KR][%s] 일봉 FHKST01010400 실서버: %s", stock_code, e
@@ -1230,6 +1239,8 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
                         raise
                     if len(ohlcv) > len(best):
                         best = ohlcv
+                    if len(best) >= 120:
+                        break
             if len(best) >= 2:
                 return best
             syn = _kr_ohlcv_fallback_from_inquire_price(uid, cfg, stock_code)
@@ -1244,7 +1255,7 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
         except ApiError as e:
             last_exc = e
             if attempt < 3 and _is_kis_tps_exceeded(e):
-                time_module.sleep(0.55 + 0.45 * attempt)
+                time_module.sleep(1.0 + 0.9 * attempt)
                 continue
             raise
     assert last_exc is not None
@@ -5322,6 +5333,7 @@ def scheduled_market_open(event: scheduler_fn.ScheduledEvent) -> None:
 @scheduler_fn.on_schedule(
     schedule="* * * * *", timezone=scheduler_fn.Timezone("Asia/Seoul"),
     memory=options.MemoryOption.MB_256,
+    timeout_sec=180,
 )
 def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
     """KR 전략 메인 사이클 — 1분 간격, 평일 09:00~15:20 KST.
