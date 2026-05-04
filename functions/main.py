@@ -5752,12 +5752,8 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
         f"\n"
         f"⏰ 다음: 1시간 후"
     )
+    # 유저별 개인 메시지만 전송: telegram_enabled=True 이고 telegram_chat_id 설정된 유저에게만
     sent = False
-    g_chat, _ = _telegram_env_chat_and_thread()
-    # 등록 유저가 전원 국내장만이면 마감~익일 개장 전까지 env 브로드캐스트도 생략 (매시간 알림 방지)
-    if g_chat and not kr_only_all_off_market:
-        sent = _send_telegram(text, force_env_only=True, parse_mode=None, log_if_unconfigured=False) or sent
-
     for uid, cfg in users_for_monitor:
         if _telegram_monitoring_skip_kr_only_off_market(cfg):
             continue
@@ -5767,7 +5763,8 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
             te = te.strip().lower() not in ("false", "0", "", "no")
         if not te:
             continue
-        if not str(raw.get("telegram_chat_id") or "").strip():
+        chat_id = str(raw.get("telegram_chat_id") or "").strip()
+        if not chat_id:
             continue
         try:
             state = get_bot_state(uid)
@@ -5777,8 +5774,15 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
             pnl = state.get("realized_pnl", 0)
             pnl_str = f"{float(pnl or 0):+,.0f}원"
             personal = (
-                f"[AutoStock 모니터링·내 계정] {now_kst.strftime('%H:%M')} KST\n"
-                f"봇:{bot_on}{halted}{mock}\n실현손익:{pnl_str}"
+                f"[AutoStock 모니터링] {now_kst.strftime('%H:%M')} KST / {now_et.strftime('%H:%M')} ET\n"
+                f"\n"
+                f"🖥 Cloud Functions (Firebase API 경유)\n"
+                f"{market_line}\n"
+                f"\n"
+                f"봇:{bot_on}{halted}{mock}\n"
+                f"실현손익:{pnl_str}\n"
+                f"\n"
+                f"⏰ 다음: 1시간 후"
             )
             if _send_telegram(personal, uid=uid, parse_mode=None, log_if_unconfigured=False):
                 sent = True
@@ -5787,8 +5791,7 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
 
     if not sent and not kr_only_all_off_market:
         logger.warning(
-            "[Telegram] 모니터링 미발송 — TELEGRAM_CHAT_ID(env) 또는 "
-            "설정에서 유저별 텔레그램(chat_id) 을 켜 주세요."
+            "[Telegram] 모니터링 미발송 — 설정에서 유저별 텔레그램(telegram_enabled + chat_id)을 켜 주세요."
         )
 
 
