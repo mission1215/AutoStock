@@ -5461,43 +5461,71 @@ def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
         logging.info(f"[scheduled_strategy_cycle] heartbeat users={len(all_users)} {now.strftime('%H:%M')}")
 
 
+def _close_all_kr_positions(uid: str, cfg: dict, label: str) -> int:
+    """보유 KR 포지션 전량 청산. 현재가 조회 실패 시 OHLCV 마지막 종가로 폴백.
+    성공 청산 종목 수 반환."""
+    positions = get_positions(uid, "KR")
+    closed = 0
+    for code, pos in list(positions.items()):
+        try:
+            current = 0.0
+            try:
+                data = get_current_price_kr(uid, cfg, code)
+                ohlcv_c = get_daily_ohlcv_kr(uid, cfg, code)
+                current = _kr_price_from_api_data(data, ohlcv_c)
+            except Exception:
+                pass
+            # 현재가 조회 실패 시 포지션 매수가로 폴백 (시장가 주문은 가격과 무관하게 체결됨)
+            if current <= 0:
+                current = float(pos.get("buy_price") or pos.get("current_price") or 0)
+            if current <= 0:
+                _add_log(uid, "WARNING", f"[{code}] {label}: 현재가 조회 불가 — 매수가 폴백 불가, 건너뜀")
+                continue
+            qty = int(pos["quantity"])
+            res = place_order_kr(uid, cfg, code, "sell", qty, 0)
+            order_no = (res.get("output") or {}).get("ODNO", "N/A")
+            pnl = register_sell(uid, "KR", code, current)
+            add_trade(uid, "KR", code, "sell", current, qty, label, pnl, stock_name=pos.get("stock_name", ""))
+            state = get_bot_state(uid)
+            update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
+            _add_log(uid, "INFO",
+                     f"[KR][{code}] {label} | {qty}주@{current:,} "
+                     f"PnL≈{pnl:,.0f}원 주문={order_no}")
+            _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), qty, cfg)
+            _invalidate_balance_cache(uid)
+            closed += 1
+        except Exception as e:
+            _add_log(uid, "ERROR", f"[{code}] {label} 오류: {e}")
+    return closed
+
+
 @scheduler_fn.on_schedule(
     schedule="20 15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
     memory=options.MemoryOption.MB_256,
 )
 def scheduled_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
-    """KR 장 마감 직전(15:20 KST) 보유 포지션 전량 청산.
-
-    당일 결제 vs 익일 결제 리스크와 익일 갭 리스크를 회피하기 위해 전량 시장가 매도.
-    스윙 모드 운영을 원할 경우 이 함수의 스케줄을 끄거나 건너뛰는 분기 추가가 필요.
-    각 매도는 _log_sell_fill 로 슬리피지 기록.
-    """
+    """KR 장 마감 직전(15:20 KST) 보유 포지션 전량 청산."""
     for uid, cfg in _get_all_users():
         if not _scope_allows_kr(cfg):
             continue
-        positions = get_positions(uid, "KR")
-        for code, pos in list(positions.items()):
-            try:
-                data = get_current_price_kr(uid, cfg, code)
-                ohlcv_c = get_daily_ohlcv_kr(uid, cfg, code)
-                current = _kr_price_from_api_data(data, ohlcv_c)
-                if current <= 0:
-                    _add_log(uid, "WARNING", f"[{code}] 장마감 청산: 현재가 0 — 건너뜀")
-                    continue
-                qty = pos["quantity"]
-                res = place_order_kr(uid, cfg, code, "sell", qty, 0)
-                order_no = (res.get("output") or {}).get("ODNO", "N/A")
-                pnl = register_sell(uid, "KR", code, current)
-                add_trade(uid, "KR", code, "sell", current, qty, "장마감_청산", pnl, stock_name=pos.get("stock_name", ""))
-                state = get_bot_state(uid)
-                update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
-                _add_log(uid, "INFO",
-                         f"[KR][{code}] 장마감 청산 | {qty}주@{current:,} "
-                         f"PnL≈{pnl:,.0f}원 주문={order_no}")
-                _log_sell_fill(uid, "KR", code, "sell", order_no, float(current), qty, cfg)
-                _invalidate_balance_cache(uid)
-            except Exception as e:
-                _add_log(uid, "ERROR", f"[{code}] 청산 오류: {e}")
+        _close_all_kr_positions(uid, cfg, "장마감_청산")
+
+
+@scheduler_fn.on_schedule(
+    schedule="25 15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
+    memory=options.MemoryOption.MB_256,
+)
+def scheduled_close_positions_retry(event: scheduler_fn.ScheduledEvent) -> None:
+    """15:20 청산 실패 대비 15:25 재시도 — 남은 포지션만 청산."""
+    for uid, cfg in _get_all_users():
+        if not _scope_allows_kr(cfg):
+            continue
+        remaining = get_positions(uid, "KR")
+        if not remaining:
+            continue
+        _add_log(uid, "WARNING",
+                 f"[KR] 15:25 청산 재시도 — 미청산 {len(remaining)}종목: {list(remaining.keys())}")
+        _close_all_kr_positions(uid, cfg, "장마감_재청산")
 
 
 @scheduler_fn.on_schedule(
