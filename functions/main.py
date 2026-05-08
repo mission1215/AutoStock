@@ -3622,14 +3622,20 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                 continue
 
             today_open = float(str(ohlcv[0].get("stck_oprc", 0)).replace(",", "") or 0)
-            prev_range = float(str(ohlcv[1].get("stck_hgpr", 0)).replace(",", "") or 0) - float(
-                str(ohlcv[1].get("stck_lwpr", 0)).replace(",", "") or 0
-            )
+            if today_open <= 0:
+                diag_parts.append(f"{code}=시가미확정")
+                continue
+            prev_high  = float(str(ohlcv[1].get("stck_hgpr", 0)).replace(",", "") or 0)
+            prev_low   = float(str(ohlcv[1].get("stck_lwpr", 0)).replace(",", "") or 0)
+            prev_range = prev_high - prev_low
+            if prev_range <= 0:
+                diag_parts.append(f"{code}=전일범위0")
+                continue
             k = cfg.get("k_factor", 0.5)
             target = today_open + k * prev_range
-            ma5 = sum(
-                float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in ohlcv[:5]
-            ) / min(5, len(ohlcv))
+            # MA5: 완성된 봉(어제~5일전)만 사용 — ohlcv[0]은 오늘 미완성 봉
+            completed = [r for r in ohlcv[1:6] if float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) > 0]
+            ma5 = sum(float(str(r.get("stck_clpr", 0)).replace(",", "") or 0) for r in completed) / len(completed) if completed else 0
 
             # K팩터 진입 슬리피지 필터:
             # 목표가를 이미 max_entry_slip(기본 2%) 이상 지나쳤으면 추격 매수 금지.
@@ -5484,6 +5490,10 @@ def _close_all_kr_positions(uid: str, cfg: dict, label: str) -> int:
             qty = int(pos["quantity"])
             res = place_order_kr(uid, cfg, code, "sell", qty, 0)
             order_no = (res.get("output") or {}).get("ODNO", "N/A")
+            if not order_no or order_no == "N/A":
+                _add_log(uid, "ERROR",
+                         f"[KR][{code}] {label} 주문번호 없음 — DB 보존 (KIS 앱에서 수동 확인 필요)")
+                continue
             pnl = register_sell(uid, "KR", code, current)
             add_trade(uid, "KR", code, "sell", current, qty, label, pnl, stock_name=pos.get("stock_name", ""))
             state = get_bot_state(uid)
