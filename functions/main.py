@@ -3991,6 +3991,10 @@ def _collect_kr_stock_data_for_codes(
                     continue
             ohlcv = get_daily_ohlcv_kr(uid, cfg, code)
             current = _kr_price_from_output(out, ohlcv)
+            # 공유 캐시 채우기 → route_status·스코어링 재호출 방지
+            _now_ts = time_module.time()
+            _price_cache[f"{uid}:KR:{code}"] = {"data": price_data, "ts": _now_ts}
+            _ohlcv_cache[f"{uid}:KR:{code}"] = {"data": ohlcv,       "ts": _now_ts}
             result.append({
                 "code": code,
                 "sector_hint": KR_SECTOR_MAP.get(code, "기타"),
@@ -4002,6 +4006,9 @@ def _collect_kr_stock_data_for_codes(
                      "high": r.get("stck_hgpr"), "low": r.get("stck_lwpr"), "close": r.get("stck_clpr")}
                     for r in (ohlcv[:5] if len(ohlcv) >= 5 else ohlcv)
                 ],
+                "_full_ohlcv": ohlcv,     # 스코어링 재사용용 (KIS 재호출 방지)
+                "_current":    current,
+                "_price_data": price_data,
             })
         except Exception as e:
             _add_log(uid, "WARNING", f"[{code}] 데이터 수집 실패: {e}")
@@ -4034,6 +4041,9 @@ def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> l
             out        = price_data.get("output", {}) or {}
             ohlcv      = get_daily_ohlcv_us(uid, cfg, code)
             current    = _us_price_from_output(out, ohlcv) if isinstance(out, dict) else 0.0
+            _now_ts = time_module.time()
+            _price_cache[f"{uid}:US:{code}"] = {"data": price_data, "ts": _now_ts}
+            _ohlcv_cache[f"{uid}:US:{code}"] = {"data": ohlcv,       "ts": _now_ts}
             result.append({
                 "code": code,
                 "sector_hint": US_SECTOR_MAP.get(str(code).strip().upper(), "기타"),
@@ -4047,6 +4057,9 @@ def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> l
                      "volume": r.get("tvol")}
                     for r in (ohlcv[:5] if len(ohlcv) >= 5 else ohlcv)
                 ],
+                "_full_ohlcv": ohlcv,
+                "_current":    current,
+                "_price_data": price_data,
             })
         except Exception as e:
             _add_log(uid, "WARNING", f"[US][{code}] 데이터 수집 실패: {e}")
@@ -4684,19 +4697,34 @@ def _run_ai_session_impl(
     # ── 시장별 스코어링 ────────────────────────────────────
     scored: list[tuple] = []
     stock_details: dict = {}
+    # 수집 단계 데이터 캐시: 동일 종목 KIS 재호출 방지 (핵심 성능 최적화)
+    _collected_by_code = {s["code"]: s for s in stock_data}
     for code in codes_to_score:
         try:
-            if market == "US":
-                data    = get_current_price_us(uid, cfg, code)
-                out     = data.get("output") or {}
-                ohlcv   = get_daily_ohlcv_us(uid, cfg, code)
-                current = _us_price_from_output(out, ohlcv) if isinstance(out, dict) else 0.0
-                score_result = score_us_stock_algorithm(current, ohlcv, cfg)
+            cached_row = _collected_by_code.get(code)
+            if cached_row and cached_row.get("_full_ohlcv"):
+                # 수집 시 이미 가져온 데이터 재사용 → KIS API 호출 0회
+                ohlcv   = cached_row["_full_ohlcv"]
+                current = cached_row["_current"]
+                data    = cached_row["_price_data"]
+                if market == "US":
+                    out = (data.get("output") or {}) if isinstance(data, dict) else {}
+                    score_result = score_us_stock_algorithm(current, ohlcv, cfg)
+                else:
+                    score_result = score_stock_algorithm(current, ohlcv, cfg)
             else:
-                data    = get_current_price_kr(uid, cfg, code)
-                ohlcv   = get_daily_ohlcv_kr(uid, cfg, code)
-                current = _kr_price_from_api_data(data, ohlcv)
-                score_result = score_stock_algorithm(current, ohlcv, cfg)
+                # Gemini가 유니버스 외 종목을 추천한 경우 폴백
+                if market == "US":
+                    data    = get_current_price_us(uid, cfg, code)
+                    out     = data.get("output") or {}
+                    ohlcv   = get_daily_ohlcv_us(uid, cfg, code)
+                    current = _us_price_from_output(out, ohlcv) if isinstance(out, dict) else 0.0
+                    score_result = score_us_stock_algorithm(current, ohlcv, cfg)
+                else:
+                    data    = get_current_price_kr(uid, cfg, code)
+                    ohlcv   = get_daily_ohlcv_kr(uid, cfg, code)
+                    current = _kr_price_from_api_data(data, ohlcv)
+                    score_result = score_stock_algorithm(current, ohlcv, cfg)
             stock_details[code] = {"current": current, "ohlcv": ohlcv, "score": score_result}
             scored.append((code, score_result["score"], score_result["detail"]))
         except Exception as e:
@@ -6349,8 +6377,9 @@ def route_status():
                 except Exception:
                     watchlist_data[code] = {"current_price": 0, "stock_name": _stock_name("", code, "KR"), "change_rate": "0"}
 
-        # 미국 감시 종목 데이터
+        # 미국 감시 종목 데이터 — 미국장 마감 시간대엔 캐시 우선, 신규 KIS 호출 최소화
         us_watchlist_data: dict[str, Any] = {}
+        _us_mkt_open = _is_us_market_open()
         for raw_us in cfg.get("us_watchlist", []):
             code = str(raw_us).strip().upper()
             if code in positions_us_detail:
@@ -6382,6 +6411,23 @@ def route_status():
                 us_watchlist_data[code] = us_wl
             else:
                 try:
+                    # 미국장 마감 중에는 OHLCV(TTL=5분) 캐시만 사용해 KIS 호출 절감
+                    if not _us_mkt_open:
+                        cache_key = f"{uid}:US:{code}"
+                        if cache_key in _ohlcv_cache:
+                            ohlcv_us = _ohlcv_cache[cache_key]["data"]
+                            cached_p = _price_cache.get(cache_key)
+                            out_c = (cached_p["data"].get("output") or {}) if cached_p else {}
+                            cur_us = _us_price_from_output(out_c, ohlcv_us) if out_c else 0.0
+                            us_watchlist_data[code] = {
+                                "current_price": cur_us,
+                                "stock_name": _stock_name("", code, "US"),
+                                "change_rate": out_c.get("diff", "0"),
+                                "closes": [round(c, 2) for c in _ensure_sparkline_closes_us(
+                                    _us_closes_from_ohlcv(ohlcv_us), float(cur_us), None,
+                                )],
+                            }
+                            continue
                     data = _cached_price(uid, cfg, code, "US")
                     out = data["output"]
                     ohlcv_us = _cached_ohlcv(uid, cfg, code, "US")
