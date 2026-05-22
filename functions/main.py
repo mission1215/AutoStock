@@ -3066,6 +3066,118 @@ def _calc_atr_us(ohlcv: list[dict], period: int = 5) -> float:
     return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
 
 
+def _compute_indicators_kr(ohlcv: list[dict], current_price: float, cfg: dict) -> dict:
+    """KR OHLCV에서 MA5/MA20/RSI/거래량비율/돌파 지표를 미리 계산한다."""
+    try:
+        closes  = [float(r.get("stck_clpr", 0) or 0) for r in ohlcv]
+        volumes = [int(str(r.get("acml_vol", "0")).replace(",", "") or 0) for r in ohlcv]
+        today_open = float(ohlcv[0].get("stck_oprc", current_price)) if ohlcv else current_price
+
+        ma5  = round(sum(closes[:5])  / 5,  0) if len(closes) >= 5  else 0.0
+        ma20 = round(sum(closes[:20]) / 20, 0) if len(closes) >= 20 else 0.0
+        rsi  = _calc_rsi(closes[:30])
+
+        vol_ratio = 0.0
+        if len(volumes) >= 6 and volumes[0] > 0:
+            avg_vol = sum(volumes[1:6]) / 5
+            vol_ratio = round(volumes[0] / avg_vol, 2) if avg_vol > 0 else 0.0
+
+        breakout = False
+        if len(ohlcv) >= 2:
+            prev_high = float(ohlcv[1].get("stck_hgpr", 0) or 0)
+            prev_low  = float(ohlcv[1].get("stck_lwpr", 0) or 0)
+            target    = today_open + cfg.get("k_factor", 0.5) * (prev_high - prev_low)
+            breakout  = current_price >= target > today_open
+
+        change_pct = 0.0
+        if len(closes) >= 2 and closes[1] > 0:
+            change_pct = round((current_price - closes[1]) / closes[1] * 100, 2)
+
+        return {
+            "ma5": int(ma5), "ma20": int(ma20), "rsi": rsi,
+            "vol_ratio": vol_ratio, "breakout": breakout,
+            "aligned": ma5 > ma20 if ma5 > 0 and ma20 > 0 else False,
+            "change_pct": change_pct,
+        }
+    except Exception:
+        return {}
+
+
+def _compute_indicators_us(ohlcv: list[dict], current_price: float, cfg: dict) -> dict:
+    """US OHLCV에서 MA5/MA20/RSI/거래량비율/돌파 지표를 미리 계산한다."""
+    try:
+        closes  = [float(r.get("clos", 0) or 0) for r in ohlcv]
+        volumes = [int(str(r.get("tvol", "0")).replace(",", "") or 0) for r in ohlcv]
+        today_open = float(ohlcv[0].get("open", current_price)) if ohlcv else current_price
+
+        ma5  = round(sum(closes[:5])  / 5,  2) if len(closes) >= 5  else 0.0
+        ma20 = round(sum(closes[:20]) / 20, 2) if len(closes) >= 20 else 0.0
+        rsi  = _calc_rsi(closes[:30])
+
+        vol_ratio = 0.0
+        if len(volumes) >= 6 and volumes[0] > 0:
+            avg_vol = sum(volumes[1:6]) / 5
+            vol_ratio = round(volumes[0] / avg_vol, 2) if avg_vol > 0 else 0.0
+
+        breakout = False
+        if len(ohlcv) >= 2:
+            prev_high = float(ohlcv[1].get("high", 0) or 0)
+            prev_low  = float(ohlcv[1].get("low",  0) or 0)
+            target    = today_open + cfg.get("k_factor", 0.5) * (prev_high - prev_low)
+            breakout  = current_price >= target > today_open
+
+        change_pct = 0.0
+        if len(closes) >= 2 and closes[1] > 0:
+            change_pct = round((current_price - closes[1]) / closes[1] * 100, 2)
+
+        return {
+            "ma5": round(ma5, 2), "ma20": round(ma20, 2), "rsi": rsi,
+            "vol_ratio": vol_ratio, "breakout": breakout,
+            "aligned": ma5 > ma20 if ma5 > 0 and ma20 > 0 else False,
+            "change_pct": change_pct,
+        }
+    except Exception:
+        return {}
+
+
+_RULE_FILTER_MIN_UNIVERSE = 10  # 유니버스가 이 이하면 필터 생략
+
+
+def _rule_filter_stock_data(stock_data: list[dict], market: str) -> tuple[list[dict], int]:
+    """Gemini 호출 전 규칙 기반 사전 필터.
+
+    유니버스가 _RULE_FILTER_MIN_UNIVERSE 이하면 건너뜁니다.
+    통과 기준(하나라도 충족):
+      - 거래량비율 1.5배 이상
+      - 당일 등락 1.5% 이상
+      - 변동성 돌파 발생
+      - 정배열 + RSI 정상 구간(40~70)
+    """
+    if len(stock_data) <= _RULE_FILTER_MIN_UNIVERSE:
+        return stock_data, 0
+
+    passed, removed = [], 0
+    for item in stock_data:
+        vol_ratio  = float(item.get("vol_ratio",  0) or 0)
+        change_pct = float(item.get("change_pct", 0) or 0)
+        breakout   = bool(item.get("breakout",  False))
+        rsi        = float(item.get("rsi",       50) or 50)
+        aligned    = bool(item.get("aligned",   False))
+
+        if (vol_ratio >= 1.5
+                or change_pct >= 1.5
+                or breakout
+                or (aligned and 40 <= rsi <= 70)):
+            passed.append(item)
+        else:
+            removed += 1
+
+    if len(passed) < _RULE_FILTER_MIN_UNIVERSE:
+        return stock_data, 0
+
+    return passed, removed
+
+
 def score_us_stock_algorithm(current_price: float, ohlcv: list[dict], cfg: dict) -> dict:
     """
     미국 주식 전용 스코어링 알고리즘 (수익률 최적화)
@@ -3995,6 +4107,7 @@ def _collect_kr_stock_data_for_codes(
             _now_ts = time_module.time()
             _price_cache[f"{uid}:KR:{code}"] = {"data": price_data, "ts": _now_ts}
             _ohlcv_cache[f"{uid}:KR:{code}"] = {"data": ohlcv,       "ts": _now_ts}
+            indicators = _compute_indicators_kr(ohlcv, current, cfg)
             result.append({
                 "code": code,
                 "sector_hint": KR_SECTOR_MAP.get(code, "기타"),
@@ -4004,8 +4117,9 @@ def _collect_kr_stock_data_for_codes(
                 "recent_ohlcv": [
                     {"date": r.get("stck_bsop_date"), "open": r.get("stck_oprc"),
                      "high": r.get("stck_hgpr"), "low": r.get("stck_lwpr"), "close": r.get("stck_clpr")}
-                    for r in (ohlcv[:5] if len(ohlcv) >= 5 else ohlcv)
+                    for r in (ohlcv[:3] if len(ohlcv) >= 3 else ohlcv)
                 ],
+                **indicators,
                 "_full_ohlcv": ohlcv,     # 스코어링 재사용용 (KIS 재호출 방지)
                 "_current":    current,
                 "_price_data": price_data,
@@ -4044,6 +4158,7 @@ def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> l
             _now_ts = time_module.time()
             _price_cache[f"{uid}:US:{code}"] = {"data": price_data, "ts": _now_ts}
             _ohlcv_cache[f"{uid}:US:{code}"] = {"data": ohlcv,       "ts": _now_ts}
+            indicators = _compute_indicators_us(ohlcv, current, cfg)
             result.append({
                 "code": code,
                 "sector_hint": US_SECTOR_MAP.get(str(code).strip().upper(), "기타"),
@@ -4055,8 +4170,9 @@ def _collect_us_stock_data_for_codes(uid: str, cfg: dict, codes: list[str]) -> l
                      "open":  r.get("open"),   "high": r.get("high"),
                      "low":   r.get("low"),     "close": r.get("clos"),
                      "volume": r.get("tvol")}
-                    for r in (ohlcv[:5] if len(ohlcv) >= 5 else ohlcv)
+                    for r in (ohlcv[:3] if len(ohlcv) >= 3 else ohlcv)
                 ],
+                **indicators,
                 "_full_ohlcv": ohlcv,
                 "_current":    current,
                 "_price_data": price_data,
@@ -4457,7 +4573,12 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
     session_labels = {"morning": "오전 (09:30)", "afternoon": "오후 (13:00)", "late": "마감 (15:30)"}
     us_sessions    = {"morning": "오전 (ET 10:30)", "afternoon": "오후 (ET 13:00)", "late": "마감 (ET 15:30)"}
     session_label  = (us_sessions if market == "US" else session_labels).get(session, session)
-    data_json = json.dumps(stock_data, ensure_ascii=False, indent=2)
+    _GEMINI_FIELDS = {
+        "code", "sector_hint", "current_price", "change_rate", "change_pct",
+        "volume", "ma5", "ma20", "rsi", "vol_ratio", "breakout", "aligned", "recent_ohlcv",
+    }
+    gemini_items = [{k: v for k, v in d.items() if k in _GEMINI_FIELDS} for d in stock_data]
+    data_json = json.dumps(gemini_items, ensure_ascii=False, indent=2)
     allowed_flat = ", ".join(
         str(d.get("code", "")).strip()
         for d in stock_data
@@ -4487,7 +4608,7 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
 You are a top-tier sell-side quant and short-term momentum specialist for US equities (NASDAQ/NYSE). Your task is to rank symbols from the PROVIDED DATA ONLY for the highest probability of favorable short-term (same session ~ 2 trading days) price action.
 
 [Input Data — authoritative]
-The JSON below is the ONLY universe you may recommend from. Each row has: code (ticker), sector_hint (coarse bucket label supplied by server—use only these labels when mentioning sectors), current_price, change_rate (%), volume, recent_ohlcv (up to 5 recent bars: date, open, high, low, close, volume when available).
+The JSON below is the ONLY universe you may recommend from. Each row has: code (ticker), sector_hint (coarse bucket label—use only these), current_price, change_pct (today's % change), volume (cumulative), ma5/ma20 (moving averages), rsi (RSI-14), vol_ratio (today÷5-day avg volume), breakout (volatility-breakout signal), aligned (MA5>MA20 uptrend), recent_ohlcv (last 3 bars).
 Session context: {session_label}
 
 {data_json}
@@ -4519,7 +4640,7 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
 당신은 월스트리트급 헤지펀드 출신 수석 퀀트 애널리스트이자, 한국 주식(KOSPI/KOSDAQ) 단기 모멘텀·수급 관점의 권위자입니다. 목표는 아래 [Input Data]만을 근거로, 단기(당일~2거래일) 상승 확률이 상대적으로 높은 종목을 고르는 것입니다.
 
 [Input Data — 유일한 근거]
-아래 JSON은 우리 서비스가 KIS API로 수집한 실데이터입니다. 각 행: code(종목코드), sector_hint(업종 힌트·서버가 부여한 라벨만 사용), current_price, change_rate(전일대비%), volume(누적거래량 문자열), recent_ohlcv(최근 최대 5일: date, open, high, low, close).
+아래 JSON은 우리 서비스가 KIS API로 수집한 실데이터입니다. 각 행: code(종목코드), sector_hint(업종 힌트·서버 부여 라벨만 사용), current_price(현재가), change_pct(당일등락%), volume(누적거래량), ma5/ma20(이동평균), rsi(RSI-14), vol_ratio(당일/5일평균 거래량비율), breakout(변동성돌파 여부), aligned(정배열:MA5>MA20), recent_ohlcv(최근 3일봉).
 세션: {session_label}
 
 {data_json}
@@ -4642,6 +4763,11 @@ def _run_ai_session_impl(
     if market != "US":
         _kr_u_hint = f" ai_universe_mode={cfg.get('ai_universe_mode', 'legacy')}"
     _add_log(uid, "INFO", f"[AI][{market}] Gemini 입력 유니버스 {len(stock_data)}종목 수집{_kr_u_hint}")
+
+    # ── RuleFilter: 기술적 조건 미충족 종목을 Gemini 호출 전 제거 ──
+    stock_data, removed_cnt = _rule_filter_stock_data(stock_data, market)
+    if removed_cnt > 0:
+        _add_log(uid, "INFO", f"[AI][{market}] RuleFilter: {removed_cnt}종목 제거 → Gemini 입력 {len(stock_data)}종목")
 
     reasons_map: dict[str, str] = {}
     try:
