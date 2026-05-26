@@ -4317,6 +4317,79 @@ def _load_any_fallback_ai_cache(
     return None
 
 
+# ══════════════════════════════════════════════════════════
+# 공유 AI 피크 캐시 (ai_picks/{date_key}) — 유저 독립, 전체 공유
+# ai_provider: "gemini" | "claude" | "both"
+# ══════════════════════════════════════════════════════════
+
+def _get_ai_provider() -> str:
+    """글로벌 ai_config/settings 에서 ai_provider 읽기. 기본값 'gemini'."""
+    try:
+        snap = get_db().collection("ai_config").document("settings").get()
+        if snap.exists:
+            return snap.to_dict().get("ai_provider", "gemini")
+    except Exception as e:
+        logger.warning("[ai_config] ai_provider 읽기 실패: %s", e)
+    return "gemini"
+
+
+def _shared_picks_ref(dk: str):
+    return get_db().collection("ai_picks").document(dk)
+
+
+def _shared_picks_field(provider: str, market: str, session: str) -> str:
+    """Firestore 문서 내 필드명 — 예: gemini_KR_morning"""
+    return f"{provider}_{market}_{session}"
+
+
+def _load_shared_ai_picks(
+    provider: str, market: str, session: str, dk: str,
+) -> tuple[list[str], dict[str, str]] | None:
+    """공유 ai_picks/{dk} 에서 (provider, market, session) 조합 캐시 반환."""
+    try:
+        snap = _shared_picks_ref(dk).get()
+        if not snap.exists:
+            return None
+        d = snap.to_dict() or {}
+        field = _shared_picks_field(provider, market, session)
+        entry = d.get(field)
+        if not isinstance(entry, dict):
+            return None
+        codes = entry.get("candidates", [])
+        reasons = entry.get("reasons", {})
+        if not codes:
+            return None
+        return [str(c).strip() for c in codes if str(c).strip()], dict(reasons)
+    except Exception as e:
+        logger.warning("[shared_picks] 읽기 실패: %s", e)
+        return None
+
+
+def _save_shared_ai_picks(
+    provider: str, market: str, session: str, dk: str,
+    candidates: list[str], reasons: dict[str, str],
+) -> None:
+    """공유 ai_picks/{dk} 에 (provider, market, session) 캐시 저장."""
+    try:
+        field = _shared_picks_field(provider, market, session)
+        _shared_picks_ref(dk).set(
+            {
+                field: {
+                    "candidates": candidates,
+                    "reasons": reasons,
+                    "provider": provider,
+                    "market": market,
+                    "session": session,
+                    "updated_at": datetime.now(KST).isoformat(),
+                },
+                "updated_at": datetime.now(KST).isoformat(),
+            },
+            merge=True,
+        )
+    except Exception as e:
+        logger.warning("[shared_picks] 저장 실패: %s", e)
+
+
 def _research_fallback_response(uid: str, market: str, dk: str, quota: bool, detail: str = "") -> dict:
     """Gemini 실패 시 Firestore에 쓰지 않고 UI용 문구만 반환."""
     if quota:
@@ -4556,6 +4629,16 @@ def query_gemini_candidates(uid: str, stock_data: list[dict], session: str, mark
         raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
 
     dk = _research_date_key(market)
+
+    # ── 1순위: 공유 캐시 (ai_picks/{dk}) — 유저 무관하게 오늘 이미 호출된 결과 재사용 ──
+    shared_hit = _load_shared_ai_picks("gemini", market, session, dk)
+    if shared_hit and shared_hit[0]:
+        _add_log(uid, "INFO", f"[Gemini] 공유 캐시 사용 ({market}/{session}) — API 호출 없음")
+        # per-user 캐시에도 기록해 기존 폴백 로직 유지
+        _save_ai_candidates_cache(uid, market, session, dk, shared_hit[0], shared_hit[1])
+        return shared_hit
+
+    # ── 2순위: per-user 캐시 ──
     hit = _load_ai_candidates_cache(uid, market, session, dk)
     if hit and hit[0]:
         _add_log(uid, "INFO", f"[Gemini] 세션 캐시 사용 ({market}/{session})")
@@ -4701,7 +4784,9 @@ Allowed tickers (subset of codes you may use): {allowed_flat}
         if reason:
             reasons_map[code] = reason
     if candidate_codes:
+        # per-user 캐시 + 공유 캐시 동시 저장 → 다른 유저는 API 호출 없이 재사용
         _save_ai_candidates_cache(uid, market, session, dk, candidate_codes, reasons_map)
+        _save_shared_ai_picks("gemini", market, session, dk, candidate_codes, reasons_map)
     _add_log(uid, "INFO", f"[Gemini] {session_label} 후보 {len(candidate_codes)}종목")
     return candidate_codes, reasons_map
 
@@ -4762,7 +4847,23 @@ def _run_ai_session_impl(
     _kr_u_hint = ""
     if market != "US":
         _kr_u_hint = f" ai_universe_mode={cfg.get('ai_universe_mode', 'legacy')}"
-    _add_log(uid, "INFO", f"[AI][{market}] Gemini 입력 유니버스 {len(stock_data)}종목 수집{_kr_u_hint}")
+    _add_log(uid, "INFO", f"[AI][{market}] 유니버스 {len(stock_data)}종목 수집{_kr_u_hint}")
+
+    # ── ai_provider 토글: claude / both / gemini ──────────────────────────────
+    ai_provider = _get_ai_provider()
+    dk = _research_date_key(market)
+
+    # Claude 피크 로드 (provider가 claude 또는 both 일 때)
+    claude_candidates: list[str] = []
+    claude_reasons: dict[str, str] = {}
+    if ai_provider in ("claude", "both"):
+        shared_claude = _load_shared_ai_picks("claude", market, session, dk)
+        if shared_claude and shared_claude[0]:
+            claude_candidates, claude_reasons = shared_claude
+            _add_log(uid, "INFO", f"[Claude] 공유 피크 로드 {len(claude_candidates)}종목 ({market}/{session})")
+        elif ai_provider == "claude":
+            _add_log(uid, "WARNING", f"[Claude] 공유 피크 없음 ({market}/{session}) — Gemini 폴백")
+            ai_provider = "gemini"  # 클로드 데이터 없으면 Gemini로 자동 폴백
 
     # ── RuleFilter: 기술적 조건 미충족 종목을 Gemini 호출 전 제거 ──
     stock_data, removed_cnt = _rule_filter_stock_data(stock_data, market)
@@ -4771,8 +4872,24 @@ def _run_ai_session_impl(
 
     reasons_map: dict[str, str] = {}
     try:
-        candidate_codes, reasons_map = query_gemini_candidates(uid, stock_data, session, market)
-    except Exception as e:
+        if ai_provider == "claude":
+            # Claude 피크만 사용: Gemini API 호출 없음
+            candidate_codes = claude_candidates
+            reasons_map = claude_reasons
+        else:
+            # gemini 또는 both: 기존 Gemini 호출
+            candidate_codes, reasons_map = query_gemini_candidates(uid, stock_data, session, market)
+            # both 모드: Claude 피크도 병합 (Gemini 우선, Claude 보완)
+            if ai_provider == "both" and claude_candidates:
+                existing = set(candidate_codes)
+                for c in claude_candidates:
+                    if c not in existing:
+                        candidate_codes.append(c)
+                        if c in claude_reasons:
+                            reasons_map[c] = f"[Claude] {claude_reasons[c]}"
+                _add_log(uid, "INFO", f"[both] Gemini+Claude 병합 후보 {len(candidate_codes)}종목")
+    except Exception as _dummy_exc:
+        e = _dummy_exc
         if _is_gemini_quota_error(e):
             _add_log(
                 uid,
@@ -6815,7 +6932,8 @@ def route_config():
                 "strategy_tier", "market_scope", "ai_universe_mode",
                 "max_positions_per_sector",
                 "ai_universe_kr_quality_gates", "ai_universe_kr_min_cap_eok",
-                "telegram_enabled", "telegram_chat_id", "telegram_message_thread_id"}
+                "telegram_enabled", "telegram_chat_id", "telegram_message_thread_id",
+                "ai_provider"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"ok": False, "error": "변경할 설정 없음"}), 400
@@ -6888,9 +7006,100 @@ def route_config():
             updates["ai_universe_kr_min_cap_eok"] = max(0.0, mn)
         except (TypeError, ValueError):
             updates["ai_universe_kr_min_cap_eok"] = 0.0
-    save_config(uid, updates)
-    _add_log(uid, "INFO", f"설정 변경: {list(updates.keys())}")
+    # ai_provider 는 글로벌 설정(ai_config/settings)에 저장 — 전 유저 공유
+    if "ai_provider" in updates:
+        raw_provider = str(updates.pop("ai_provider", "gemini")).strip().lower()
+        if raw_provider not in ("gemini", "claude", "both"):
+            raw_provider = "gemini"
+        try:
+            get_db().collection("ai_config").document("settings").set(
+                {"ai_provider": raw_provider, "updated_at": datetime.now(KST).isoformat()},
+                merge=True,
+            )
+            _add_log(uid, "INFO", f"[ai_config] ai_provider → {raw_provider}")
+        except Exception as e:
+            logger.warning("[ai_config] 저장 실패: %s", e)
+
+    if updates:
+        save_config(uid, updates)
+        _add_log(uid, "INFO", f"설정 변경: {list(updates.keys())}")
     return jsonify({"ok": True, "updated": updates})
+
+
+# ── Claude 스케줄러 → 공유 AI 피크 수신 엔드포인트 ──────────────────────────────
+@flask_app.route("/api/ai/picks", methods=["POST"])
+def route_ai_picks():
+    """
+    Claude Cowork 스케줄러가 매일 아침 종목 추천 결과를 push하는 엔드포인트.
+
+    인증: Firebase Bearer 토큰 (일반 유저) 또는 헤더 X-AI-Picks-Secret (환경변수 AI_PICKS_SECRET)
+    Body: {
+        "provider": "claude",          # 필수
+        "market":   "KR",              # 필수: KR | US
+        "session":  "morning",         # 필수: morning | afternoon | late
+        "candidates": [                # 필수: 종목 리스트
+            {"code": "005930", "reason": "..."},
+            ...
+        ]
+    }
+    """
+    # ── 인증: 전용 시크릿 키 또는 Firebase 토큰 ──
+    secret = os.environ.get("AI_PICKS_SECRET", "")
+    header_secret = request.headers.get("X-AI-Picks-Secret", "")
+    if secret and header_secret == secret:
+        auth_ok = True
+    else:
+        uid, err = _require_auth()
+        auth_ok = err is None
+    if not auth_ok:
+        return jsonify({"ok": False, "error": "인증 실패"}), 401
+
+    body = request.get_json() or {}
+    provider = str(body.get("provider", "claude")).strip().lower()
+    market   = str(body.get("market", "KR")).strip().upper()
+    session  = str(body.get("session", "morning")).strip().lower()
+    raw_list = body.get("candidates", [])
+
+    if market not in ("KR", "US"):
+        return jsonify({"ok": False, "error": "market: KR | US"}), 400
+    if session not in ("morning", "afternoon", "late"):
+        return jsonify({"ok": False, "error": "session: morning | afternoon | late"}), 400
+    if not isinstance(raw_list, list) or not raw_list:
+        return jsonify({"ok": False, "error": "candidates 리스트가 비어있습니다"}), 400
+
+    candidates: list[str] = []
+    reasons: dict[str, str] = {}
+    for item in raw_list:
+        if isinstance(item, dict):
+            code   = str(item.get("code", "")).strip()
+            reason = str(item.get("reason", "")).strip()
+        else:
+            code   = str(item).strip()
+            reason = ""
+        if not code:
+            continue
+        if market == "KR" and code.isdigit():
+            code = code.zfill(6)
+        if code not in candidates:
+            candidates.append(code)
+            if reason:
+                reasons[code] = reason
+
+    if not candidates:
+        return jsonify({"ok": False, "error": "유효한 종목 코드가 없습니다"}), 400
+
+    dk = _research_date_key(market)
+    _save_shared_ai_picks(provider, market, session, dk, candidates, reasons)
+    logger.info("[/api/ai/picks] %s/%s/%s %d종목 저장", provider, market, session, len(candidates))
+    return jsonify({
+        "ok": True,
+        "provider": provider,
+        "market": market,
+        "session": session,
+        "date_key": dk,
+        "count": len(candidates),
+        "candidates": candidates,
+    })
 
 
 @flask_app.route("/api/trades")
@@ -7118,6 +7327,8 @@ def route_logs():
     # 기본 60s 초과 시 Cloud Run이 502 반환 — AI 유니버스 수집·Gemini·스코어링은 수 분 걸릴 수 있음
     memory=options.MemoryOption.MB_512,
     timeout_sec=540,
+    # 콜드 스타트 제거: 항상 최소 1개 인스턴스 warm 유지 → 첫 진입 지연 3~10초 → 0초
+    min_instances=1,
 )
 def api(req: https_fn.Request) -> https_fn.Response:
     with flask_app.request_context(req.environ):

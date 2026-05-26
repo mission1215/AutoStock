@@ -24,7 +24,17 @@ import { tvSymbol } from "../utils/tradingViewSymbol";
 import { formatKst } from "../utils/formatKst";
 import { normalizeMarketScope, type MarketScope } from "../utils/marketScope";
 
-const POLL_MS = 20000;
+// 장 중(09:00~15:30 KST)에는 10초, 장 외에는 30초 폴링
+function getPollMs(): number {
+  const now = new Date();
+  const kst = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const h = kst.getHours();
+  const m = kst.getMinutes();
+  const totalMin = h * 60 + m;
+  const isMarketHours = totalMin >= 9 * 60 && totalMin < 15 * 60 + 30;
+  return isMarketHours ? 10_000 : 30_000;
+}
+const POLL_MS = getPollMs();
 
 export function Dashboard({
   idToken,
@@ -183,8 +193,28 @@ export function Dashboard({
 
   if (loading && !status) {
     return (
-      <div className="mx-auto w-full max-w-6xl px-4 sm:px-6 py-16 flex justify-center">
-        <div className="h-10 w-10 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+      <div className="mx-auto w-full max-w-6xl px-4 sm:px-5 md:px-6 lg:px-8 pb-6 animate-pulse">
+        {/* 헤더 스켈레톤 */}
+        <div className="pt-2 pb-5 border-b border-white/[0.06]">
+          <div className="h-4 w-20 rounded bg-slate-800 mb-2" />
+          <div className="h-7 w-36 rounded bg-slate-800 mb-2" />
+          <div className="h-3 w-48 rounded bg-slate-800/60" />
+        </div>
+        {/* 잔고 카드 스켈레톤 */}
+        <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {[...Array(3)].map((_, i) => (
+            <div key={i} className="rounded-2xl border border-white/[0.07] bg-slate-900/60 px-4 py-3.5 h-20" />
+          ))}
+        </div>
+        {/* 감시종목 카드 스켈레톤 */}
+        <div className="mt-8">
+          <div className="h-4 w-24 rounded bg-slate-800 mb-4" />
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+            {[...Array(6)].map((_, i) => (
+              <div key={i} className="rounded-xl border border-white/[0.07] bg-slate-900/60 p-3 h-[200px]" />
+            ))}
+          </div>
+        </div>
       </div>
     );
   }
@@ -545,6 +575,15 @@ export function Dashboard({
                     : "—";
               const breakout = wd.target_breakout ?? 0;
               const ma5wl = wd.ma5 ?? 0;
+              // 목표 돌파가까지 진행률
+              const breakoutProgress =
+                !owned && breakout > 0 && displayPrice != null && displayPrice > 0
+                  ? Math.min((displayPrice / breakout) * 100, 100)
+                  : 0;
+              const breakoutRemainPct =
+                !owned && breakout > 0 && displayPrice != null && displayPrice > 0
+                  ? Math.max(((breakout - displayPrice) / breakout) * 100, 0)
+                  : 0;
               const showBuySignal =
                 !owned &&
                 currentMarket === "KR" &&
@@ -669,6 +708,37 @@ export function Dashboard({
                             </span>
                           ) : null}
                         </div>
+                        {/* 목표 돌파가 진행률 프로그레스바 */}
+                        {breakoutProgress > 0 && (
+                          <div className="mt-2">
+                            <div className="flex justify-between items-center mb-1">
+                              <span className="text-[10px] text-slate-500">
+                                {showBuySignal
+                                  ? "✅ 돌파 진입 구간"
+                                  : `남은 거리 ${breakoutRemainPct.toFixed(1)}%`}
+                              </span>
+                              <span
+                                className={`text-[10px] font-semibold tabular-nums ${
+                                  showBuySignal ? "text-emerald-400" : "text-slate-400"
+                                }`}
+                              >
+                                {breakoutProgress.toFixed(1)}%
+                              </span>
+                            </div>
+                            <div className="h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all duration-500 ${
+                                  showBuySignal
+                                    ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]"
+                                    : breakoutProgress >= 90
+                                      ? "bg-amber-400"
+                                      : "bg-blue-500"
+                                }`}
+                                style={{ width: `${breakoutProgress}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ) : null}
                   </div>

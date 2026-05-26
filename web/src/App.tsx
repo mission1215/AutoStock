@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import {
   onAuthStateChanged,
   signInWithPopup,
@@ -12,14 +12,48 @@ import { AccountMenu } from "./components/AccountMenu";
 import { SetupForm } from "./pages/SetupForm";
 import { Dashboard } from "./pages/Dashboard";
 
+function formatBootElapsed(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/** 로그인 직후 첫 `/api/status` 대기 중에만 표시(토큰 자동 갱신 때는 띄우지 않음) */
+function BootStatusOverlay({ elapsedSec }: { elapsedSec: number }) {
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center px-4 bg-[#060b18]/88 backdrop-blur-md"
+      role="alertdialog"
+      aria-busy="true"
+      aria-label="서버 동기화 중"
+    >
+      <div className="w-full max-w-sm rounded-2xl border border-blue-500/25 bg-slate-900/95 p-6 text-center shadow-2xl shadow-blue-950/40">
+        <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+        <p className="text-sm font-semibold text-white">대시보드 연결 중</p>
+        <p className="mt-1 text-xs text-slate-500">서버 상태를 불러오는 중입니다.</p>
+        <p
+          className="mt-4 font-mono text-2xl font-bold tabular-nums tracking-widest text-blue-300"
+          aria-live="polite"
+        >
+          {formatBootElapsed(elapsedSec)}
+        </p>
+        <p className="mt-1 text-[10px] text-slate-600">경과 시간</p>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [idToken, setIdToken] = useState<string | null>(null);
   const [boot, setBoot] = useState(true);
+  const [bootElapsedSec, setBootElapsedSec] = useState(0);
   const [setupRequired, setSetupRequired] = useState(false);
   const [market, setMarket] = useState<"KR" | "US">("KR");
   /** 부트 시 받은 /api/status — Dashboard 첫 그림에서 중복 호출 제거(토큰 변경 시엔 대시보드가 다시 조회) */
   const [statusBootstrap, setStatusBootstrap] = useState<StatusResponse | null>(null);
+  /** 같은 세션에서 idToken이 주기 갱신될 때 전체 화면 부트를 다시 띄우지 않기 위함 */
+  const initialStatusFetchRef = useRef(true);
 
   useEffect(() => {
     return onAuthStateChanged(auth, async (u) => {
@@ -41,9 +75,12 @@ function App() {
     if (!user || !idToken) {
       setBoot(false);
       setStatusBootstrap(null);
+      initialStatusFetchRef.current = true;
       return;
     }
     let cancelled = false;
+    const showFullBoot = initialStatusFetchRef.current;
+    if (showFullBoot) setBoot(true);
     (async () => {
       try {
         const s = await apiFetch<StatusResponse>("/api/status", { idToken });
@@ -61,13 +98,26 @@ function App() {
           setStatusBootstrap(null);
         }
       } finally {
-        if (!cancelled) setBoot(false);
+        if (!cancelled) {
+          setBoot(false);
+          initialStatusFetchRef.current = false;
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
   }, [user, idToken]);
+
+  useEffect(() => {
+    if (!boot || !user) return;
+    const t0 = Date.now();
+    setBootElapsedSec(0);
+    const id = setInterval(() => {
+      setBootElapsedSec(Math.floor((Date.now() - t0) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [boot, user]);
 
   useEffect(() => {
     if (!user) return;
@@ -138,8 +188,8 @@ function App() {
 
   if (boot && user) {
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-[#060b18]">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+      <div className="relative flex min-h-dvh items-center justify-center bg-[#060b18]">
+        <BootStatusOverlay elapsedSec={bootElapsedSec} />
       </div>
     );
   }

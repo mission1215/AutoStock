@@ -1,6 +1,7 @@
-# 환경 변수 (절대 커밋 금지)
-.env
-functions/.env
+# 환경 변수
+/.env
+# functions/.env 는 private 레포이므로 커밋 허용 (다중 PC 개발 환경)
+!functions/.env
 
 # Python
 __pycache__/
