@@ -173,12 +173,12 @@ export function Dashboard({
         ? "kr"
         : "us"
       : marketScope;
-  const equityFilter: "KR" | "US" =
+  const equityFilter: "KR" | "US" | null =
     marketScope === "kr"
       ? "KR"
       : marketScope === "us"
         ? "US"
-        : currentMarket;
+        : null; // both 모드: 차트 내 탭이 KR/US 전환
 
   const tradesView = useMemo(() => {
     if (marketScope === "both") return trades;
@@ -391,11 +391,11 @@ export function Dashboard({
           <div className="mb-3">
             <h2 className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
               누적 실현손익
-              {marketScope === "both" && (
-                <span className="text-slate-600 font-normal"> · {currentMarket}</span>
-              )}
             </h2>
-            <p className="text-[10px] text-slate-600 mt-0.5">매도 체결 기준(선택 시장)</p>
+            <p className="text-[10px] text-slate-600 mt-0.5">
+              매도 체결 기준
+              {marketScope !== "both" && ` · ${marketScope === "kr" ? "국내" : "미국"}`}
+            </p>
           </div>
           <EquityChart trades={trades} marketFilter={equityFilter} />
         </div>

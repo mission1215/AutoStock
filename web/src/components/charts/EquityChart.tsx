@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   LineChart,
   Line,
@@ -40,7 +41,20 @@ export function EquityChart({
   /** 국내만/미국만 누적손익 — both 모드·단일 시장 뷰용 */
   marketFilter?: "KR" | "US" | null;
 }) {
-  const data = buildSeries(trades, marketFilter);
+  const [innerTab, setInnerTab] = useState<"KR" | "US" | null>(null);
+
+  const hasBothMarkets =
+    marketFilter == null &&
+    trades.some((t) => (t.market || "KR").toUpperCase() === "KR") &&
+    trades.some((t) => (t.market || "KR").toUpperCase() === "US");
+
+  const effectiveFilter: "KR" | "US" | null = hasBothMarkets
+    ? (innerTab ?? "KR")
+    : marketFilter;
+
+  const isUs = effectiveFilter === "US";
+  const data = buildSeries(trades, effectiveFilter);
+
   if (data.length < 2) {
     return (
       <p className="text-slate-500 text-sm py-8 text-center">
@@ -48,36 +62,67 @@ export function EquityChart({
       </p>
     );
   }
+
   return (
-    <div className="h-48 sm:h-56 w-full min-w-0">
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-          <XAxis dataKey="t" tick={{ fill: "#64748b", fontSize: 10 }} />
-          <YAxis
-            tick={{ fill: "#64748b", fontSize: 10 }}
-            tickFormatter={(v) =>
-              typeof v === "number" ? v.toLocaleString() : String(v)
-            }
-          />
-          <Tooltip
-            contentStyle={{
-              background: "#0f172a",
-              border: "1px solid #334155",
-              borderRadius: 8,
-            }}
-            labelStyle={{ color: "#94a3b8" }}
-          />
-          <Line
-            type="monotone"
-            dataKey="cum"
-            name="누적 실현손익"
-            stroke="#60a5fa"
-            strokeWidth={2}
-            dot={false}
-          />
-        </LineChart>
-      </ResponsiveContainer>
+    <div className="space-y-2">
+      {hasBothMarkets && (
+        <div className="flex gap-1">
+          {(["KR", "US"] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => setInnerTab(m)}
+              className={`px-2.5 py-1 rounded-lg text-[10px] font-medium border transition-all ${
+                effectiveFilter === m
+                  ? "border-blue-400/60 bg-blue-600/25 text-blue-200"
+                  : "border-white/10 bg-white/5 text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              {m === "KR" ? "🇰🇷 국내" : "🇺🇸 미국"}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="h-48 sm:h-56 w-full min-w-0">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+            <XAxis dataKey="t" tick={{ fill: "#64748b", fontSize: 10 }} />
+            <YAxis
+              tick={{ fill: "#64748b", fontSize: 10 }}
+              tickFormatter={(v) =>
+                typeof v === "number"
+                  ? isUs
+                    ? `$${v.toFixed(0)}`
+                    : v.toLocaleString()
+                  : String(v)
+              }
+            />
+            <Tooltip
+              contentStyle={{
+                background: "#0f172a",
+                border: "1px solid #334155",
+                borderRadius: 8,
+              }}
+              labelStyle={{ color: "#94a3b8" }}
+              formatter={(v) => {
+                const n = typeof v === "number" ? v : 0;
+                return isUs
+                  ? [`$${n.toFixed(2)}`, "누적 실현손익"]
+                  : [`${n.toLocaleString()}원`, "누적 실현손익"];
+              }}
+            />
+            <Line
+              type="monotone"
+              dataKey="cum"
+              name="누적 실현손익"
+              stroke={isUs ? "#a78bfa" : "#60a5fa"}
+              strokeWidth={2}
+              dot={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
     </div>
   );
 }

@@ -4322,14 +4322,13 @@ def _load_any_fallback_ai_cache(
 # ai_provider: "gemini" | "claude" | "both"
 # ══════════════════════════════════════════════════════════
 
-def _get_ai_provider() -> str:
-    """글로벌 ai_config/settings 에서 ai_provider 읽기. 기본값 'gemini'."""
-    try:
-        snap = get_db().collection("ai_config").document("settings").get()
-        if snap.exists:
-            return snap.to_dict().get("ai_provider", "gemini")
-    except Exception as e:
-        logger.warning("[ai_config] ai_provider 읽기 실패: %s", e)
+def _get_ai_provider(cfg: dict | None = None) -> str:
+    """유저별 config 에서 ai_provider 읽기. 기본값 'gemini'.
+    cfg 를 넘기면 Firestore 호출 없이 바로 반환 — 스케줄 사이클에서 사용.
+    """
+    if cfg is not None:
+        v = str(cfg.get("ai_provider", "gemini")).strip().lower()
+        return v if v in ("gemini", "claude", "both") else "gemini"
     return "gemini"
 
 
@@ -4849,9 +4848,10 @@ def _run_ai_session_impl(
         _kr_u_hint = f" ai_universe_mode={cfg.get('ai_universe_mode', 'legacy')}"
     _add_log(uid, "INFO", f"[AI][{market}] 유니버스 {len(stock_data)}종목 수집{_kr_u_hint}")
 
-    # ── ai_provider 토글: claude / both / gemini ──────────────────────────────
-    ai_provider = _get_ai_provider()
+    # ── ai_provider 토글: 유저별 config 에서 읽기 (독립 설정) ─────────────────
+    ai_provider = _get_ai_provider(cfg)
     dk = _research_date_key(market)
+    _add_log(uid, "INFO", f"[AI][{market}] ai_provider={ai_provider}")
 
     # Claude 피크 로드 (provider가 claude 또는 both 일 때)
     claude_candidates: list[str] = []
@@ -5104,12 +5104,20 @@ def _run_ai_session_impl(
             )
             _skip("US점수")
             continue
+        # Claude 피크는 뉴스·테마 촉매 기반 → 기술 점수 아직 덜 올라올 수 있음
+        # ai_provider가 claude 또는 both+Claude 출처인 경우 기준 20% 완화
+        _is_claude_pick = ai_provider == "claude" or (
+            ai_provider == "both" and str(reasons_map.get(code, "")).startswith("[Claude]")
+        )
         min_score_ai_kr = int(cfg.get("min_score_kr", 40))
+        if _is_claude_pick:
+            min_score_ai_kr = max(int(min_score_ai_kr * 0.8), 1)
         if market == "KR" and rec["score"] < min_score_ai_kr:
             _add_log(
                 uid,
                 "INFO",
-                f"[AI][KR][{code}] 점수 미달({rec['score']}/{min_score_ai_kr}, 전략 min_score_kr 동일) — 건너뜀",
+                f"[AI][KR][{code}] 점수 미달({rec['score']}/{min_score_ai_kr}"
+                f"{', Claude완화' if _is_claude_pick else ''}) — 건너뜀",
             )
             _skip("KR점수")
             continue
@@ -6724,6 +6732,8 @@ def route_status():
         except Exception:
             pass
 
+        safe_cfg["ai_provider"] = _get_ai_provider(cfg)  # 유저별 설정 반영
+
         return jsonify({
             "ok": True,
             "state": state, "balance": balance_data,
@@ -7006,19 +7016,13 @@ def route_config():
             updates["ai_universe_kr_min_cap_eok"] = max(0.0, mn)
         except (TypeError, ValueError):
             updates["ai_universe_kr_min_cap_eok"] = 0.0
-    # ai_provider 는 글로벌 설정(ai_config/settings)에 저장 — 전 유저 공유
+    # ai_provider 는 유저별 config 에 저장 — 유저마다 독립 설정 가능
     if "ai_provider" in updates:
-        raw_provider = str(updates.pop("ai_provider", "gemini")).strip().lower()
+        raw_provider = str(updates["ai_provider"]).strip().lower()
         if raw_provider not in ("gemini", "claude", "both"):
-            raw_provider = "gemini"
-        try:
-            get_db().collection("ai_config").document("settings").set(
-                {"ai_provider": raw_provider, "updated_at": datetime.now(KST).isoformat()},
-                merge=True,
-            )
-            _add_log(uid, "INFO", f"[ai_config] ai_provider → {raw_provider}")
-        except Exception as e:
-            logger.warning("[ai_config] 저장 실패: %s", e)
+            updates["ai_provider"] = "gemini"
+        else:
+            updates["ai_provider"] = raw_provider
 
     if updates:
         save_config(uid, updates)

@@ -1,6 +1,5 @@
-# 환경 변수
-/.env
-# functions/.env 는 private 레포이므로 커밋 허용 (다중 PC 개발 환경)
+# 환경 변수 — private 레포이므로 둘 다 커밋 허용 (다중 PC 개발 환경)
+!/.env
 !functions/.env
 
 # Python

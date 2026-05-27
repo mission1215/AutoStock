@@ -19,6 +19,16 @@ import json
 import datetime
 import requests
 from zoneinfo import ZoneInfo
+from pathlib import Path
+
+# 프로젝트 루트 .env 자동 로드
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 KST = ZoneInfo("Asia/Seoul")
 
