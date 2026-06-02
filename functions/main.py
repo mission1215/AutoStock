@@ -7328,11 +7328,8 @@ def route_logs():
         cors_origins="*",
         cors_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     ),
-    # 기본 60s 초과 시 Cloud Run이 502 반환 — AI 유니버스 수집·Gemini·스코어링은 수 분 걸릴 수 있음
     memory=options.MemoryOption.MB_512,
     timeout_sec=540,
-    # 콜드 스타트 제거: 항상 최소 1개 인스턴스 warm 유지 → 첫 진입 지연 3~10초 → 0초
-    min_instances=1,
 )
 def api(req: https_fn.Request) -> https_fn.Response:
     with flask_app.request_context(req.environ):
