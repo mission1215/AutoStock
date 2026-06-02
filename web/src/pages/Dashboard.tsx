@@ -32,7 +32,7 @@ function getPollMs(): number {
   const m = kst.getMinutes();
   const totalMin = h * 60 + m;
   const isMarketHours = totalMin >= 9 * 60 && totalMin < 15 * 60 + 30;
-  return isMarketHours ? 10_000 : 30_000;
+  return isMarketHours ? 30_000 : 60_000;
 }
 const POLL_MS = getPollMs();
 
@@ -107,12 +107,9 @@ export function Dashboard({
       loadStatus();
     }
     prevIdToken.current = idToken;
-    const t = setInterval(() => {
-      loadStatus();
-      loadTrades();
-      loadLogs();
-    }, POLL_MS);
-    return () => clearInterval(t);
+    const t = setInterval(() => { loadStatus(); }, POLL_MS);
+    const t2 = setInterval(() => { loadTrades(); loadLogs(); }, 5 * 60_000);
+    return () => { clearInterval(t); clearInterval(t2); };
   }, [idToken, loadStatus, loadTrades, loadLogs, statusBootstrap]);
 
   async function botControl(action: "start" | "stop" | "resume") {

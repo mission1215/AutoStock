@@ -5719,12 +5719,12 @@ def scheduled_market_open(event: scheduler_fn.ScheduledEvent) -> None:
 
 
 @scheduler_fn.on_schedule(
-    schedule="* * * * *", timezone=scheduler_fn.Timezone("Asia/Seoul"),
+    schedule="*/5 8-16 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
     memory=options.MemoryOption.MB_256,
     timeout_sec=180,
 )
 def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
-    """KR 전략 메인 사이클 — 1분 간격, 평일 09:00~15:20 KST.
+    """KR 전략 메인 사이클 — 5분 간격, 평일 08:00~16:00 KST.
 
     `run_strategy_cycle_kr` 만 호출. 한 사이클 안에서:
       1) 보유 포지션 점검 (백필/본전스탑/분할익절/트레일링/목표·손절/시간청산/물타기)
