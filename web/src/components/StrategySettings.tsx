@@ -98,7 +98,7 @@ export function StrategySettings({
   /** KR 스케줄 AI 입력 유니버스 — US 전략에는 영향 없음 */
   const [aiUniverseMode, setAiUniverseMode] = useState<"legacy" | "dynamic">("legacy");
   /** AI 엔진 — 글로벌(전 유저 공유), ai_config/settings 저장 */
-  const [aiProvider, setAiProvider] = useState<"gemini" | "claude" | "both">("gemini");
+  const [aiProvider, setAiProvider] = useState<"gemini" | "claude" | "cursor" | "both">("gemini");
   /** 계정 공통 — Firestore 최상위 저장(모의/실전과 무관) */
   const [tgEn, setTgEn] = useState(false);
   const [tgChat, setTgChat] = useState("");
@@ -109,7 +109,7 @@ export function StrategySettings({
   function syncAiProviderFromConfig(c: AppConfig | undefined) {
     if (!c) return;
     const p = c.ai_provider;
-    if (p === "claude" || p === "both") setAiProvider(p);
+    if (p === "claude" || p === "both" || p === "cursor") setAiProvider(p);
     else setAiProvider("gemini");
   }
 
@@ -363,16 +363,15 @@ export function StrategySettings({
 
           {/* AI 엔진 선택 */}
           <p className="text-xs text-slate-400 pt-2 border-t border-cyan-500/15">
-            <span className="text-cyan-300 font-medium">AI 추천 엔진</span> — 전 유저 공유 설정입니다.
-            Claude는 <code className="text-[10px] bg-white/5 px-1 rounded">claude_picker.py</code>가
-            매일 사전에 종목을 Push해야 사용 가능합니다.
+            <span className="text-cyan-300 font-medium">AI 추천 엔진</span>
           </p>
           <div className="flex flex-wrap gap-2">
             {(
               [
                 { id: "gemini" as const, label: "Gemini (기본)" },
+                { id: "cursor" as const, label: "Cursor (무료)" },
                 { id: "claude" as const, label: "Claude" },
-                { id: "both" as const, label: "Gemini + Claude 병합" },
+                { id: "both" as const, label: "Gemini + Claude" },
               ] as const
             ).map(({ id, label }) => (
               <button
@@ -393,7 +392,14 @@ export function StrategySettings({
             ))}
           </div>
           <p className="text-[10px] text-slate-500 leading-relaxed">
-            Claude 또는 병합 모드에서 당일 Push된 피크가 없으면 자동으로 Gemini로 폴백됩니다.
+            <strong className="text-slate-400">Cursor</strong>:{" "}
+            <code className="text-[10px] bg-white/5 px-1 rounded">python -m pipeline run --step finalize</code>
+            로 Firebase에 Push된 감시목록을 사용합니다 (Gemini API 비용 없음).
+            당일 Push가 없으면 Gemini로 자동 폴백됩니다.
+            <br />
+            <strong className="text-slate-400">Claude</strong>:{" "}
+            <code className="text-[10px] bg-white/5 px-1 rounded">claude_picker.py</code>
+            가 사전 Push해야 합니다.
           </p>
           <div
             className="mt-3 rounded-lg border border-cyan-500/20 bg-slate-950/40 px-3 py-3 space-y-3"

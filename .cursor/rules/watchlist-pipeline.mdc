@@ -1,0 +1,66 @@
+---
+description: Daily Korean stock watchlist pipeline — Cursor-native LLM scoring workflow
+globs: pipeline/**/*
+alwaysApply: false
+---
+
+# Watchlist Pipeline (Cursor Pro)
+
+## Architecture
+
+```
+Universe → RuleFilter → LLM (Cursor @web) → Validate → Score → Briefing
+```
+
+| Step | Module | Output |
+|------|--------|--------|
+| 1 | `pipeline/universe.py` | `data/universe_YYYYMMDD.parquet` |
+| 2 | `pipeline/rule_filter.py` | `data/filtered_YYYYMMDD.parquet` |
+| 3 | `pipeline/llm_prompt.py` + `expert_signal_scoring.md` | `prompts/cursor_llm_scoring_YYYYMMDD.md` |
+| 4 | `pipeline/validate.py` | — |
+| 5 | `pipeline/scoring.py` | — |
+| 6 | `pipeline/briefing.py` | `output/watchlist_YYYYMMDD.{csv,md}` |
+
+## Daily Workflow
+
+### Automated daily (no Cursor chat)
+```bash
+python -m pipeline run --step daily
+# macOS 평일 08:50 KST:
+./scripts/install_launchd.sh
+```
+- KIS 수집 → RuleFilter → **auto Expert score** → Firebase Push
+- Firebase AI morning: **09:05 KST** (Cursor picks 반영 후 매매)
+
+### Cursor Agent (Expert Signal — zero API cost)
+1. Open `prompts/cursor_llm_scoring_YYYYMMDD.md` (references `expert_signal_scoring.md`)
+2. @web — market_context + per-stock news/flow/earnings
+3. Score L1~L7; output strict JSON with `grade`, `total_score`, `layer_scores`
+4. Save to `data/llm_candidates_YYYYMMDD.json`
+5. STRONG BUY (14+pt) → Firebase Push · BUY (10+) → watchlist CSV/MD
+
+### Finalize (+ Firebase Push)
+```bash
+python -m pipeline run --step finalize
+```
+- `AUTOSTOCK_API_URL` / `AUTOSTOCK_API_SECRET` → `/api/ai/picks` (provider=cursor)
+- 웹 설정 **AI 추천 엔진 = Cursor** 선택 시 감시목록·AI 매매에 반영
+
+## Hard Rules (never bypass)
+
+- R1–R8 in `pipeline/rule_filter.py` are hard gates
+- LLM tickers must exist in today's universe (no hallucinations)
+- Use `rapidfuzz` name match ≥ 0.85
+- No OpenAI/Gemini API calls — Cursor built-in LLM only
+
+## Scoring
+
+```
+composite = technical_score × 0.55 + llm_score × 0.45
+min_composite_score = 0.62 (env: PIPELINE_MIN_SCORE)
+max_watchlist_size = 10
+```
+
+## Env
+
+Requires `.env` with `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO`.

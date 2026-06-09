@@ -57,11 +57,14 @@ def _print_banner() -> None:
     """시작 배너 출력"""
     from config import Config
     mode = "모의투자  [MOCK]" if Config.IS_MOCK else "실전투자  [LIVE] ⚠️"
+    mock_tag = "✓" if Config.profile_configured(mock=True) else "—"
+    live_tag = "✓" if Config.profile_configured(mock=False) else "—"
     print()
     print("╔══════════════════════════════════════════════════════╗")
     print("║          AutoStock — KIS 자동매매 시스템             ║")
     print("║          변동성 돌파 전략 + 리스크 관리               ║")
     print(f"║  투자 모드 : {mode:<38}║")
+    print(f"║  프로필    : 모의[{mock_tag}]  실전[{live_tag}]  (.env KIS_*_*)  ║")
     print(f"║  감시 종목 : {', '.join(Config.WATCHLIST):<38}║")
     print("╚══════════════════════════════════════════════════════╝")
     print()

@@ -2,3 +2,6 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 APScheduler>=3.10.4
 pandas>=2.1.0
+rapidfuzz>=3.6.0
+pyarrow>=14.0.0
+# Optional: pip install pandas-ta (falls back to pure-pandas indicators if missing)

@@ -3696,7 +3696,7 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
             _add_log(uid, "ERROR", f"[KR][{code}] 포지션 체크 오류: {e}")
 
     positions = get_positions(uid, "KR")
-    watchlist = cfg.get("kr_watchlist", [])
+    watchlist = _get_effective_kr_watchlist(cfg)
     diag_parts: list[str] = []
     max_per_sector  = int(cfg.get("max_positions_per_sector", 2))
     sector_exposure = _get_sector_exposure(uid, "KR")
@@ -3863,7 +3863,7 @@ def _merge_ai_universe_kr(cfg: dict) -> list[str]:
     """감시목록 우선 + 대표 풀, 중복 제거, API 부담 상한까지."""
     seen: set[str] = set()
     out: list[str] = []
-    for raw in list(cfg.get("kr_watchlist", [])) + GEMINI_UNIVERSE_KR:
+    for raw in list(_get_effective_kr_watchlist(cfg)) + GEMINI_UNIVERSE_KR:
         s = str(raw).strip()
         if not s.isdigit():
             continue
@@ -4031,7 +4031,7 @@ def _resolve_ai_universe_kr(uid: str, cfg: dict) -> list[str]:
         return _merge_ai_universe_kr(cfg)
     wl_first: list[str] = []
     seen: set[str] = set()
-    for raw in list(cfg.get("kr_watchlist", [])):
+    for raw in list(_get_effective_kr_watchlist(cfg)):
         s = str(raw).strip()
         if not s.isdigit():
             continue
@@ -4319,7 +4319,7 @@ def _load_any_fallback_ai_cache(
 
 # ══════════════════════════════════════════════════════════
 # 공유 AI 피크 캐시 (ai_picks/{date_key}) — 유저 독립, 전체 공유
-# ai_provider: "gemini" | "claude" | "both"
+# ai_provider: "gemini" | "claude" | "cursor" | "both"
 # ══════════════════════════════════════════════════════════
 
 def _get_ai_provider(cfg: dict | None = None) -> str:
@@ -4328,7 +4328,7 @@ def _get_ai_provider(cfg: dict | None = None) -> str:
     """
     if cfg is not None:
         v = str(cfg.get("ai_provider", "gemini")).strip().lower()
-        return v if v in ("gemini", "claude", "both") else "gemini"
+        return v if v in ("gemini", "claude", "cursor", "both") else "gemini"
     return "gemini"
 
 
@@ -4387,6 +4387,30 @@ def _save_shared_ai_picks(
         )
     except Exception as e:
         logger.warning("[shared_picks] 저장 실패: %s", e)
+
+
+def _get_effective_kr_watchlist(cfg: dict, session: str = "morning") -> list[str]:
+    """ai_provider=cursor 일 때 공유 Cursor 피크를 감시목록 앞에 병합."""
+    base = [str(c).strip() for c in (cfg.get("kr_watchlist") or []) if str(c).strip()]
+    if _get_ai_provider(cfg) != "cursor":
+        return base
+    dk = _research_date_key("KR")
+    hit = _load_shared_ai_picks("cursor", "KR", session, dk)
+    if not hit or not hit[0]:
+        return base
+    cursor_codes, _ = hit
+    seen: set[str] = set()
+    merged: list[str] = []
+    for raw in list(cursor_codes) + base:
+        s = str(raw).strip()
+        if not s.isdigit():
+            continue
+        c = s.zfill(6)
+        if c in seen:
+            continue
+        seen.add(c)
+        merged.append(c)
+    return merged
 
 
 def _research_fallback_response(uid: str, market: str, dk: str, quota: bool, detail: str = "") -> dict:
@@ -4853,9 +4877,11 @@ def _run_ai_session_impl(
     dk = _research_date_key(market)
     _add_log(uid, "INFO", f"[AI][{market}] ai_provider={ai_provider}")
 
-    # Claude 피크 로드 (provider가 claude 또는 both 일 때)
+    # Claude / Cursor 피크 로드 (provider가 claude·cursor 또는 both 일 때)
     claude_candidates: list[str] = []
     claude_reasons: dict[str, str] = {}
+    cursor_candidates: list[str] = []
+    cursor_reasons: dict[str, str] = {}
     if ai_provider in ("claude", "both"):
         shared_claude = _load_shared_ai_picks("claude", market, session, dk)
         if shared_claude and shared_claude[0]:
@@ -4864,6 +4890,14 @@ def _run_ai_session_impl(
         elif ai_provider == "claude":
             _add_log(uid, "WARNING", f"[Claude] 공유 피크 없음 ({market}/{session}) — Gemini 폴백")
             ai_provider = "gemini"  # 클로드 데이터 없으면 Gemini로 자동 폴백
+    if ai_provider == "cursor":
+        shared_cursor = _load_shared_ai_picks("cursor", market, session, dk)
+        if shared_cursor and shared_cursor[0]:
+            cursor_candidates, cursor_reasons = shared_cursor
+            _add_log(uid, "INFO", f"[Cursor] 공유 피크 로드 {len(cursor_candidates)}종목 ({market}/{session})")
+        else:
+            _add_log(uid, "WARNING", f"[Cursor] 공유 피크 없음 ({market}/{session}) — Gemini 폴백")
+            ai_provider = "gemini"
 
     # ── RuleFilter: 기술적 조건 미충족 종목을 Gemini 호출 전 제거 ──
     stock_data, removed_cnt = _rule_filter_stock_data(stock_data, market)
@@ -4876,6 +4910,9 @@ def _run_ai_session_impl(
             # Claude 피크만 사용: Gemini API 호출 없음
             candidate_codes = claude_candidates
             reasons_map = claude_reasons
+        elif ai_provider == "cursor":
+            candidate_codes = cursor_candidates
+            reasons_map = cursor_reasons
         else:
             # gemini 또는 both: 기존 Gemini 호출
             candidate_codes, reasons_map = query_gemini_candidates(uid, stock_data, session, market)
@@ -5104,20 +5141,19 @@ def _run_ai_session_impl(
             )
             _skip("US점수")
             continue
-        # Claude 피크는 뉴스·테마 촉매 기반 → 기술 점수 아직 덜 올라올 수 있음
-        # ai_provider가 claude 또는 both+Claude 출처인 경우 기준 20% 완화
-        _is_claude_pick = ai_provider == "claude" or (
-            ai_provider == "both" and str(reasons_map.get(code, "")).startswith("[Claude]")
+        # Claude/Cursor 피크는 뉴스·테마 촉매 기반 → 기술 점수 아직 덜 올라올 수 있음
+        _is_external_pick = ai_provider in ("claude", "cursor") or (
+            ai_provider == "both" and str(reasons_map.get(code, "")).startswith(("[Claude]", "[Cursor]"))
         )
         min_score_ai_kr = int(cfg.get("min_score_kr", 40))
-        if _is_claude_pick:
+        if _is_external_pick:
             min_score_ai_kr = max(int(min_score_ai_kr * 0.8), 1)
         if market == "KR" and rec["score"] < min_score_ai_kr:
             _add_log(
                 uid,
                 "INFO",
                 f"[AI][KR][{code}] 점수 미달({rec['score']}/{min_score_ai_kr}"
-                f"{', Claude완화' if _is_claude_pick else ''}) — 건너뜀",
+                f"{', 외부피크완화' if _is_external_pick else ''}) — 건너뜀",
             )
             _skip("KR점수")
             continue
@@ -5885,10 +5921,11 @@ def scheduled_reconcile_us(event: scheduler_fn.ScheduledEvent) -> None:
 
 
 @scheduler_fn.on_schedule(
-    schedule="30 9 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
+    schedule="5 9 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
     memory=options.MemoryOption.MB_512,
 )
 def scheduled_ai_morning(event: scheduler_fn.ScheduledEvent) -> None:
+    """09:05 KST — 8:50 로컬 파이프라인 Push 후 장 시작 AI 매매."""
     for uid, cfg in _get_all_users():
         try:
             run_ai_session(uid, cfg, "morning")
@@ -6561,7 +6598,7 @@ def route_status():
 
         # 감시 종목 데이터 (KR)
         watchlist_data: dict[str, Any] = {}
-        for raw_code in cfg.get("kr_watchlist", []):
+        for raw_code in _get_effective_kr_watchlist(cfg):
             code = _normalize_kr_stock_code(raw_code)
             if code in positions_kr_detail:
                 p = positions_kr_detail[code]
@@ -7019,7 +7056,7 @@ def route_config():
     # ai_provider 는 유저별 config 에 저장 — 유저마다 독립 설정 가능
     if "ai_provider" in updates:
         raw_provider = str(updates["ai_provider"]).strip().lower()
-        if raw_provider not in ("gemini", "claude", "both"):
+        if raw_provider not in ("gemini", "claude", "cursor", "both"):
             updates["ai_provider"] = "gemini"
         else:
             updates["ai_provider"] = raw_provider
@@ -7034,11 +7071,11 @@ def route_config():
 @flask_app.route("/api/ai/picks", methods=["POST"])
 def route_ai_picks():
     """
-    Claude Cowork 스케줄러가 매일 아침 종목 추천 결과를 push하는 엔드포인트.
+    Claude Cowork / Cursor 파이프라인이 매일 아침 종목 추천 결과를 push하는 엔드포인트.
 
     인증: Firebase Bearer 토큰 (일반 유저) 또는 헤더 X-AI-Picks-Secret (환경변수 AI_PICKS_SECRET)
     Body: {
-        "provider": "claude",          # 필수
+        "provider": "claude" | "cursor",   # 필수
         "market":   "KR",              # 필수: KR | US
         "session":  "morning",         # 필수: morning | afternoon | late
         "candidates": [                # 필수: 종목 리스트

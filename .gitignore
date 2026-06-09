@@ -38,3 +38,12 @@ logs/
 
 # Claude Code 로컬 설정
 .claude/
+
+# Watchlist pipeline artifacts
+data/*.parquet
+data/*.json
+data/*.log
+output/*.csv
+output/*.md
+!data/.gitkeep
+!output/.gitkeep
