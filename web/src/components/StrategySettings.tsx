@@ -103,6 +103,8 @@ export function StrategySettings({
   const [tgEn, setTgEn] = useState(false);
   const [tgChat, setTgChat] = useState("");
   const [tgThread, setTgThread] = useState("");
+  const [tgTesting, setTgTesting] = useState(false);
+  const [tgTestMsg, setTgTestMsg] = useState("");
 
   const profilesStr = useMemo(() => (profiles ? JSON.stringify(profiles) : ""), [profiles]);
 
@@ -115,7 +117,8 @@ export function StrategySettings({
 
   function syncTelegramFromConfig(c: AppConfig | undefined) {
     if (!c) return;
-    setTgEn(c.telegram_enabled === true);
+    const en = c.telegram_enabled;
+    setTgEn(en === true || en === "true" || en === 1);
     setTgChat((c.telegram_chat_id != null ? String(c.telegram_chat_id) : "").trim());
     setTgThread((c.telegram_message_thread_id != null ? String(c.telegram_message_thread_id) : "").trim());
   }
@@ -274,6 +277,31 @@ export function StrategySettings({
       setMsg("❌ " + (e instanceof Error ? e.message : "오류"));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function testTelegram() {
+    if (!tgEn || !tgChat.trim()) {
+      setTgTestMsg("❌ 알림을 켜고 chat_id를 입력한 뒤 저장하세요.");
+      return;
+    }
+    setTgTesting(true);
+    setTgTestMsg("");
+    try {
+      const data = await apiFetch<{ ok: boolean; message?: string; error?: string }>(
+        "/api/config/telegram-test",
+        { method: "POST", idToken },
+      );
+      if (data.ok) {
+        setTgTestMsg("✅ " + (data.message || "테스트 메시지 전송됨"));
+      } else {
+        setTgTestMsg("❌ " + (data.error || "전송 실패"));
+      }
+    } catch (e: unknown) {
+      setTgTestMsg("❌ " + (e instanceof Error ? e.message : "전송 실패"));
+    } finally {
+      setTgTesting(false);
+      setTimeout(() => setTgTestMsg(""), 8000);
     }
   }
 
@@ -706,6 +734,20 @@ export function StrategySettings({
                 disabled={!tgEn}
               />
             </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={tgTesting || !tgEn || !tgChat.trim()}
+              onClick={testTelegram}
+              className="px-3 py-2 rounded-lg text-xs font-medium border border-emerald-500/40 bg-emerald-600/20 text-emerald-100 disabled:opacity-40"
+            >
+              {tgTesting ? "전송 중…" : "테스트 전송"}
+            </button>
+            <span className="text-[10px] text-slate-500">
+              저장 후 누르세요. 봇에게 /start 가 필요합니다.
+            </span>
+            {tgTestMsg && <span className="text-xs text-slate-300">{tgTestMsg}</span>}
           </div>
         </div>
 

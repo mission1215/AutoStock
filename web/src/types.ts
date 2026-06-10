@@ -93,7 +93,7 @@ export interface AppConfig {
   /** AI 추천 엔진 — gemini | claude | cursor | both */
   ai_provider?: "gemini" | "claude" | "cursor" | "both";
   /** 텔레그램 매매·모니터링 알림(서버에 봇 토큰 1벌, chat_id 는 계정별) */
-  telegram_enabled?: boolean;
+  telegram_enabled?: boolean | string | number;
   telegram_chat_id?: string;
   /** 포럼(토픽) 방일 때만 */
   telegram_message_thread_id?: string;

@@ -1729,6 +1729,13 @@ def _telegram_creds() -> tuple[str, str]:
     return _telegram_bot_token(), _telegram_env_chat_and_thread()[0]
 
 
+def _config_truthy(val) -> bool:
+    """Firestore·JSON에서 telegram_enabled 등 불리언 필드 해석."""
+    if isinstance(val, str):
+        return val.strip().lower() not in ("false", "0", "", "no")
+    return bool(val)
+
+
 def _telegram_resolve_dest(
     uid: str | None,
     *,
@@ -1740,10 +1747,7 @@ def _telegram_resolve_dest(
         return env_chat, env_thread
     if uid is not None:
         raw = get_config_raw(uid)
-        u_on = raw.get("telegram_enabled", False)
-        if isinstance(u_on, str):
-            u_on = str(u_on).lower() not in ("false", "0", "", "no")
-        u_on = bool(u_on)
+        u_on = _config_truthy(raw.get("telegram_enabled", False))
         u_chat = str(raw.get("telegram_chat_id") or "").strip()
         u_thr = str(raw.get("telegram_message_thread_id") or "").strip()
         if u_on and u_chat:
@@ -1751,14 +1755,14 @@ def _telegram_resolve_dest(
     return env_chat, env_thread
 
 
-def _send_telegram(
+def _send_telegram_ex(
     text: str,
     *,
     uid: str | None = None,
     force_env_only: bool = False,
     parse_mode: str | None = "HTML",
     log_if_unconfigured: bool = True,
-) -> bool:
+) -> tuple[bool, str]:
     """텔레그램 Bot API sendMessage.
 
     - uid 가 있으면: 해당 유저가 `telegram_enabled`+`telegram_chat_id` 를 쓴 경우 그 채팅으로,
@@ -1768,13 +1772,19 @@ def _send_telegram(
     """
     token = _telegram_bot_token()
     chat_id, thread = _telegram_resolve_dest(uid, force_env_only=force_env_only)
-    if not token or not chat_id:
+    if not token:
+        msg = "서버 TELEGRAM_BOT_TOKEN 미설정"
         if log_if_unconfigured:
-            logger.warning(
-                "[Telegram] 미설정 — 서버에 TELEGRAM_BOT_TOKEN, "
-                "그리고 유저 chat_id(설정) 또는 TELEGRAM_CHAT_ID(env)"
-            )
-        return False
+            logger.warning("[Telegram] %s", msg)
+        return False, msg
+    if not chat_id:
+        msg = (
+            "chat_id 없음 — 전략 설정에서 텔레그램 알림+chat_id 저장, "
+            "또는 서버 TELEGRAM_CHAT_ID(env)"
+        )
+        if log_if_unconfigured:
+            logger.warning("[Telegram] %s", msg)
+        return False, msg
     if len(text) > 4090:
         text = text[:4087] + "\n…"
 
@@ -1792,7 +1802,7 @@ def _send_telegram(
         try:
             resp = http_requests.post(url, json=payload, timeout=15)
             if resp.status_code == 200:
-                return True
+                return True, ""
             if resp.status_code == 429 and attempt < 2:
                 ra = int(resp.headers.get("Retry-After", "1") or 1)
                 time_module.sleep(min(max(ra, 1), 10))
@@ -1800,19 +1810,45 @@ def _send_telegram(
             if resp.status_code >= 500 and attempt < 2:
                 time_module.sleep(0.4 * (attempt + 1))
                 continue
+            err_body = (resp.text or "")[:500]
+            err_msg = f"HTTP {resp.status_code}: {err_body}"
             logger.error(
-                "[Telegram] sendMessage HTTP %s: %s",
-                resp.status_code,
-                (resp.text or "")[:500],
+                "[Telegram] sendMessage uid=%s chat=%s… %s",
+                (uid or "")[:8],
+                str(chat_id)[:6],
+                err_msg,
             )
-            return False
+            hint = ""
+            if resp.status_code == 403:
+                hint = " — 봇에게 /start 를 보냈는지 확인하세요."
+            elif resp.status_code == 400:
+                hint = " — chat_id·토픽 ID가 맞는지 확인하세요."
+            return False, err_msg + hint
         except Exception as e:
             if attempt < 2:
                 time_module.sleep(0.3 * (attempt + 1))
                 continue
-            logger.error("[Telegram] 전송 실패: %s", e)
-            return False
-    return False
+            logger.error("[Telegram] 전송 실패 uid=%s: %s", (uid or "")[:8], e)
+            return False, str(e)
+    return False, "전송 재시도 초과"
+
+
+def _send_telegram(
+    text: str,
+    *,
+    uid: str | None = None,
+    force_env_only: bool = False,
+    parse_mode: str | None = "HTML",
+    log_if_unconfigured: bool = True,
+) -> bool:
+    ok, _ = _send_telegram_ex(
+        text,
+        uid=uid,
+        force_env_only=force_env_only,
+        parse_mode=parse_mode,
+        log_if_unconfigured=log_if_unconfigured,
+    )
+    return ok
 
 
 _telegram_trade_missed_config_logged: bool = False
@@ -6112,10 +6148,7 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
         if _telegram_monitoring_skip_kr_only_off_market(cfg):
             continue
         raw = get_config_raw(uid)
-        te = raw.get("telegram_enabled", False)
-        if isinstance(te, str):
-            te = te.strip().lower() not in ("false", "0", "", "no")
-        if not te:
+        if not _config_truthy(raw.get("telegram_enabled", False)):
             continue
         chat_id = str(raw.get("telegram_chat_id") or "").strip()
         if not chat_id:
@@ -6138,9 +6171,15 @@ def scheduled_telegram_monitoring(event: scheduler_fn.ScheduledEvent) -> None:
                 f"\n"
                 f"⏰ 다음: 1시간 후"
             )
-            if _send_telegram(personal, uid=uid, parse_mode=None, log_if_unconfigured=False):
+            ok, err = _send_telegram_ex(
+                personal, uid=uid, parse_mode=None, log_if_unconfigured=False,
+            )
+            if ok:
                 sent = True
-        except Exception:
+            elif err:
+                logger.warning("[Telegram] 모니터링 uid=%s… 실패: %s", uid[:8], err)
+        except Exception as exc:
+            logger.warning("[Telegram] 모니터링 uid=%s…: %s", uid[:8], exc)
             continue
 
     if not sent and not kr_only_all_off_market:
@@ -6953,6 +6992,12 @@ def route_config():
         raw_cfg = get_config_raw(uid)
         profiles_payload = _profiles_for_client_payload(raw_cfg)
         safe = {k: v for k, v in cfg.items() if k not in ("app_key", "app_secret")}
+        tg_chat = str(raw_cfg.get("telegram_chat_id") or "").strip()
+        safe["telegram_enabled"] = _config_truthy(raw_cfg.get("telegram_enabled", False))
+        if tg_chat:
+            safe["telegram_chat_id"] = tg_chat
+        if raw_cfg.get("telegram_message_thread_id"):
+            safe["telegram_message_thread_id"] = str(raw_cfg.get("telegram_message_thread_id") or "").strip()
         return jsonify({"ok": True, "config": safe, "profiles": profiles_payload})
     body = request.get_json() or {}
     allowed = {"is_mock", "kr_watchlist", "us_watchlist", "k_factor", "ma_period",
@@ -7065,6 +7110,39 @@ def route_config():
         save_config(uid, updates)
         _add_log(uid, "INFO", f"설정 변경: {list(updates.keys())}")
     return jsonify({"ok": True, "updated": updates})
+
+
+@flask_app.route("/api/config/telegram-test", methods=["POST"])
+def route_telegram_test():
+    """저장된 유저 chat_id로 테스트 메시지 1건 전송 (env 폴백 없음)."""
+    uid, err = _require_auth()
+    if err:
+        return err
+    raw = get_config_raw(uid)
+    if not _config_truthy(raw.get("telegram_enabled", False)):
+        return jsonify({
+            "ok": False,
+            "error": "텔레그램 알림이 꺼져 있습니다. 전략 설정에서 켠 뒤 저장하세요.",
+        }), 400
+    chat_id = str(raw.get("telegram_chat_id") or "").strip()
+    if not chat_id:
+        return jsonify({
+            "ok": False,
+            "error": "chat_id가 비어 있습니다. 저장 후 다시 시도하세요.",
+        }), 400
+    ok, detail = _send_telegram_ex(
+        "[AutoStock] 텔레그램 테스트 — 이 메시지가 보이면 설정이 정상입니다.",
+        uid=uid,
+        parse_mode=None,
+        log_if_unconfigured=False,
+    )
+    if ok:
+        tail = chat_id[-4:] if len(chat_id) >= 4 else chat_id
+        return jsonify({
+            "ok": True,
+            "message": f"전송 성공 (chat_id …{tail})",
+        })
+    return jsonify({"ok": False, "error": detail or "전송 실패"}), 502
 
 
 # ── Claude 스케줄러 → 공유 AI 피크 수신 엔드포인트 ──────────────────────────────
