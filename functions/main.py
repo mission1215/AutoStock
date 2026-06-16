@@ -4918,20 +4918,20 @@ def _run_ai_session_impl(
     claude_reasons: dict[str, str] = {}
     cursor_candidates: list[str] = []
     cursor_reasons: dict[str, str] = {}
-    if ai_provider in ("claude", "both"):
+    if ai_provider in ("claude", "cursor", "both"):
         shared_claude = _load_shared_ai_picks("claude", market, session, dk)
         if shared_claude and shared_claude[0]:
             claude_candidates, claude_reasons = shared_claude
             _add_log(uid, "INFO", f"[Claude] 공유 피크 로드 {len(claude_candidates)}종목 ({market}/{session})")
         elif ai_provider == "claude":
             _add_log(uid, "WARNING", f"[Claude] 공유 피크 없음 ({market}/{session}) — Gemini 폴백")
-            ai_provider = "gemini"  # 클로드 데이터 없으면 Gemini로 자동 폴백
-    if ai_provider == "cursor":
+            ai_provider = "gemini"  # 레거시 claude 데이터 없으면 Gemini로 폴백
+    if ai_provider in ("cursor", "both"):
         shared_cursor = _load_shared_ai_picks("cursor", market, session, dk)
         if shared_cursor and shared_cursor[0]:
             cursor_candidates, cursor_reasons = shared_cursor
             _add_log(uid, "INFO", f"[Cursor] 공유 피크 로드 {len(cursor_candidates)}종목 ({market}/{session})")
-        else:
+        elif ai_provider == "cursor":
             _add_log(uid, "WARNING", f"[Cursor] 공유 피크 없음 ({market}/{session}) — Gemini 폴백")
             ai_provider = "gemini"
 
@@ -4952,15 +4952,26 @@ def _run_ai_session_impl(
         else:
             # gemini 또는 both: 기존 Gemini 호출
             candidate_codes, reasons_map = query_gemini_candidates(uid, stock_data, session, market)
-            # both 모드: Claude 피크도 병합 (Gemini 우선, Claude 보완)
-            if ai_provider == "both" and claude_candidates:
+            # both 모드: Gemini 후보 + Cursor 피크 병합 (레거시 Claude 피크도 보완)
+            if ai_provider == "both":
                 existing = set(candidate_codes)
+                merged = 0
+                for c in cursor_candidates:
+                    if c not in existing:
+                        candidate_codes.append(c)
+                        existing.add(c)
+                        merged += 1
+                        if c in cursor_reasons:
+                            reasons_map[c] = f"[Cursor] {cursor_reasons[c]}"
                 for c in claude_candidates:
                     if c not in existing:
                         candidate_codes.append(c)
+                        existing.add(c)
+                        merged += 1
                         if c in claude_reasons:
                             reasons_map[c] = f"[Claude] {claude_reasons[c]}"
-                _add_log(uid, "INFO", f"[both] Gemini+Claude 병합 후보 {len(candidate_codes)}종목")
+                if merged:
+                    _add_log(uid, "INFO", f"[both] Gemini+Cursor 병합 후보 {len(candidate_codes)}종목 (+{merged})")
     except Exception as _dummy_exc:
         e = _dummy_exc
         if _is_gemini_quota_error(e):
