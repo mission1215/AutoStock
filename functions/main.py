@@ -99,6 +99,13 @@ ET  = ZoneInfo("America/New_York")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── OHLCV 인메모리 캐시 ─────────────────────────────────────────────────────
+# OHLCV는 일봉 데이터 — 10분 이내 다시 불러도 값이 사실상 같음.
+# Cloud Run 컨테이너 인스턴스가 살아 있는 동안(warm) 재사용 → KIS API 호출 90% 감소.
+# → GCP 아웃바운드 네트워크 비용·KIS TPS 소비 대폭 절감.
+_ohlcv_cache: dict[str, tuple[float, list]] = {}   # key → (fetch_ts, data)
+_OHLCV_TTL   = 600   # 10분
+
 # functions/.env — 로컬·배포 패키지에 포함될 때 텔레그램·Gemini 키 등 주입 (kis_ws.py 와 동일)
 _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.is_file():
@@ -1218,12 +1225,18 @@ def _kr_ohlcv_fallback_from_inquire_price(uid: str, cfg: dict, stock_code: str) 
 
 def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
     """일봉 FHKST01010400. 실서버·모의 VTS·마지막으로 현재가 합성 순으로 충전.
+    인메모리 캐시 10분 적용 — OHLCV는 일봉이므로 10분 old 값 사용에 매매 영향 없음.
 
     - 실서버+`get_token_real`: 실전/일부 키에서 `output2` 정상
     - 모의 VTS+`get_token`: 일부 환경에서만 일봉 있음
     - 모의 앱키로 실서버 일봉이 비는 경우 다수 → `FHKST01010100`로 합성(전략 동작)
     - KOSPI+`Q` 등 INVALID FID 는 스킵(기존)
     """
+    _ck = f"KR:{stock_code}"
+    _now = time_module.time()
+    if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck][0] < _OHLCV_TTL:
+        return _ohlcv_cache[_ck][1]
+
     last_exc: BaseException | None = None
     for attempt in range(4):
         try:
@@ -1297,7 +1310,9 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
                     stock_code,
                     len(best),
                 )
+                _ohlcv_cache[_ck] = (time_module.time(), syn)
                 return syn
+            _ohlcv_cache[_ck] = (time_module.time(), best)
             return best
         except ApiError as e:
             last_exc = e
@@ -1436,7 +1451,13 @@ def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
 
 
 def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
-    """미국 주식 일봉 — get_current_price_us와 동일 호스트/인증."""
+    """미국 주식 일봉 — get_current_price_us와 동일 호스트/인증.
+    인메모리 캐시 10분 적용."""
+    _ck = f"US:{stock_code}"
+    _now = time_module.time()
+    if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck][0] < _OHLCV_TTL:
+        return _ohlcv_cache[_ck][1]
+
     last_exc: BaseException | None = None
     for attempt in range(4):
         try:
@@ -1450,7 +1471,9 @@ def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
                 },
                 timeout=10,
             )
-            return _parse(resp, uid, cfg).get("output2", [])
+            data = _parse(resp, uid, cfg).get("output2", [])
+            _ohlcv_cache[_ck] = (time_module.time(), data)
+            return data
         except ApiError as e:
             last_exc = e
             if attempt < 3 and _is_kis_tps_exceeded(e):
@@ -5829,100 +5852,154 @@ def _purge_old_docs(uid: str, collection_name: str, days: int) -> int:
     return deleted
 
 
-@scheduler_fn.on_schedule(
-    schedule="10 3 * * *", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_cleanup_history(event: scheduler_fn.ScheduledEvent) -> None:
-    """
-    데이터 보존정리:
-    - logs: 14일
-    - recommendations: 30일
-    - trades: 180일
-    """
-    for uid, _ in _get_all_users():
-        try:
-            logs_deleted = _purge_old_docs(uid, "logs", 14)
-            recs_deleted = _purge_old_docs(uid, "recommendations", 30)
-            trades_deleted = _purge_old_docs(uid, "trades", 180)
-            if logs_deleted or recs_deleted or trades_deleted:
-                logger.info(
-                    "[%s] cleanup done logs=%d recs=%d trades=%d",
-                    uid[:8], logs_deleted, recs_deleted, trades_deleted
-                )
-        except Exception as e:
-            logger.error("[%s] cleanup failed: %s", uid[:8], e)
-
+# ══════════════════════════════════════════════════════════
+# KR 마스터 사이클 — 1개 Cloud Scheduler 잡으로 KR 전 작업 수행
+# ══════════════════════════════════════════════════════════
+# Cloud Scheduler 무료 티어: 3개. 잡 수를 줄여 월 비용 $0 유지.
+# 이 함수 하나가 아래 구 함수들을 모두 대체:
+#   scheduled_cleanup_history / scheduled_prepare / scheduled_market_open
+#   scheduled_close_positions / scheduled_close_positions_retry
+#   scheduled_market_close / scheduled_reconcile_kr
+#   scheduled_ai_morning / scheduled_ai_afternoon / scheduled_ai_late
 
 @scheduler_fn.on_schedule(
-    schedule="50 8 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_prepare(event: scheduler_fn.ScheduledEvent) -> None:
-    for uid, cfg in _get_all_users():
-        try:
-            # 전날 로그 정리 (오늘 날짜 기준 2일 이전 삭제 → 로그 무한 누적 방지)
-            cutoff = datetime.now(KST) - timedelta(days=2)
-            old_logs = list(
-                _uref(uid).collection("logs")
-                .where("timestamp", "<", cutoff)
-                .limit(500)
-                .stream()
-            )
-            for doc in old_logs:
-                doc.reference.delete()
-
-            invalidate_token(uid)
-            get_token(uid, cfg)
-            equity = _get_total_equity_kr(uid, cfg)
-            update_bot_state(uid, {
-                "trading_halted": False, "halt_reason": "",
-                "realized_pnl": 0.0,
-                "start_equity": equity, "peak_equity": equity,
-                "today": date.today().isoformat(),
-            })
-            _add_log(uid, "INFO", f"[08:50] 준비 완료 | 기준자산={equity:,.0f}원 | 로그초기화완료")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"[08:50] 초기화 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="0 9 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_market_open(event: scheduler_fn.ScheduledEvent) -> None:
-    for uid, cfg in _get_all_users():
-        update_bot_state(uid, {"is_market_open": True})
-        _add_log(uid, "INFO", f"[09:00] 장 시작 | {'모의' if cfg.get('is_mock') else '실전'}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="* 9-15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
-    timeout_sec=180,
+    schedule="* 8-15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=540,
 )
 def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
-    """KR 전략 메인 사이클 — 1분 간격, 평일 09:00~15:59 KST.
-    변동성 돌파 전략은 진입 타이밍이 핵심 — 5분 지연은 슬리피지 손실로 직결됨.
+    """KR 마스터 사이클 — 매분 평일 08:00~15:59 KST.
 
-    `run_strategy_cycle_kr` 만 호출. 한 사이클 안에서:
-      1) 보유 포지션 점검 (백필/본전스탑/분할익절/트레일링/목표·손절/시간청산/물타기)
-      2) 진입 게이트 (블랙아웃 → 일간 P&L → KOSPI 레짐) 통과 시 신규 매수 스캔
-    예외는 유저 단위로 격리 (한 유저 오류가 다른 유저를 막지 않음).
+    시각별 수행 작업:
+      08:50  장 전 준비 (토큰 갱신·로그 초기화·기준자산 스냅샷)
+      09:00  장 시작 마킹 + 주간 데이터 정리
+      09:05  AI 오전 세션 (Gemini/Cursor)
+      09:15·09:45·10:15·10:45·…  KR reconcile (30분 간격)
+      13:00  AI 오후 세션
+      14:30  AI 마감 세션 (구: 15:30 → 청산 전 충분한 시간 확보)
+      15:20  장 마감 청산
+      15:25  청산 재시도 (미청산 포지션)
+      15:31  장 마감 마킹
+      매분   전략 사이클 (09:00~15:19)
     """
     now = datetime.now(KST)
-    if now.weekday() >= 5: return
+    if now.weekday() >= 5:
+        return
+    h, m = now.hour, now.minute
+    all_users = list(_get_all_users())
+
+    # 08:50 — 장 전 준비 (토큰 갱신, 상태 초기화)
+    if h == 8 and m == 50:
+        for uid, cfg in all_users:
+            try:
+                cutoff = now - timedelta(days=2)
+                old_logs = list(
+                    _uref(uid).collection("logs").where("timestamp", "<", cutoff).limit(500).stream()
+                )
+                for doc in old_logs:
+                    doc.reference.delete()
+                invalidate_token(uid)
+                get_token(uid, cfg)
+                equity = _get_total_equity_kr(uid, cfg)
+                update_bot_state(uid, {
+                    "trading_halted": False, "halt_reason": "",
+                    "realized_pnl": 0.0,
+                    "start_equity": equity, "peak_equity": equity,
+                    "today": date.today().isoformat(),
+                })
+                _add_log(uid, "INFO", f"[08:50] 준비 완료 | 기준자산={equity:,.0f}원 | 로그초기화완료")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"[08:50] 초기화 오류: {e}")
+        return  # 장 전이므로 전략 사이클 진행 안 함
+
+    # 09:00 — 장 시작 마킹 + 데이터 보존 정리 (주 1회 이상 수행 보장)
+    if h == 9 and m == 0:
+        for uid, _ in all_users:
+            update_bot_state(uid, {"is_market_open": True})
+            _add_log(uid, "INFO", f"[09:00] 장 시작")
+        for uid, _ in all_users:
+            try:
+                ld = _purge_old_docs(uid, "logs", 14)
+                rd = _purge_old_docs(uid, "recommendations", 30)
+                td = _purge_old_docs(uid, "trades", 180)
+                if ld or rd or td:
+                    logger.info("[%s] cleanup done logs=%d recs=%d trades=%d", uid[:8], ld, rd, td)
+            except Exception as e:
+                logger.error("[%s] cleanup failed: %s", uid[:8], e)
+
+    # 09:05 — AI 오전 세션
+    if h == 9 and m == 5:
+        for uid, cfg in all_users:
+            try:
+                run_ai_session(uid, cfg, "morning")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"AI 오전 오류: {e}")
+
+    # 13:00 — AI 오후 세션
+    if h == 13 and m == 0:
+        for uid, cfg in all_users:
+            try:
+                run_ai_session(uid, cfg, "afternoon")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"AI 오후 오류: {e}")
+
+    # 14:30 — AI 마감 세션 (15:20 청산 전 충분한 여유 확보)
+    if h == 14 and m == 30:
+        for uid, cfg in all_users:
+            try:
+                run_ai_session(uid, cfg, "late")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"AI 마감 오류: {e}")
+
+    # KR reconcile — 09:15·09:45·10:15·10:45·… (30분 간격, 09:15~15:15)
+    if m in (15, 45) and (
+        (h == 9 and m >= 15) or (10 <= h <= 14) or (h == 15 and m == 15)
+    ):
+        for uid, cfg in all_users:
+            if not cfg.get("reconcile_enabled", True):
+                continue
+            try:
+                reconcile_positions(uid, cfg, "KR")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"[reconcile][KR] 사이클 오류: {e}")
+
+    # 15:20 — 장 마감 청산
+    if h == 15 and m == 20:
+        for uid, cfg in all_users:
+            if _scope_allows_kr(cfg):
+                _close_all_kr_positions(uid, cfg, "장마감_청산")
+        return
+
+    # 15:25 — 청산 재시도
+    if h == 15 and m == 25:
+        for uid, cfg in all_users:
+            if not _scope_allows_kr(cfg):
+                continue
+            remaining = get_positions(uid, "KR")
+            if not remaining:
+                continue
+            _add_log(uid, "WARNING", f"[KR] 15:25 청산 재시도 — 미청산 {len(remaining)}종목: {list(remaining.keys())}")
+            _close_all_kr_positions(uid, cfg, "장마감_재청산")
+        return
+
+    # 15:31 — 장 마감 마킹
+    if h == 15 and m == 31:
+        for uid, _ in all_users:
+            update_bot_state(uid, {"is_market_open": False})
+            _add_log(uid, "INFO", "[15:31] 장 마감")
+        return
+
+    # 매분 — KR 전략 사이클 (09:00~15:19)
     market_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=20, second=0, microsecond=0)
-    if not (market_start <= now <= market_end): return
-    all_users = _get_all_users()
-    for uid, cfg in all_users:
-        try:
-            run_strategy_cycle_kr(uid, cfg)
-        except Exception as e:
-            _add_log(uid, "ERROR", f"전략 사이클 오류: {e}")
-    if now.minute % 5 == 0:
-        logging.info(f"[scheduled_strategy_cycle] heartbeat users={len(all_users)} {now.strftime('%H:%M')}")
+    market_end   = now.replace(hour=15, minute=20, second=0, microsecond=0)
+    if market_start <= now < market_end:
+        for uid, cfg in all_users:
+            try:
+                run_strategy_cycle_kr(uid, cfg)
+            except Exception as e:
+                _add_log(uid, "ERROR", f"전략 사이클 오류: {e}")
+        if m % 5 == 0:
+            logging.info(f"[kr_cycle] heartbeat users={len(all_users)} {now.strftime('%H:%M')}")
 
 
 def _close_all_kr_positions(uid: str, cfg: dict, label: str) -> int:
@@ -5967,230 +6044,109 @@ def _close_all_kr_positions(uid: str, cfg: dict, label: str) -> int:
     return closed
 
 
-@scheduler_fn.on_schedule(
-    schedule="20 15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
-    """KR 장 마감 직전(15:20 KST) 보유 포지션 전량 청산."""
-    for uid, cfg in _get_all_users():
-        if not _scope_allows_kr(cfg):
-            continue
-        _close_all_kr_positions(uid, cfg, "장마감_청산")
-
+# ══════════════════════════════════════════════════════════
+# US 마스터 사이클 — 1개 Cloud Scheduler 잡으로 US 전 작업 수행
+# ══════════════════════════════════════════════════════════
+# 이 함수 하나가 아래 구 함수들을 모두 대체:
+#   scheduled_reconcile_us / scheduled_us_ai_morning
+#   scheduled_us_ai_afternoon / scheduled_us_ai_late / scheduled_us_close_positions
 
 @scheduler_fn.on_schedule(
-    schedule="25 15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
+    schedule="*/5 9-16 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=540,
 )
-def scheduled_close_positions_retry(event: scheduler_fn.ScheduledEvent) -> None:
-    """15:20 청산 실패 대비 15:25 재시도 — 남은 포지션만 청산."""
-    for uid, cfg in _get_all_users():
-        if not _scope_allows_kr(cfg):
-            continue
-        remaining = get_positions(uid, "KR")
-        if not remaining:
-            continue
-        _add_log(uid, "WARNING",
-                 f"[KR] 15:25 청산 재시도 — 미청산 {len(remaining)}종목: {list(remaining.keys())}")
-        _close_all_kr_positions(uid, cfg, "장마감_재청산")
+def scheduled_us_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
+    """US 마스터 사이클 — 5분 간격, ET 09:00~16:59.
 
-
-@scheduler_fn.on_schedule(
-    schedule="31 15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_market_close(event: scheduler_fn.ScheduledEvent) -> None:
-    for uid, _ in _get_all_users():
-        update_bot_state(uid, {"is_market_open": False})
-        _add_log(uid, "INFO", "[15:31] 장 마감")
-
-
-@scheduler_fn.on_schedule(
-    schedule="*/30 9-15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_reconcile_kr(event: scheduler_fn.ScheduledEvent) -> None:
-    """KR 포지션 reconcile — 평일 KST 09:15~15:15, 30분 간격.
-
-    `reconcile_positions(uid, cfg, "KR")` 호출.
-    개장 직후 09:00은 잔고 갱신이 안정화되지 않을 수 있어 09:15부터,
-    마감 청산 함수(15:20)와의 충돌을 피해 15:15까지로 제한.
-
-    cfg["reconcile_enabled"]=False 인 유저는 스킵.
-    상세 동작은 `reconcile_positions` 의 docstring 참조.
-    """
-    now = datetime.now(KST)
-    if now.weekday() >= 5:
-        return
-    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=15, second=0, microsecond=0)
-    if not (market_start <= now <= market_end):
-        return
-    for uid, cfg in _get_all_users():
-        if not cfg.get("reconcile_enabled", True):
-            continue
-        try:
-            reconcile_positions(uid, cfg, "KR")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"[reconcile][KR] 사이클 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="*/30 9-16 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_reconcile_us(event: scheduler_fn.ScheduledEvent) -> None:
-    """US 포지션 reconcile — 평일 ET 09:45~15:45, 30분 간격.
-
-    개장 09:30 직후는 KIS 잔고 동기화 지연 가능성을 고려해 09:45부터,
-    마감 청산(15:50)과의 충돌을 피해 15:45까지.
-    상세는 `reconcile_positions` docstring 참조.
+    시각별 수행 작업 (ET 기준):
+      10:30  US AI 오전 세션
+      09:45·10:15·10:45·…  US reconcile (30분 간격, 09:45~15:45)
+      13:00  US AI 오후 세션
+      15:30  US AI 마감 세션
+      15:50  US 장 마감 청산
+      매5분  전략 사이클 (장중)
     """
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return
-    market_start = now.replace(hour=9, minute=45, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=45, second=0, microsecond=0)
-    if not (market_start <= now <= market_end):
-        return
-    for uid, cfg in _get_all_users():
-        if not cfg.get("reconcile_enabled", True):
-            continue
-        try:
-            reconcile_positions(uid, cfg, "US")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"[reconcile][US] 사이클 오류: {e}")
+    h, m = now.hour, now.minute
+    all_users = list(_get_all_users())
 
-
-@scheduler_fn.on_schedule(
-    schedule="5 9 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_512,
-)
-def scheduled_ai_morning(event: scheduler_fn.ScheduledEvent) -> None:
-    """09:05 KST — 8:50 로컬 파이프라인 Push 후 장 시작 AI 매매."""
-    for uid, cfg in _get_all_users():
-        try:
-            run_ai_session(uid, cfg, "morning")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"AI 오전 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="0 13 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_512,
-)
-def scheduled_ai_afternoon(event: scheduler_fn.ScheduledEvent) -> None:
-    for uid, cfg in _get_all_users():
-        try:
-            run_ai_session(uid, cfg, "afternoon")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"AI 오후 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="30 15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
-    memory=options.MemoryOption.MB_512,
-)
-def scheduled_ai_late(event: scheduler_fn.ScheduledEvent) -> None:
-    for uid, cfg in _get_all_users():
-        try:
-            run_ai_session(uid, cfg, "late")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"AI 마감 오류: {e}")
-
-
-# ══════════════════════════════════════════════════════════
-# 미국 주식 스케줄 Functions (ET 기준)
-# ══════════════════════════════════════════════════════════
-
-@scheduler_fn.on_schedule(
-    schedule="*/5 9-15 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_us_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
-    """미국 장 중 5분마다 전략 사이클 실행 (ET 9:00~16:00)"""
-    if not _is_us_market_open():
-        return
-    for uid, cfg in _get_all_users():
-        try:
-            run_strategy_cycle_us(uid, cfg)
-        except Exception as e:
-            _add_log(uid, "ERROR", f"[US] 전략 사이클 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="30 10 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
-    memory=options.MemoryOption.MB_512,
-)
-def scheduled_us_ai_morning(event: scheduler_fn.ScheduledEvent) -> None:
-    """미국 오전 세션 AI 추천 (ET 10:30 — 장 개시 1시간 후 모멘텀 확인)"""
-    for uid, cfg in _get_all_users():
-        try:
-            run_ai_session(uid, cfg, "morning", "US")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"[US] AI 오전 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="0 13 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
-    memory=options.MemoryOption.MB_512,
-)
-def scheduled_us_ai_afternoon(event: scheduler_fn.ScheduledEvent) -> None:
-    """미국 오후 세션 AI 추천 (ET 13:00)"""
-    for uid, cfg in _get_all_users():
-        try:
-            run_ai_session(uid, cfg, "afternoon", "US")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"[US] AI 오후 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="30 15 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
-    memory=options.MemoryOption.MB_512,
-)
-def scheduled_us_ai_late(event: scheduler_fn.ScheduledEvent) -> None:
-    """미국 마감 세션 AI 추천 (ET 15:30 — 마감 30분 전 최종 정리)"""
-    for uid, cfg in _get_all_users():
-        try:
-            run_ai_session(uid, cfg, "late", "US")
-        except Exception as e:
-            _add_log(uid, "ERROR", f"[US] AI 마감 오류: {e}")
-
-
-@scheduler_fn.on_schedule(
-    schedule="50 15 * * 1-5", timezone=scheduler_fn.Timezone("America/New_York"),
-    memory=options.MemoryOption.MB_256,
-)
-def scheduled_us_close_positions(event: scheduler_fn.ScheduledEvent) -> None:
-    """미국 장 마감 10분 전 포지션 전량 청산 (ET 15:50)"""
-    for uid, cfg in _get_all_users():
-        if not _scope_allows_us(cfg):
-            continue
-        positions = get_positions(uid, "US")
-        for code, pos in list(positions.items()):
+    # 10:30 — US AI 오전 세션
+    if h == 10 and m == 30:
+        for uid, cfg in all_users:
             try:
-                data    = get_current_price_us(uid, cfg, code)
-                ohlcv_c = get_daily_ohlcv_us(uid, cfg, code)
-                _o = data.get("output") or {}
-                current = _us_price_from_output(_o, ohlcv_c) if isinstance(_o, dict) else 0.0
-                qty     = pos["quantity"]
-                res = place_order_us(uid, cfg, code, "sell", qty, 0)
-                order_no = (res.get("output") or {}).get("ODNO", "N/A")
-                pnl = register_sell(uid, "US", code, current)
-                add_trade(uid, "US", code, "sell", current, qty, "US장마감_청산", pnl, stock_name=pos.get("stock_name", ""))
-                state = get_bot_state(uid)
-                update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
-                _add_log(uid, "INFO",
-                         f"[US][{code}] 마감 청산 | ${current:.2f} | PnL ${pnl:+.2f} 주문={order_no}")
-                _log_sell_fill(uid, "US", code, "sell", order_no, float(current), qty, cfg)
-                _invalidate_balance_cache(uid)
+                run_ai_session(uid, cfg, "morning", "US")
             except Exception as e:
-                _add_log(uid, "ERROR", f"[US][{code}] 마감 청산 오류: {e}")
+                _add_log(uid, "ERROR", f"[US] AI 오전 오류: {e}")
+
+    # 13:00 — US AI 오후 세션
+    if h == 13 and m == 0:
+        for uid, cfg in all_users:
+            try:
+                run_ai_session(uid, cfg, "afternoon", "US")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"[US] AI 오후 오류: {e}")
+
+    # 15:30 — US AI 마감 세션
+    if h == 15 and m == 30:
+        for uid, cfg in all_users:
+            try:
+                run_ai_session(uid, cfg, "late", "US")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"[US] AI 마감 오류: {e}")
+
+    # US reconcile — 09:45·10:15·10:45·… (30분 간격)
+    if m in (15, 45) and (
+        (h == 9 and m >= 45) or (10 <= h <= 14) or (h == 15 and m == 15)
+    ):
+        for uid, cfg in all_users:
+            if not cfg.get("reconcile_enabled", True):
+                continue
+            try:
+                reconcile_positions(uid, cfg, "US")
+            except Exception as e:
+                _add_log(uid, "ERROR", f"[reconcile][US] 사이클 오류: {e}")
+
+    # 15:50 — US 장 마감 청산
+    if h == 15 and m == 50:
+        for uid, cfg in all_users:
+            if not _scope_allows_us(cfg):
+                continue
+            positions = get_positions(uid, "US")
+            for code, pos in list(positions.items()):
+                try:
+                    data    = get_current_price_us(uid, cfg, code)
+                    ohlcv_c = get_daily_ohlcv_us(uid, cfg, code)
+                    _o = data.get("output") or {}
+                    current = _us_price_from_output(_o, ohlcv_c) if isinstance(_o, dict) else 0.0
+                    qty     = pos["quantity"]
+                    res = place_order_us(uid, cfg, code, "sell", qty, 0)
+                    order_no = (res.get("output") or {}).get("ODNO", "N/A")
+                    pnl = register_sell(uid, "US", code, current)
+                    add_trade(uid, "US", code, "sell", current, qty, "US장마감_청산", pnl, stock_name=pos.get("stock_name", ""))
+                    state = get_bot_state(uid)
+                    update_bot_state(uid, {"realized_pnl": state.get("realized_pnl", 0) + pnl})
+                    _add_log(uid, "INFO",
+                             f"[US][{code}] 마감 청산 | ${current:.2f} | PnL ${pnl:+.2f} 주문={order_no}")
+                    _log_sell_fill(uid, "US", code, "sell", order_no, float(current), qty, cfg)
+                    _invalidate_balance_cache(uid)
+                except Exception as e:
+                    _add_log(uid, "ERROR", f"[US][{code}] 마감 청산 오류: {e}")
+        return
+
+    # 매5분 — US 전략 사이클 (장중)
+    if _is_us_market_open():
+        for uid, cfg in all_users:
+            try:
+                run_strategy_cycle_us(uid, cfg)
+            except Exception as e:
+                _add_log(uid, "ERROR", f"[US] 전략 사이클 오류: {e}")
 
 
 # ══════════════════════════════════════════════════════════
-# 텔레그램 모니터링 리포트 (매 시 정각)
+# 텔레그램 모니터링 리포트 (매 시 정각) — 3번째이자 마지막 Cloud Scheduler 잡
 # ══════════════════════════════════════════════════════════
 
 @scheduler_fn.on_schedule(
