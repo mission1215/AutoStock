@@ -99,13 +99,6 @@ ET  = ZoneInfo("America/New_York")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── OHLCV 인메모리 캐시 ─────────────────────────────────────────────────────
-# OHLCV는 일봉 데이터 — 10분 이내 다시 불러도 값이 사실상 같음.
-# Cloud Run 컨테이너 인스턴스가 살아 있는 동안(warm) 재사용 → KIS API 호출 90% 감소.
-# → GCP 아웃바운드 네트워크 비용·KIS TPS 소비 대폭 절감.
-_ohlcv_cache: dict[str, tuple[float, list]] = {}   # key → (fetch_ts, data)
-_OHLCV_TTL   = 600   # 10분
-
 # functions/.env — 로컬·배포 패키지에 포함될 때 텔레그램·Gemini 키 등 주입 (kis_ws.py 와 동일)
 _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.is_file():
@@ -167,10 +160,10 @@ _db = None
 # ── 인메모리 가격 캐시 (인스턴스 재사용 시 유효, TTL=60초) ──
 _price_cache: dict[str, dict] = {}   # key: "uid:market:code"  value: {data, ts}
 _balance_cache: dict[str, dict] = {} # key: uid                value: {data, ts}
-_ohlcv_cache: dict[str, dict] = {}   # key: "uid:market:code"  value: {data, ts}
-_PRICE_TTL  = 60   # 초
-_BALANCE_TTL = 30  # 초
-_OHLCV_TTL = 300   # 초 (일봉은 초단위로 자주 바뀌지 않음)
+_ohlcv_cache: dict[str, dict] = {}   # key: "uid:market:code" or "market:code"  value: {data, ts}
+_PRICE_TTL   = 60    # 초
+_BALANCE_TTL = 30    # 초
+_OHLCV_TTL   = 600   # 10분 — OHLCV 일봉 데이터. KIS API 호출·아웃바운드 네트워크 90% 절감.
 
 
 def _evict_caches_for_uid(uid: str) -> None:
@@ -1234,8 +1227,8 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
     """
     _ck = f"KR:{stock_code}"
     _now = time_module.time()
-    if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck][0] < _OHLCV_TTL:
-        return _ohlcv_cache[_ck][1]
+    if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck]["ts"] < _OHLCV_TTL:
+        return _ohlcv_cache[_ck]["data"]
 
     last_exc: BaseException | None = None
     for attempt in range(4):
@@ -1310,9 +1303,9 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
                     stock_code,
                     len(best),
                 )
-                _ohlcv_cache[_ck] = (time_module.time(), syn)
+                _ohlcv_cache[_ck] = {"ts": time_module.time(), "data": syn}
                 return syn
-            _ohlcv_cache[_ck] = (time_module.time(), best)
+            _ohlcv_cache[_ck] = {"ts": time_module.time(), "data": best}
             return best
         except ApiError as e:
             last_exc = e
@@ -1455,8 +1448,8 @@ def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
     인메모리 캐시 10분 적용."""
     _ck = f"US:{stock_code}"
     _now = time_module.time()
-    if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck][0] < _OHLCV_TTL:
-        return _ohlcv_cache[_ck][1]
+    if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck]["ts"] < _OHLCV_TTL:
+        return _ohlcv_cache[_ck]["data"]
 
     last_exc: BaseException | None = None
     for attempt in range(4):
@@ -1472,7 +1465,7 @@ def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
                 timeout=10,
             )
             data = _parse(resp, uid, cfg).get("output2", [])
-            _ohlcv_cache[_ck] = (time_module.time(), data)
+            _ohlcv_cache[_ck] = {"ts": time_module.time(), "data": data}
             return data
         except ApiError as e:
             last_exc = e

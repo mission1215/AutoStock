@@ -24,7 +24,7 @@ import { tvSymbol } from "../utils/tradingViewSymbol";
 import { formatKst } from "../utils/formatKst";
 import { normalizeMarketScope, type MarketScope } from "../utils/marketScope";
 
-// 장 중(09:00~15:30 KST)에는 10초, 장 외에는 30초 폴링
+// 장 중(09:00~15:30 KST)에는 10초, 장 외에는 60초 폴링
 function getPollMs(): number {
   const now = new Date();
   const kst = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
@@ -32,7 +32,7 @@ function getPollMs(): number {
   const m = kst.getMinutes();
   const totalMin = h * 60 + m;
   const isMarketHours = totalMin >= 9 * 60 && totalMin < 15 * 60 + 30;
-  return isMarketHours ? 30_000 : 60_000;
+  return isMarketHours ? 10_000 : 60_000;
 }
 const POLL_MS = getPollMs();
 
