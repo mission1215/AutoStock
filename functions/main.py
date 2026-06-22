@@ -626,6 +626,8 @@ _CONFIG_TOP_KEYS = frozenset({
     "ai_universe_mode",
     # 텔레그램: 서버에 TELEGRAM_BOT_TOKEN 한 벌만 두고, chat_id 는 유저별 (미설정 시 env CHAT_ID 폴백)
     "telegram_enabled", "telegram_chat_id", "telegram_message_thread_id",
+    # AI 추천 엔진: gemini | cursor | both(Gemini+Cursor) — 유저별, 계정 공통
+    "ai_provider",
 })
 _CONFIG_PROFILE_KEYS = frozenset({
     "app_key", "app_secret", "account_no",
@@ -728,6 +730,7 @@ def get_config(uid: str) -> dict:
         "setup_complete", "display_name", "email", "created_at",
         "market_scope", "ai_universe_mode",
         "telegram_enabled", "telegram_chat_id", "telegram_message_thread_id",
+        "ai_provider",
     ):
         if k in raw:
             out[k] = raw[k]
@@ -3062,6 +3065,46 @@ def _calc_rsi(closes: list[float], period: int = 14) -> float:
     return round(100 - (100 / (1 + rs)), 2)
 
 
+def _calc_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
+    """MACD 계산. closes는 [최신→과거] 순서.
+    반환: {"macd": float, "signal": float, "hist": float, "valid": bool}
+    """
+    if len(closes) < slow + signal:
+        return {"macd": 0.0, "signal": 0.0, "hist": 0.0, "valid": False}
+    c_asc = list(reversed(closes[:slow + signal + 5]))
+    ema_fast = _calc_ema(c_asc, fast)
+    ema_slow = _calc_ema(c_asc, slow)
+    if not ema_fast or not ema_slow:
+        return {"macd": 0.0, "signal": 0.0, "hist": 0.0, "valid": False}
+    n = min(len(ema_fast), len(ema_slow))
+    macd_line = [ema_fast[-(n - i)] - ema_slow[-(n - i)] for i in range(n)]
+    sig_list = _calc_ema(macd_line, signal)
+    if not sig_list:
+        return {"macd": 0.0, "signal": 0.0, "hist": 0.0, "valid": False}
+    m = round(macd_line[-1], 4)
+    s = round(sig_list[-1], 4)
+    return {"macd": m, "signal": s, "hist": round(m - s, 4), "valid": True}
+
+
+def _intraday_vol_ratio(today_vol: int, avg_full_day_vol: float) -> float:
+    """당일 누적 거래량을 전일 종일 평균과 비교할 때 경과 시간으로 정규화.
+
+    KR 정규 세션: 09:00~15:30 (390분). 현재 시각 기준으로 몇 % 경과했는지
+    계산하여 당일 vol 을 종일 예상 vol 로 환산 후 비율 반환.
+    예: 10:00 (60분 경과, 15.4%) 에 vol=500만 이면 → 예상 종일 vol ≈ 3250만.
+    """
+    now = datetime.now(KST)
+    open_t  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
+    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    total_sec = (close_t - open_t).total_seconds()
+    elapsed   = max((now - open_t).total_seconds(), 60)
+    frac      = min(elapsed / total_sec, 1.0)
+    if frac <= 0 or avg_full_day_vol <= 0 or today_vol <= 0:
+        return 1.0
+    projected_full_day = today_vol / frac
+    return round(projected_full_day / avg_full_day_vol, 2)
+
+
 def _calc_atr(ohlcv: list[dict], period: int = 5) -> float:
     rows = ohlcv[:period + 1]
     if len(rows) < 2:
@@ -3355,84 +3398,136 @@ def calculate_optimal_prices_us(current_price: float, ohlcv: list[dict], cfg: di
 
 
 def score_stock_algorithm(current_price: float, ohlcv: list[dict], cfg: dict) -> dict:
+    """KR 종목 스코어링 — 최대 100점.
+
+    배점 설계 원칙:
+      - 변동성 돌파(K-factor)가 핵심 시그널 → 가장 높은 가중치
+      - 거래량은 시간보정 RVOL 로 계산 (장 초반 불이익 제거)
+      - RSI 범위: 돌파일에 자연히 높아지는 50~75 허용
+      - MACD 히스토그램 양전환 = 모멘텀 확인
+      - 트렌드(EMA 정배열)는 보조 가중치
+
+    점수 구간:
+      ≥60점  진입 허용 (기본 min_score_kr)
+      ≥75점  강한 시그널
+    """
     score = 0
-    detail = {}
+    detail: dict = {}
     try:
-        closes = [float(r.get("stck_clpr", r.get("clos", 0))) for r in ohlcv]
-        volumes = [int(r.get("acml_vol", r.get("tvol", "0")).replace(",", "") or 0) for r in ohlcv]
-        today_open = float(ohlcv[0].get("stck_oprc", ohlcv[0].get("open", current_price))) if ohlcv else current_price
+        closes  = [float(r.get("stck_clpr", r.get("clos", 0)) or 0) for r in ohlcv]
+        volumes = [int(str(r.get("acml_vol", r.get("tvol", "0"))).replace(",", "") or 0) for r in ohlcv]
+        today_open = float(ohlcv[0].get("stck_oprc", ohlcv[0].get("open", current_price)) or current_price) if ohlcv else current_price
 
+        # ── 1. 변동성 돌파 (35점) ───────────────────────────────
+        # 핵심 진입 조건. K=0.5 이상 돌파 여부.
+        breakout = False
         if len(ohlcv) >= 2:
-            prev_high = float(ohlcv[1].get("stck_hgpr", ohlcv[1].get("high", 0)))
-            prev_low = float(ohlcv[1].get("stck_lwpr", ohlcv[1].get("low", 0)))
-            target = today_open + cfg.get("k_factor", 0.5) * (prev_high - prev_low)
-            breakout = current_price >= target
-            score += 30 if breakout else 0
+            prev_high = float(ohlcv[1].get("stck_hgpr", ohlcv[1].get("high", 0)) or 0)
+            prev_low  = float(ohlcv[1].get("stck_lwpr", ohlcv[1].get("low",  0)) or 0)
+            k = float(cfg.get("k_factor", 0.5))
+            target = today_open + k * (prev_high - prev_low)
+            breakout = current_price >= target > today_open
+            score += 35 if breakout else 0
             detail["breakout"] = breakout
+            detail["breakout_target"] = round(target, 0)
 
+        # ── 2. 거래량 (시간보정 RVOL, 25점) ───────────────────
+        # 당일 누적 vol → 종일 추정치로 환산 후 5일 평균과 비교
         if len(volumes) >= 6 and volumes[0] > 0:
-            avg_vol = sum(volumes[1:6]) / 5
-            vol_ratio = volumes[0] / avg_vol if avg_vol > 0 else 1
-            if vol_ratio >= 2.0: score += 25
-            elif vol_ratio >= 1.5: score += 15
-            elif vol_ratio >= 1.2: score += 8
-            detail["volume_ratio"] = round(vol_ratio, 2)
+            avg_full = sum(volumes[1:6]) / 5
+            rvol = _intraday_vol_ratio(volumes[0], avg_full)
+            if   rvol >= 3.0: score += 25
+            elif rvol >= 2.0: score += 18
+            elif rvol >= 1.5: score += 10
+            elif rvol >= 1.2: score += 5
+            detail["rvol"] = rvol
 
-        ma5 = sum(closes[:5]) / 5 if len(closes) >= 5 else 0
-        if ma5 > 0 and current_price > ma5: score += 10
-        detail["ma5"] = round(ma5, 0)
-
-        # EMA5/EMA20 정배열 — MA5>MA20 단순비교 대체 (최근 데이터 가중 반영)
+        # ── 3. EMA 정배열 가격 위치 (20점) ────────────────────
+        # EMA5 > EMA20 & 현재가 EMA5 위 = 상승 추세
         if len(closes) >= 20:
-            closes_asc = list(reversed(closes[:25]))   # oldest → newest
+            closes_asc = list(reversed(closes[:26]))
             ema5_list  = _calc_ema(closes_asc, 5)
             ema20_list = _calc_ema(closes_asc, 20)
             if ema5_list and ema20_list:
                 ema5  = ema5_list[-1]
                 ema20 = ema20_list[-1]
-                if ema5 > ema20:
-                    score += 10   # 정배열 가점
-                detail["ema5"]  = round(ema5, 0)
-                detail["ema20"] = round(ema20, 0)
+                if current_price > ema5 > ema20:
+                    score += 20
+                elif current_price > ema5:
+                    score += 10
+                detail["ema5"]     = round(ema5, 0)
+                detail["ema20"]    = round(ema20, 0)
+                detail["ema_ok"]   = current_price > ema5 > ema20
 
-        rsi = _calc_rsi(closes[:30])   # Wilder RSI: 30개 이상 권장
-        if 45 <= rsi <= 65: score += 15
-        elif 40 <= rsi <= 70: score += 8
+        # ── 4. RSI (15점) — 돌파일 기준 50~75 허용 ───────────
+        # 45~65 은 지나치게 좁음. 강한 돌파일 RSI = 60~75 이 정상.
+        rsi = _calc_rsi(closes[:30])
+        if   50 <= rsi <= 75: score += 15
+        elif 45 <= rsi <= 80: score += 8
         detail["rsi"] = rsi
 
+        # ── 5. MACD 히스토그램 양전환 (5점) ────────────────────
+        macd_d = _calc_macd(closes[:40])
+        if macd_d["valid"] and macd_d["hist"] > 0:
+            score += 5
+        detail["macd_hist"] = macd_d.get("hist", 0)
+
+        # ── 참고용 지표 ───────────────────────────────────────
         if len(closes) >= 2 and closes[1] > 0:
             change_rate = (current_price - closes[1]) / closes[1] * 100
-            if 0.5 <= change_rate <= 4.0: score += 10
-            elif 0 < change_rate <= 6.0: score += 5
             detail["change_rate"] = round(change_rate, 2)
+        detail["score_max"] = 100
+
     except Exception as e:
         detail["error"] = str(e)
     return {"score": score, "detail": detail}
 
 
 def calculate_optimal_prices(current_price: float, ohlcv: list[dict], cfg: dict) -> dict:
+    """진입 기준가·목표가·손절가 계산.
+
+    설계 원칙 (기대값 양수 조건):
+      - 손절: ATR × 1.5 또는 stop_loss_ratio 중 **작은** 값 (엄격한 손절)
+        → 큰 값(관대한 손절)을 쓰면 손실 1회가 수익 수회를 날려버림.
+      - 목표: ATR × 2.5 또는 최소 4% 중 큰 값
+        → R:R ≈ 1.67:1. 승률 40%에도 기대값 양수.
+        ※ 구 목표 8% 최소값은 KR 일중 달성 불가 → 트레일링 스탑에 소극적 청산만 반복됨.
+      - 최소 R:R 1.5 미만이면 목표가를 자동 상향 조정.
+    """
     atr = _calc_atr(ohlcv)
     buy_price = current_price
-    sl_ratio = cfg.get("stop_loss_ratio", 0.03)
+    sl_ratio = float(cfg.get("stop_loss_ratio", 0.025))
+
     if atr > 0:
-        # 목표: ATR 3배 또는 최소 8% 중 큰 값
-        sell_by_atr = buy_price + atr * 3.0
-        sell_by_min = buy_price * 1.08
-        sell_price = max(sell_by_atr, sell_by_min)
-        stop_by_atr = buy_price - atr * 1.0
+        stop_by_atr   = buy_price - atr * 1.5
         stop_by_ratio = buy_price * (1 - sl_ratio)
+        # 손절은 ATR 기반과 비율 기반 중 더 타이트한(높은) 쪽
         stop_loss = max(stop_by_atr, stop_by_ratio)
+
+        sell_by_atr = buy_price + atr * 2.5
+        sell_by_min = buy_price * 1.04   # 최소 목표 4% (구: 8%)
+        sell_price  = max(sell_by_atr, sell_by_min)
     else:
-        sell_price = buy_price * 1.08
-        stop_loss = buy_price * (1 - sl_ratio)
+        stop_loss  = buy_price * (1 - sl_ratio)
+        sell_price = buy_price * 1.05
+
+    risk_amt   = buy_price - stop_loss
+    profit_amt = sell_price - buy_price
+    # R:R 1.5 미만이면 목표가 상향
+    if risk_amt > 0 and profit_amt / risk_amt < 1.5:
+        sell_price = buy_price + risk_amt * 1.5
+
     profit_ratio = (sell_price - buy_price) / buy_price * 100
-    risk_ratio = (buy_price - stop_loss) / buy_price * 100
-    rr_ratio = profit_ratio / risk_ratio if risk_ratio > 0 else 0
+    risk_ratio   = (buy_price - stop_loss)  / buy_price * 100
+    rr_ratio     = profit_ratio / risk_ratio if risk_ratio > 0 else 0
     return {
-        "buy_price": round(buy_price, 2), "sell_price": round(sell_price, 2),
-        "stop_loss": round(stop_loss, 2), "atr": round(atr, 2),
-        "profit_ratio": round(profit_ratio, 2), "risk_ratio": round(risk_ratio, 2),
-        "rr_ratio": round(rr_ratio, 2),
+        "buy_price":    round(buy_price,    2),
+        "sell_price":   round(sell_price,   2),
+        "stop_loss":    round(stop_loss,    2),
+        "atr":          round(atr,          2),
+        "profit_ratio": round(profit_ratio, 2),
+        "risk_ratio":   round(risk_ratio,   2),
+        "rr_ratio":     round(rr_ratio,     2),
     }
 
 
@@ -3657,8 +3752,10 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                     _invalidate_balance_cache(uid)
                     continue
 
-            # 물타기: 평단 대비 일정 하락 + 손절선 위 + 횟수/간격/총비중 + 추세 필터
-            if cfg.get("avg_down_enabled", True):
+            # 물타기: 기본값 OFF — 변동성 돌파 전략에서 물타기는 추세를 역행.
+            # stop_loss_ratio(2.5%)보다 avg_down_trigger(4%)가 크면 손절이 먼저 발동
+            # → 물타기가 실행되지 않음. 스윙 포지션 전용으로 수동 활성화할 것.
+            if cfg.get("avg_down_enabled", False):
                 max_ad = int(cfg.get("avg_down_max_times", 2))
                 last_at = pos.get("avg_down_last_at")
                 min_h = float(cfg.get("avg_down_min_interval_hours", 20))
@@ -3675,7 +3772,12 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                             interval_ok = False
                     except Exception:
                         interval_ok = True
-                dip_pct = float(cfg.get("avg_down_trigger_pct", 0.04))
+                # 물타기 트리거는 반드시 손절 비율보다 작아야 손절 전에 발동 가능
+                sl_ratio_cfg = float(cfg.get("stop_loss_ratio", 0.025))
+                dip_pct = min(
+                    float(cfg.get("avg_down_trigger_pct", 0.04)),
+                    sl_ratio_cfg * 0.8,
+                )
                 ad_cnt = int(pos.get("avg_down_count", 0))
                 price_dipped = current <= buy_avg * (1 - dip_pct)
                 above_stop = current > slp * 1.002
@@ -3797,9 +3899,9 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
             above_ma5    = current > ma5
 
             if above_target and above_ma5:
-                # 최소 스코어 체크 (KR 기본 40점 / 100점 만점)
+                # 최소 스코어 체크 — 신규 스코어링 기준: 기본 60점/100점
                 score_result = score_stock_algorithm(current, ohlcv, cfg)
-                min_score_kr = int(cfg.get("min_score_kr", 40))
+                min_score_kr = int(cfg.get("min_score_kr", 60))
                 if score_result["score"] < min_score_kr:
                     diag_parts.append(
                         f"{code}=점수미달({score_result['score']}/{min_score_kr})"
@@ -3818,7 +3920,6 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                     float(prices_kr.get("stop_loss") or 0), cfg,
                 )
                 if qty <= 0 and available >= current and equity > 0:
-                    # 안전망: 폴백 모드에서도 1주 가능하면 1주
                     qty = 1
                     qty_reason = "최소1주"
                 if qty > 0:
@@ -3830,8 +3931,9 @@ def run_strategy_cycle_kr(uid: str, cfg: dict):
                         order_no = result.get("output", {}).get("ODNO", "N/A")
                         out = data.get("output") or {}
                         sname = _stock_name(_kr_isnm_from_output(out) if isinstance(out, dict) else "", code, "KR")
+                        sl_ratio_use = float(cfg.get("stop_loss_ratio", 0.025))
                         register_buy(
-                            uid, "KR", code, current, qty, cfg.get("stop_loss_ratio", 0.03),
+                            uid, "KR", code, current, qty, sl_ratio_use,
                             float(prices_kr["sell_price"]), "자동", sname,
                             stop_loss_price=float(prices_kr["stop_loss"]),
                         )
@@ -4355,7 +4457,7 @@ def _load_any_fallback_ai_cache(
 
 # ══════════════════════════════════════════════════════════
 # 공유 AI 피크 캐시 (ai_picks/{date_key}) — 유저 독립, 전체 공유
-# ai_provider: "gemini" | "claude" | "cursor" | "both"
+# ai_provider: "gemini" | "cursor" | "both"(Gemini+Cursor) | "claude"(레거시)
 # ══════════════════════════════════════════════════════════
 
 def _get_ai_provider(cfg: dict | None = None) -> str:
@@ -4913,25 +5015,25 @@ def _run_ai_session_impl(
     dk = _research_date_key(market)
     _add_log(uid, "INFO", f"[AI][{market}] ai_provider={ai_provider}")
 
-    # Claude / Cursor 피크 로드 (provider가 claude·cursor 또는 both 일 때)
+    # Claude / Cursor 피크 로드
     claude_candidates: list[str] = []
     claude_reasons: dict[str, str] = {}
     cursor_candidates: list[str] = []
     cursor_reasons: dict[str, str] = {}
-    if ai_provider in ("claude", "both"):
+    if ai_provider == "claude":
         shared_claude = _load_shared_ai_picks("claude", market, session, dk)
         if shared_claude and shared_claude[0]:
             claude_candidates, claude_reasons = shared_claude
             _add_log(uid, "INFO", f"[Claude] 공유 피크 로드 {len(claude_candidates)}종목 ({market}/{session})")
-        elif ai_provider == "claude":
+        else:
             _add_log(uid, "WARNING", f"[Claude] 공유 피크 없음 ({market}/{session}) — Gemini 폴백")
-            ai_provider = "gemini"  # 클로드 데이터 없으면 Gemini로 자동 폴백
-    if ai_provider == "cursor":
+            ai_provider = "gemini"
+    if ai_provider in ("cursor", "both"):
         shared_cursor = _load_shared_ai_picks("cursor", market, session, dk)
         if shared_cursor and shared_cursor[0]:
             cursor_candidates, cursor_reasons = shared_cursor
             _add_log(uid, "INFO", f"[Cursor] 공유 피크 로드 {len(cursor_candidates)}종목 ({market}/{session})")
-        else:
+        elif ai_provider == "cursor":
             _add_log(uid, "WARNING", f"[Cursor] 공유 피크 없음 ({market}/{session}) — Gemini 폴백")
             ai_provider = "gemini"
 
@@ -4950,17 +5052,16 @@ def _run_ai_session_impl(
             candidate_codes = cursor_candidates
             reasons_map = cursor_reasons
         else:
-            # gemini 또는 both: 기존 Gemini 호출
+            # gemini 또는 both(Gemini+Cursor): Gemini 호출
             candidate_codes, reasons_map = query_gemini_candidates(uid, stock_data, session, market)
-            # both 모드: Claude 피크도 병합 (Gemini 우선, Claude 보완)
-            if ai_provider == "both" and claude_candidates:
+            if ai_provider == "both" and cursor_candidates:
                 existing = set(candidate_codes)
-                for c in claude_candidates:
+                for c in cursor_candidates:
                     if c not in existing:
                         candidate_codes.append(c)
-                        if c in claude_reasons:
-                            reasons_map[c] = f"[Claude] {claude_reasons[c]}"
-                _add_log(uid, "INFO", f"[both] Gemini+Claude 병합 후보 {len(candidate_codes)}종목")
+                        if c in cursor_reasons:
+                            reasons_map[c] = f"[Cursor] {cursor_reasons[c]}"
+                _add_log(uid, "INFO", f"[both] Gemini+Cursor 병합 후보 {len(candidate_codes)}종목")
     except Exception as _dummy_exc:
         e = _dummy_exc
         if _is_gemini_quota_error(e):
@@ -5484,8 +5585,9 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                     _invalidate_balance_cache(uid)
                     continue
 
-            # 물타기: 평단 대비 일정 하락 + 손절선 위 + 횟수/간격/총비중 + 추세 필터
-            if cfg.get("avg_down_enabled", True):
+            # 물타기 (US): 기본값 OFF — 변동성 돌파 전략과 물타기는 모순.
+            # 스윙 포지션 전용으로 수동 활성화.
+            if cfg.get("avg_down_enabled", False):
                 max_ad = int(cfg.get("avg_down_max_times", 2))
                 last_at = pos.get("avg_down_last_at")
                 min_h = float(cfg.get("avg_down_min_interval_hours", 20))
@@ -5502,7 +5604,11 @@ def run_strategy_cycle_us(uid: str, cfg: dict):
                             interval_ok = False
                     except Exception:
                         interval_ok = True
-                dip_pct = float(cfg.get("avg_down_trigger_pct", 0.04))
+                sl_ratio_cfg_us = float(cfg.get("stop_loss_ratio", 0.025))
+                dip_pct = min(
+                    float(cfg.get("avg_down_trigger_pct", 0.04)),
+                    sl_ratio_cfg_us * 0.8,
+                )
                 ad_cnt = int(pos.get("avg_down_count", 0))
                 price_dipped = current <= buy_avg * (1 - dip_pct)
                 above_stop = current > slp * 1.002
@@ -5791,12 +5897,13 @@ def scheduled_market_open(event: scheduler_fn.ScheduledEvent) -> None:
 
 
 @scheduler_fn.on_schedule(
-    schedule="*/5 8-16 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
+    schedule="* 9-15 * * 1-5", timezone=scheduler_fn.Timezone("Asia/Seoul"),
     memory=options.MemoryOption.MB_256,
     timeout_sec=180,
 )
 def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
-    """KR 전략 메인 사이클 — 5분 간격, 평일 08:00~16:00 KST.
+    """KR 전략 메인 사이클 — 1분 간격, 평일 09:00~15:59 KST.
+    변동성 돌파 전략은 진입 타이밍이 핵심 — 5분 지연은 슬리피지 손실로 직결됨.
 
     `run_strategy_cycle_kr` 만 호출. 한 사이클 안에서:
       1) 보유 포지션 점검 (백필/본전스탑/분할익절/트레일링/목표·손절/시간청산/물타기)
@@ -6469,8 +6576,8 @@ def route_setup():
         "max_entry_slip_pct_mock": float(body.get("max_entry_slip_pct_mock", 0.05)),
         "max_entry_slip_pct_live": float(body.get("max_entry_slip_pct_live", 0.03)),
         "ma_period": int(body.get("ma_period", 5)),
-        "min_score_kr": int(body.get("min_score_kr", 40)),
-        "stop_loss_ratio": float(body.get("stop_loss_ratio", 0.03)),
+        "min_score_kr": int(body.get("min_score_kr", 60)),
+        "stop_loss_ratio": float(body.get("stop_loss_ratio", 0.025)),
         "max_position_ratio": float(body.get("max_position_ratio", 0.10)),
         "daily_profit_target": float(body.get("daily_profit_target", 0.03)),
         "ai_stock_count": int(body.get("ai_stock_count", 5)),
@@ -6998,6 +7105,9 @@ def route_config():
             safe["telegram_chat_id"] = tg_chat
         if raw_cfg.get("telegram_message_thread_id"):
             safe["telegram_message_thread_id"] = str(raw_cfg.get("telegram_message_thread_id") or "").strip()
+        ap = str(raw_cfg.get("ai_provider") or cfg.get("ai_provider") or "gemini").strip().lower()
+        if ap in ("gemini", "claude", "cursor", "both"):
+            safe["ai_provider"] = ap
         return jsonify({"ok": True, "config": safe, "profiles": profiles_payload})
     body = request.get_json() or {}
     allowed = {"is_mock", "kr_watchlist", "us_watchlist", "k_factor", "ma_period",
