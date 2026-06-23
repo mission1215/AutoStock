@@ -97,8 +97,8 @@ export function StrategySettings({
   const [marketScope, setMarketScope] = useState<MarketScope>("kr");
   /** KR 스케줄 AI 입력 유니버스 — US 전략에는 영향 없음 */
   const [aiUniverseMode, setAiUniverseMode] = useState<"legacy" | "dynamic">("legacy");
-  /** AI 엔진 — 글로벌(전 유저 공유), ai_config/settings 저장 */
-  const [aiProvider, setAiProvider] = useState<"gemini" | "claude" | "cursor" | "both">("gemini");
+  /** AI 엔진 — 유저별 Firestore config/settings 최상위 저장 */
+  const [aiProvider, setAiProvider] = useState<"gemini" | "cursor" | "both">("gemini");
   /** 계정 공통 — Firestore 최상위 저장(모의/실전과 무관) */
   const [tgEn, setTgEn] = useState(false);
   const [tgChat, setTgChat] = useState("");
@@ -111,7 +111,8 @@ export function StrategySettings({
   function syncAiProviderFromConfig(c: AppConfig | undefined) {
     if (!c) return;
     const p = c.ai_provider;
-    if (p === "claude" || p === "both" || p === "cursor") setAiProvider(p);
+    if (p === "cursor" || p === "both") setAiProvider(p);
+    else if (p === "claude") setAiProvider("gemini");
     else setAiProvider("gemini");
   }
 
@@ -398,8 +399,7 @@ export function StrategySettings({
               [
                 { id: "gemini" as const, label: "Gemini (기본)" },
                 { id: "cursor" as const, label: "Cursor (무료)" },
-                { id: "claude" as const, label: "Claude" },
-                { id: "both" as const, label: "Gemini + Claude" },
+                { id: "both" as const, label: "Gemini + Cursor" },
               ] as const
             ).map(({ id, label }) => (
               <button
@@ -420,14 +420,11 @@ export function StrategySettings({
             ))}
           </div>
           <p className="text-[10px] text-slate-500 leading-relaxed">
-            <strong className="text-slate-400">Cursor</strong>:{" "}
-            <code className="text-[10px] bg-white/5 px-1 rounded">python -m pipeline run --step finalize</code>
-            로 Firebase에 Push된 감시목록을 사용합니다 (Gemini API 비용 없음).
-            당일 Push가 없으면 Gemini로 자동 폴백됩니다.
+            <strong className="text-slate-400">Cursor</strong>: 맥에서 돌아가는 일일 파이프라인이 Firebase에
+            올린 감시목록을 사용합니다 (Gemini API 비용 없음). 당일 Push가 없으면 Gemini로 자동 폴백됩니다.
             <br />
-            <strong className="text-slate-400">Claude</strong>:{" "}
-            <code className="text-[10px] bg-white/5 px-1 rounded">claude_picker.py</code>
-            가 사전 Push해야 합니다.
+            <strong className="text-slate-400">Gemini + Cursor</strong>: Gemini AI 선정 후 Cursor 피크를
+            추가로 병합합니다.
           </p>
           <div
             className="mt-3 rounded-lg border border-cyan-500/20 bg-slate-950/40 px-3 py-3 space-y-3"

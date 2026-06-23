@@ -90,7 +90,7 @@ export interface AppConfig {
   avg_down_min_interval_hours?: number;
   /** 보수/보통/적극 프리셋 — 마지막으로 저장한 성향(표시용). 전략 수치는 k_factor 등과 함께 병합 저장 */
   strategy_tier?: "conservative" | "balanced" | "aggressive" | null;
-  /** AI 추천 엔진 — gemini | claude | cursor | both */
+  /** AI 추천 엔진 — gemini | cursor | both(Gemini+Cursor); claude 는 레거시 */
   ai_provider?: "gemini" | "claude" | "cursor" | "both";
   /** 텔레그램 매매·모니터링 알림(서버에 봇 토큰 1벌, chat_id 는 계정별) */
   telegram_enabled?: boolean | string | number;
