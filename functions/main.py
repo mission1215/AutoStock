@@ -1225,7 +1225,8 @@ def get_daily_ohlcv_kr(uid: str, cfg: dict, stock_code: str) -> list:
     - 모의 앱키로 실서버 일봉이 비는 경우 다수 → `FHKST01010100`로 합성(전략 동작)
     - KOSPI+`Q` 등 INVALID FID 는 스킵(기존)
     """
-    _ck = f"KR:{stock_code}"
+    _env = "mock" if cfg.get("is_mock", True) else "live"
+    _ck = f"KR:{_env}:{stock_code}"
     _now = time_module.time()
     if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck]["ts"] < _OHLCV_TTL:
         return _ohlcv_cache[_ck]["data"]
@@ -1446,7 +1447,8 @@ def get_current_price_us(uid: str, cfg: dict, stock_code: str) -> dict:
 def get_daily_ohlcv_us(uid: str, cfg: dict, stock_code: str) -> list:
     """미국 주식 일봉 — get_current_price_us와 동일 호스트/인증.
     인메모리 캐시 10분 적용."""
-    _ck = f"US:{stock_code}"
+    _env = "mock" if cfg.get("is_mock", True) else "live"
+    _ck = f"US:{_env}:{stock_code}"
     _now = time_module.time()
     if _ck in _ohlcv_cache and _now - _ohlcv_cache[_ck]["ts"] < _OHLCV_TTL:
         return _ohlcv_cache[_ck]["data"]
@@ -5881,10 +5883,15 @@ def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
     h, m = now.hour, now.minute
     all_users = list(_get_all_users())
 
-    # 08:50 — 장 전 준비 (토큰 갱신, 상태 초기화)
-    if h == 8 and m == 50:
+    # 08:50~08:59 — 장 전 준비 (토큰 갱신, 상태 초기화)
+    # 범위 체크: 스케줄러 지연 허용. today 체크로 같은 날 중복 실행 방지.
+    if h == 8 and m >= 50:
+        today_str = date.today().isoformat()
         for uid, cfg in all_users:
             try:
+                state_pre = get_bot_state(uid)
+                if state_pre.get("today") == today_str:
+                    continue  # 이미 오늘 초기화 완료 — 중복 실행 방지 (realized_pnl 리셋 방지)
                 cutoff = now - timedelta(days=2)
                 old_logs = list(
                     _uref(uid).collection("logs").where("timestamp", "<", cutoff).limit(500).stream()
@@ -5898,27 +5905,31 @@ def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
                     "trading_halted": False, "halt_reason": "",
                     "realized_pnl": 0.0,
                     "start_equity": equity, "peak_equity": equity,
-                    "today": date.today().isoformat(),
+                    "today": today_str,
                 })
-                _add_log(uid, "INFO", f"[08:50] 준비 완료 | 기준자산={equity:,.0f}원 | 로그초기화완료")
+                _add_log(uid, "INFO", f"[{h}:{m:02d}] 준비 완료 | 기준자산={equity:,.0f}원 | 로그초기화완료")
             except Exception as e:
-                _add_log(uid, "ERROR", f"[08:50] 초기화 오류: {e}")
+                _add_log(uid, "ERROR", f"[준비] 초기화 오류: {e}")
         return  # 장 전이므로 전략 사이클 진행 안 함
 
-    # 09:00 — 장 시작 마킹 + 데이터 보존 정리 (주 1회 이상 수행 보장)
-    if h == 9 and m == 0:
+    # 09:00~09:04 — 장 시작 마킹 + 데이터 보존 정리 (범위 체크로 지연 허용, 중복 실행 방지)
+    if h == 9 and m <= 4:
         for uid, _ in all_users:
-            update_bot_state(uid, {"is_market_open": True})
-            _add_log(uid, "INFO", f"[09:00] 장 시작")
-        for uid, _ in all_users:
-            try:
-                ld = _purge_old_docs(uid, "logs", 14)
-                rd = _purge_old_docs(uid, "recommendations", 30)
-                td = _purge_old_docs(uid, "trades", 180)
-                if ld or rd or td:
-                    logger.info("[%s] cleanup done logs=%d recs=%d trades=%d", uid[:8], ld, rd, td)
-            except Exception as e:
-                logger.error("[%s] cleanup failed: %s", uid[:8], e)
+            st_open = get_bot_state(uid)
+            if not st_open.get("is_market_open", False):
+                update_bot_state(uid, {"is_market_open": True})
+                _add_log(uid, "INFO", f"[{h}:{m:02d}] 장 시작 마킹")
+        # cleanup은 1회만 (m==0 or 아직 안 돌았을 때만)
+        if m == 0 or m == 1:
+            for uid, _ in all_users:
+                try:
+                    ld = _purge_old_docs(uid, "logs", 14)
+                    rd = _purge_old_docs(uid, "recommendations", 30)
+                    td = _purge_old_docs(uid, "trades", 180)
+                    if ld or rd or td:
+                        logger.info("[%s] cleanup done logs=%d recs=%d trades=%d", uid[:8], ld, rd, td)
+                except Exception as e:
+                    logger.error("[%s] cleanup failed: %s", uid[:8], e)
 
     # 09:05 — AI 오전 세션
     if h == 9 and m == 5:
@@ -5956,30 +5967,34 @@ def scheduled_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
             except Exception as e:
                 _add_log(uid, "ERROR", f"[reconcile][KR] 사이클 오류: {e}")
 
-    # 15:20 — 장 마감 청산
-    if h == 15 and m == 20:
+    # 15:20~15:24 — 장 마감 청산
+    # 스케줄러 지연 대비: 15:20~15:24 모두 청산 시도 (get_positions 빈 경우 자동 스킵)
+    if h == 15 and 20 <= m <= 24:
         for uid, cfg in all_users:
             if _scope_allows_kr(cfg):
                 _close_all_kr_positions(uid, cfg, "장마감_청산")
         return
 
-    # 15:25 — 청산 재시도
-    if h == 15 and m == 25:
+    # 15:25~15:29 — 청산 재시도 (미청산 포지션만)
+    if h == 15 and 25 <= m <= 29:
         for uid, cfg in all_users:
             if not _scope_allows_kr(cfg):
                 continue
             remaining = get_positions(uid, "KR")
             if not remaining:
                 continue
-            _add_log(uid, "WARNING", f"[KR] 15:25 청산 재시도 — 미청산 {len(remaining)}종목: {list(remaining.keys())}")
+            _add_log(uid, "WARNING", f"[KR] 청산 재시도 — 미청산 {len(remaining)}종목: {list(remaining.keys())}")
             _close_all_kr_positions(uid, cfg, "장마감_재청산")
         return
 
-    # 15:31 — 장 마감 마킹
-    if h == 15 and m == 31:
+    # 15:31~15:35 — 장 마감 마킹 (범위 체크로 지연 허용)
+    if h == 15 and 31 <= m <= 35:
         for uid, _ in all_users:
+            state_cur = get_bot_state(uid)
+            if not state_cur.get("is_market_open", True):
+                continue  # 이미 마감 처리됨
             update_bot_state(uid, {"is_market_open": False})
-            _add_log(uid, "INFO", "[15:31] 장 마감")
+            _add_log(uid, "INFO", f"[{h}:{m:02d}] 장 마감 마킹")
         return
 
     # 매분 — KR 전략 사이클 (09:00~15:19)
@@ -6102,8 +6117,8 @@ def scheduled_us_strategy_cycle(event: scheduler_fn.ScheduledEvent) -> None:
             except Exception as e:
                 _add_log(uid, "ERROR", f"[reconcile][US] 사이클 오류: {e}")
 
-    # 15:50 — US 장 마감 청산
-    if h == 15 and m == 50:
+    # 15:50~15:54 — US 장 마감 청산 (스케줄러 지연 대비 범위 체크)
+    if h == 15 and 50 <= m <= 54:
         for uid, cfg in all_users:
             if not _scope_allows_us(cfg):
                 continue
