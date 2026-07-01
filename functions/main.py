@@ -99,7 +99,7 @@ ET  = ZoneInfo("America/New_York")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# functions/.env — 로컬·배포 패키지에 포함될 때 텔레그램·Gemini 키 등 주입 (kis_ws.py 와 동일)
+# functions/.env — 로컬 전용 (git 제외). firebase deploy 시 패키지에 포함되어 키 주입 (kis_ws.py 동일)
 _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.is_file():
     try:
